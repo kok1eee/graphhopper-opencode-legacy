@@ -95,6 +95,31 @@ export interface LoopState {
    * 未設定なら graphhopper_attempt の自己申告にフォールバックする。
    */
   eval_cmd: string | null;
+  /**
+   * 直近に注入した継続リマインダー時点の進展フィンガープリント
+   * （continuationFingerprint の戻り値）。次回 idle 時に同一なら
+   * 「前回注入以降に進展なし」とみなして注入をスキップし、待機ackの
+   * 言い換え繰り返しによる空転ループを1往復で止める。
+   */
+  last_continuation_marker: string | null;
+  /**
+   * 直近の eval_cmd 実行結果のフィンガープリント（ok + 出力tailのハッシュ）。
+   * 同一失敗の再注入を抑止しつつ、結果が変わったら注入を再開するための材料。
+   */
+  last_eval_fingerprint: string | null;
+  /**
+   * 無限ループ検知（echoループ）の連続カウント。session.idle 発火ごとに
+   * 「直前のassistantメッセージとほぼ同一のuserメッセージ」を検知して増える。
+   * ループでない（人間の新規入力）と判定されたら0に戻る。
+   */
+  loop_streak: number;
+  /** 無限ループを検知して自動継続注入を停止した「現在の一時状態」か。永続フラグではなく
+   * pauseGoal / resumeGoal / completeGoal / 明示 pause / clear で false に戻る。
+   * resume の恒久ブロックは loop_stop_count >= loop_stop_max の判定で行う。 */
+  loop_stopped: boolean;
+  /** ループ検知による自動停止の累積回数（goalごと）。loop_stop_max に達すると resume を
+   * 拒否して人間に判断を委ねる。明示 pause はカウントしない。clear で0に戻る。 */
+  loop_stop_count: number;
   updated_at: string;
 }
 
@@ -116,6 +141,19 @@ export interface GraphhopperConfig {
    * Claude Code版の GH_HANDOFF_THRESHOLD_KB（既定500KB）相当。opencodeにはtranscript_pathが
    * 無いため client.session.messages() のJSONシリアライズ長で近似する */
   handoff_nudge_chars: number;
+  /** echoループ（直前のassistantメッセージとほぼ同一のuserメッセージ）を
+   * 何回連続で検知したら自動継続注入を止めるか。0以下なら echo 検知を無効化
+   * （tool検知は loop_tool_repeat_threshold で独立に制御される） */
+  loop_stop_threshold: number;
+  /** ループ検知による自動停止が累積 loop_stop_max 回に達したら resume を拒否する
+   * （人間が force:true で明示解除するか clear するまで）。0以下なら resume ブロック無効 */
+  loop_stop_max: number;
+  /** 同一tool call反復検知のウィンドウ幅（対象は最後の人間user入力以降の tool call のうち
+   * 直近この件数）。0以下なら無効 */
+  loop_tool_window: number;
+  /** 直近 loop_tool_window 件の tool call 内で同一 (tool名+入力ハッシュ) がこの回数
+   * 出たらループと判定する。1以下なら tool 検知を無効化 */
+  loop_tool_repeat_threshold: number;
 }
 
 export const DEFAULT_CONFIG: GraphhopperConfig = {
@@ -124,6 +162,10 @@ export const DEFAULT_CONFIG: GraphhopperConfig = {
   agents: {},
   handoff_nudge_chars: 500_000,
   stuck_threshold: 3,
+  loop_stop_threshold: 6,
+  loop_stop_max: 3,
+  loop_tool_window: 8,
+  loop_tool_repeat_threshold: 4,
 };
 
 function dir(root: string): string {
@@ -200,7 +242,17 @@ export type HistoryEvent =
     }
   | { type: "eval_set"; goal: string; cmd: string }
   | { type: "eval_run"; goal: string; ok: boolean; fail_streak: number }
-  | { type: "handoff_nudged"; goal: string; size_chars: number };
+  | {
+      type: "loop_detected";
+      goal: string;
+      kind: LoopKind;
+      streak: number;
+      stopped: boolean;
+    }
+  | { type: "loop_stopped"; goal: string; count: number }
+  | { type: "loop_resume_forced"; goal: string }
+  | { type: "handoff_nudged"; goal: string; size_chars: number }
+  | { type: "continuation_skipped"; goal: string; marker: string };
 
 /** append-only の履歴ログ。LLMの自己申告ではなくplugin機械記録の監査証跡 */
 export function recordEvent(root: string, event: HistoryEvent): void {
@@ -241,6 +293,14 @@ export function readConfig(root: string): GraphhopperConfig {
     stuck_threshold: raw.stuck_threshold ?? DEFAULT_CONFIG.stuck_threshold,
     handoff_nudge_chars:
       raw.handoff_nudge_chars ?? DEFAULT_CONFIG.handoff_nudge_chars,
+    loop_stop_threshold:
+      raw.loop_stop_threshold ?? DEFAULT_CONFIG.loop_stop_threshold,
+    loop_stop_max: raw.loop_stop_max ?? DEFAULT_CONFIG.loop_stop_max,
+    loop_tool_window:
+      raw.loop_tool_window ?? DEFAULT_CONFIG.loop_tool_window,
+    loop_tool_repeat_threshold:
+      raw.loop_tool_repeat_threshold ??
+      DEFAULT_CONFIG.loop_tool_repeat_threshold,
   };
 }
 
@@ -265,6 +325,11 @@ function emptyState(): LoopState {
     handoff_nudged: false,
     fail_streak: 0,
     eval_cmd: null,
+    last_continuation_marker: null,
+    last_eval_fingerprint: null,
+    loop_streak: 0,
+    loop_stopped: false,
+    loop_stop_count: 0,
     updated_at: new Date().toISOString(),
   };
 }
@@ -352,27 +417,58 @@ function mutateActive(
 }
 
 export function pauseGoal(root: string): ActiveLoop | null {
-  const r = mutateActive(root, () => ({ goal: { status: "paused" } }));
+  const r = mutateActive(root, () => ({
+    goal: { status: "paused" },
+    // 人間による明示的な操作なのでloop停止フラグも解除（pause自体が駆動を止める）
+    state: { loop_streak: 0, loop_stopped: false },
+  }));
   if (r) recordEvent(root, { type: "goal_pause", goal: r.goal.id });
   return r;
 }
 
-export function resumeGoal(root: string, sessionID: string): ActiveLoop | null {
+export function resumeGoal(
+  root: string,
+  sessionID: string,
+  force = false,
+): ActiveLoop | null {
+  // 恒久ブロック: loop_stop_max に達したら通常resumeを拒否（forceで明示解除のみ）
+  if (isResumeBlocked(root) && !force) return null;
   const r = mutateActive(root, () => ({
     goal: { status: "active" },
-    state: { session_id: sessionID },
+    state: { session_id: sessionID, loop_streak: 0, loop_stopped: false },
   }));
-  if (r) recordEvent(root, { type: "goal_resume", goal: r.goal.id });
+  if (r) {
+    recordEvent(root, { type: "goal_resume", goal: r.goal.id });
+    if (force) {
+      // 人間の判断を監査証跡に残す（カウンタは保持するため履歴は残る）
+      recordEvent(root, { type: "loop_resume_forced", goal: r.goal.id });
+    }
+  }
   return r;
 }
 
 export function completeGoal(root: string): ActiveLoop | null {
   const r = mutateActive(root, () => ({
     goal: { status: "done", done_at: new Date().toISOString() },
-    state: { phase: "done" },
+    state: {
+      phase: "done",
+      loop_streak: 0,
+      loop_stopped: false,
+    },
   }));
   if (r) recordEvent(root, { type: "goal_complete", goal: r.goal.id });
   return r;
+}
+
+/** clear 専用の loop 全リセット（completeGoal はカウンタを保持するので分離） */
+export function resetLoopForClear(root: string): void {
+  const state = readState(root);
+  writeState(root, {
+    ...state,
+    loop_streak: 0,
+    loop_stopped: false,
+    loop_stop_count: 0,
+  });
 }
 
 export function setPhase(
@@ -558,6 +654,348 @@ export function setHandoffNudged(root: string, sizeChars: number): LoopState {
     });
   }
   return next;
+}
+
+/* ================================================================== *
+ * 無限ループ検知（echoループ + 同一tool call反復）: assistant出力がそのまま次の
+ * user入力にミラーされ続けると、session.idle が連続発火して自動継続が延々回る。
+ * 検知は2種:
+ * - echo: 直前のassistantメッセージとほぼ同一のuserメッセージ（3パターン）
+ * - tool: 直近ウィンドウ内で同一 (tool名+入力ハッシュ) の反復
+ * どちらかが loop_stop_threshold（echo無効時は loop_tool_repeat_threshold）回
+ * 連続したら自動継続を止める（goalをpause）。
+ * ================================================================== */
+
+/** 検知の種別。イベント記録・通知文に使う */
+export type LoopKind = "echo" | "tool" | "echo+tool";
+
+/** session.messages() の最小構造（SDK型に依存しない軽量型） */
+export interface SessionMessageLike {
+  info: { id: string; role: "user" | "assistant" };
+  parts: Array<{
+    type: string;
+    text?: string;
+    synthetic?: boolean;
+    callID?: string;
+    tool?: string;
+    state?: { status?: string; input?: unknown };
+  }>;
+}
+
+function normalizeMessage(text: string): string {
+  return (
+    text
+      .toLowerCase()
+      .replace(/\s+/g, "") // 空白・改行を除去
+      .replace(/[。、！!？?・…〜〜：:，,（）()「」『』'"'`~]/g, "") // 句読点を除去
+      // 絵文字・記号・ASCII装飾を除去（echo判定のノイズ）
+      .replace(/[^\u3040-\u30ff\u4e00-\u9fff\u0020-\u007e\u30fc]/g, "")
+      .trim()
+  );
+}
+
+/** echoループ検知。3パターンを扱う:
+ * 1. 末尾=user・直前=assistant がほぼ同一（外部ミラーが出力を user にコピーするケース）
+ * 2. 末尾=assistant・直前=user で、その user が「その前の assistant（[-3]）」の echo
+ *    （自動継続ループで idle 時点の末尾が必ず assistant になるケースの本体）
+ * 3. 連続する assistant メッセージ（[-3] と [-1]）がほぼ同一（強制継続で同文を繰り返す）
+ * どれも正規化テキストの同一 or 十分な重複を echo とみなす。 */
+export function isEchoMessage(msgs: SessionMessageLike[]): boolean {
+  if (msgs.length < 2) return false;
+  const last = msgs[msgs.length - 1];
+  const prev = msgs[msgs.length - 2];
+
+  const text = (m: SessionMessageLike): string =>
+    (m.parts ?? [])
+      .filter((p) => p.type === "text" && !p.synthetic)
+      .map((p) => p.text ?? "")
+      .join("");
+
+  const isEcho = (a: string, b: string): boolean => {
+    const x = normalizeMessage(a);
+    const y = normalizeMessage(b);
+    if (!x || !y) return false;
+    // 短すぎる挨拶（"👋" など）は echo と誤判定しない
+    if (Math.min(x.length, y.length) < 4) return false;
+    if (x === y) return true;
+    // 部分一致（一方が他方にほぼ含まれる）。例: 編集で微差が付いた場合
+    const short = x.length <= y.length ? x : y;
+    const long = x.length <= y.length ? y : x;
+    if (long.includes(short)) return short.length >= long.length * 0.5;
+    return false;
+  };
+
+  // パターン1: 末尾=user・直前=assistant のミラー echo
+  if (last.info.role === "user" && prev.info.role === "assistant") {
+    return isEcho(text(prev), text(last));
+  }
+
+  // パターン2/3: 末尾=assistant（自動継続ループはこちらの形）
+  if (last.info.role === "assistant" && msgs.length >= 3) {
+    const beforePrev = msgs[msgs.length - 3];
+    // 直前の user がその前の assistant の echo になっている
+    if (prev.info.role === "user" && beforePrev.info.role === "assistant") {
+      if (isEcho(text(beforePrev), text(prev))) return true;
+    }
+    // 直前の assistant と末尾の assistant が同一文の繰り返し
+    if (beforePrev.info.role === "assistant") {
+      if (isEcho(text(beforePrev), text(last))) return true;
+    }
+  }
+  return false;
+}
+
+export interface LoopDetectionResult {
+  streak: number;
+  stopped: boolean;
+  justStopped: boolean;
+}
+
+/* ---------------------------------------------------------------- *
+ * 同一tool call反復検知: 最後の人間user入力以降の tool call のうち、直近
+ * loop_tool_window 件で同一 (tool名+入力ハッシュ) が loop_tool_repeat_threshold 回
+ * 出たらループとみなす。callID で dedupe、completed/error のみ数える。
+ * ---------------------------------------------------------------- */
+
+/** JSONのcanonical形式（キーを再帰ソート）。入力の同一性を順序非依存で判定する */
+export function canonicalJSON(input: unknown): string {
+  if (input === null || typeof input !== "object") return JSON.stringify(input);
+  if (Array.isArray(input)) {
+    return "[" + input.map((v) => canonicalJSON(v)).join(",") + "]";
+  }
+  const obj = input as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return (
+    "{" +
+    keys.map((k) => JSON.stringify(k) + ":" + canonicalJSON(obj[k])).join(",") +
+    "}"
+  );
+}
+
+/** FNV-1a 64bit ハッシュ（文字列→16進hex）。実用目的のハッシュで十分 */
+export function fnv1a(input: string): string {
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < input.length; i++) {
+    h ^= BigInt(input.charCodeAt(i));
+    h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return h.toString(16);
+}
+
+/** tool call を `tool名:hash(canonicalJSON(input))` に正規化する。
+ * シリアライズ不能・callID欠損・input欠損の tool 部品は null（カウント対象外）。 */
+export function toolCallHash(part: SessionMessageLike["parts"][number]): string | null {
+  if (part.type !== "tool") return null;
+  if (!part.callID || !part.tool || !part.state || !("input" in part.state)) {
+    return null;
+  }
+  if (part.state.status !== "completed" && part.state.status !== "error") {
+    return null; // pending / running は数えない
+  }
+  try {
+    return `${part.tool}:${fnv1a(canonicalJSON(part.state.input))}`;
+  } catch {
+    return null;
+  }
+}
+
+/** 自動継続注入メッセージの先頭マーカー。session.messages 上で人間入力と
+ * 区別するための目印（index.ts の idle ハンドラが注入文の先頭に付与する）。
+ * これが無いと自前の注入が「人間の新規入力」に見えて tool 反復検知の
+ * ウィンドウが毎回リセットされ、tool ループを検知できなくなる。 */
+export const CONTINUATION_MARKER = "[graphhopper-continuation]";
+
+/** 人間の新規入力テキスト部品か。自動継続注入・synthetic は除外する */
+export function isHumanTextPart(
+  p: SessionMessageLike["parts"][number],
+): boolean {
+  if (p.type !== "text" || p.synthetic || !(p.text ?? "").length) return false;
+  return !p.text!.startsWith(CONTINUATION_MARKER);
+}
+
+/** 同一tool call反復を検知する。callID重複は1件に数え直す。 */
+export function isToolRepeatLoop(
+  msgs: SessionMessageLike[],
+  cfg: GraphhopperConfig,
+): boolean {
+  const window = cfg.loop_tool_window;
+  const threshold = cfg.loop_tool_repeat_threshold;
+  if (window <= 0 || threshold <= 1) return false;
+
+  // 最後の「人間の新規user入力（自動継続注入・syntheticでない text 部品を持つ）」
+  // 以降のメッセージだけを見る。
+  // tool result を運ぶ user メッセージ（text 部品なし）は人間入力扱いしない
+  // （自動継続バーストを切らない）。自前の継続注入（CONTINUATION_MARKER 付き）も
+  // 人間入力扱いしない（注入のたびにウィンドウがリセットされ tool ループを
+  // 検知できなくなるバグの修正）。
+  let lastHumanIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    const hasHumanText = (m.parts ?? []).some(
+      (p) => m.info.role === "user" && isHumanTextPart(p),
+    );
+    if (hasHumanText) {
+      lastHumanIdx = i;
+      break;
+    }
+  }
+
+  // callID で dedupe（最新状態を採用）
+  const calls = new Map<string, string>();
+  for (let i = lastHumanIdx + 1; i < msgs.length; i++) {
+    for (const p of msgs[i]?.parts ?? []) {
+      if (p.type !== "tool" || !p.callID) continue;
+      const h = toolCallHash(p);
+      if (h === null) continue;
+      calls.set(p.callID, h);
+    }
+  }
+
+  const recent = Array.from(calls.values()).slice(-window);
+  if (recent.length < threshold) return false;
+
+  const counts = new Map<string, number>();
+  for (const h of recent) counts.set(h, (counts.get(h) ?? 0) + 1);
+  for (const n of counts.values()) if (n >= threshold) return true;
+  return false;
+}
+
+/** echo / tool のどちらが検知に寄与したかを判定する（両方なら "echo+tool"） */
+export function detectLoopKind(
+  msgs: SessionMessageLike[],
+  cfg: GraphhopperConfig,
+): { detected: boolean; kind: LoopKind } {
+  const echoEnabled = cfg.loop_stop_threshold > 0;
+  const toolEnabled = cfg.loop_tool_repeat_threshold > 1;
+  if (!echoEnabled && !toolEnabled) return { detected: false, kind: "echo" };
+
+  const isEcho = echoEnabled && isEchoMessage(msgs);
+  const isTool = toolEnabled && isToolRepeatLoop(msgs, cfg);
+  const kind: LoopKind = isEcho && isTool ? "echo+tool" : isEcho ? "echo" : "tool";
+  return { detected: isEcho || isTool, kind };
+}
+
+/** ループ検知で loop_streak / loop_stopped を更新する。検知でない（人間の新規入力）なら
+ * streakをリセットし、停止中でも再開する（検知による誤検知でgoalが永久停止しないため）。
+ * 閾値に達したら loop_stopped=true を返す（呼び出し側が goal を pause する）。 */
+export function updateLoopDetection(
+  root: string,
+  detected: boolean,
+  kind: LoopKind = "echo",
+): LoopDetectionResult {
+  const cfg = readConfig(root);
+  const threshold =
+    cfg.loop_stop_threshold > 0
+      ? cfg.loop_stop_threshold
+      : cfg.loop_tool_repeat_threshold;
+  const state = readState(root);
+
+  let streak: number;
+  let stopped: boolean;
+  if (threshold > 0 && detected) {
+    streak = state.loop_streak + 1;
+    stopped = state.loop_stopped || streak >= threshold;
+  } else {
+    streak = 0;
+    stopped = false;
+  }
+
+  writeState(root, { ...state, loop_streak: streak, loop_stopped: stopped });
+  if (state.goal_id && streak > 0) {
+    recordEvent(root, {
+      type: "loop_detected",
+      goal: state.goal_id,
+      kind,
+      streak,
+      stopped,
+    });
+  }
+  return { streak, stopped, justStopped: stopped && !state.loop_stopped };
+}
+
+/* ---------------------------------------------------------------- *
+ * 継続注入 dedupe: 前回注入以降の「進展」をフィンガープリント化する。
+ * 進展 = 人間入力の到達位置・tool 実行件数・phase・eval_cmd・直近 eval 結果。
+ * assistant の言い換え待機 ack（テキストのみ・tool なし）は進展に数えない。
+ * これにより「deny → 待機ack → 注入 → 言い換え待機ack → 注入 …」の空転が
+ * echo 検知（文面一致・閾値6回）を待たずに1往復で止まる。
+ * ---------------------------------------------------------------- */
+
+/** 最後の人間入力の到達位置（自動継続注入は人間扱いしない） */
+function lastHumanIndex(msgs: SessionMessageLike[]): number {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (
+      m.info.role === "user" &&
+      (m.parts ?? []).some((p) => isHumanTextPart(p))
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** 進展フィンガープリントを計算する（純粋関数・テスト容易性のため分離） */
+export function continuationFingerprint(
+  msgs: SessionMessageLike[],
+  phase: Phase,
+  evalCmd: string | null,
+  evalFingerprint: string | null,
+): string {
+  const h = lastHumanIndex(msgs);
+  let toolCalls = 0;
+  for (let i = h + 1; i < msgs.length; i++) {
+    for (const p of msgs[i]?.parts ?? []) {
+      if (p.type === "tool" && p.callID) toolCalls++;
+    }
+  }
+  return fnv1a(
+    canonicalJSON({
+      h,
+      t: toolCalls,
+      p: phase,
+      e: evalCmd ?? "",
+      o: evalFingerprint ?? "",
+    }),
+  );
+}
+
+/** 継続リマインダーを注入したことを記録する（次回 idle の skip 判定材料） */
+export function noteContinuation(root: string, marker: string): LoopState {
+  const state = readState(root);
+  const next = { ...state, last_continuation_marker: marker };
+  writeState(root, next);
+  return next;
+}
+
+/** 直近の eval 実行結果フィンガープリントを記録する */
+export function noteEvalFingerprint(root: string, fp: string): LoopState {
+  const state = readState(root);
+  const next = { ...state, last_eval_fingerprint: fp };
+  writeState(root, next);
+  return next;
+}
+
+/** loop 停止時に goal を pause する（自動継続を物理的に止める）。累積停止回数
+ * （loop_stop_count）を加算し、loop_stopped イベントを記録する。
+ * pause は human の resume でしか解除されない。 */
+export function stopLoopByPause(root: string): ActiveLoop | null {
+  const state = readState(root);
+  const count = state.loop_stop_count + 1;
+  writeState(root, { ...state, loop_stop_count: count });
+  const r = pauseGoal(root);
+  if (r?.goal.id) {
+    recordEvent(root, { type: "loop_stopped", goal: r.goal.id, count });
+  }
+  return r;
+}
+
+/** resume がブロックされているか（loop_stop_max に累積停止回数が達した） */
+export function isResumeBlocked(root: string): boolean {
+  const cfg = readConfig(root);
+  if (cfg.loop_stop_max <= 0) return false;
+  const state = readState(root);
+  return state.loop_stop_count >= cfg.loop_stop_max;
 }
 
 /* ================================================================== *

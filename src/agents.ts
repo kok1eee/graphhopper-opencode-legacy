@@ -24,7 +24,7 @@
  * メインとは別ベンダー（例: Luna）を使うことで系列多様性を設計段階で得る
  * （verifier=実装後のdrift検出 / critic=実装前の計画検証 の役割分担）。
  *
- * 全て読み取り専用（edit/bash deny）。実装はメインループ側だけが行う。
+ * 全て読み取り専用（edit deny + bash は `rg` のみ許可）。実装はメインループ側だけが行う。
  * ユーザーが opencode.json(c) に同名 agent を定義している場合はそちらを優先する。
  * プロジェクト単位のモデル上書きは .graphhopper/config.json の agents で指定する。
  */
@@ -32,18 +32,43 @@ import { readConfig } from "./state";
 import type { Config } from "@opencode-ai/plugin";
 import type { AgentConfig } from "@opencode-ai/sdk";
 
+/**
+ * 全subagent共通の探索ルール（graft-first + rg固定）。
+ * 背景: researcher/critic/verifier が Grep ツール連打・graft MCP 未使用で
+ * トークンを浪費する事例が多発したため、prompt レベルで強制する。
+ * - コード探索は graft MCP を先に使う。graft で絞りきれない時だけ rg にフォールバック。
+ * - テキスト検索は plain grep ではなく必ず `rg`（bash経由）。
+ * - 同じ概念の検索を繰り返さない。Read 全文取得の直後に同じファイルへ Grep しない。
+ */
+const SEARCH_RULES: readonly string[] = [
+  "- コード探索は graft MCP を先に使う（graft_find_code=定義・意味検索 / graft_find_all=全出現 / graft_trace_calls=呼び出し元・先と blast radius / graft_file_api=ファイルのAPI一覧 / graft_repo_map=未踏リポジトリの把握）。graft で絞りきれない場合だけ rg にフォールバックする",
+  "- テキスト検索は plain grep ではなく必ず `rg` を使う（例: `rg -n <pattern> <path>`）。同じ概念の検索を繰り返さない",
+  "- Read で全文取得した直後に同じファイルへ Grep しない（全文が手元にある）",
+];
+
+/**
+ * 読み取り専用を保ったまま `rg` だけ許可する bash 権限。
+ * 全subagentは edit deny + bash rg-only（plain grep 等の他コマンドは deny）。
+ */
+const RG_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
+  "*": "deny",
+  rg: "allow",
+  "rg *": "allow",
+};
+
 export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-researcher": {
     description:
       "コードベース探索と外部調査の統合エージェント。ファイル検索・構造把握・公式ドキュメント調査。高頻度に呼ばれるためコストティア最下層で使う（モデルは .graphhopper/config.json の agents で設定）",
     mode: "subagent",
     temperature: 0.1,
-    permission: { edit: "deny", bash: "deny" },
+    permission: { edit: "deny", bash: RG_ONLY_BASH },
     prompt: [
       "あなたは調査専門家。与えられた問いに対し、コードベースを探索して根拠（ファイル:行）付きの回答を返す。",
       "",
       "ルール:",
-      "- 推測で答えない。必ずgrep/glob/readで裏付けを取る",
+      "- 推測で答えない。必ず graft MCP / rg / glob / read で裏付けを取る",
+      ...SEARCH_RULES,
       "- 回答は「結論 → 根拠 → 不明点」の形式",
       "- 見つからなかった場合は見つからなかったと言う",
       "- コードは書かない。調査と報告だけ",
@@ -55,7 +80,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "designingフェーズのdesign.mdを敵対レビューする。要件漏れ・設計の穴・スコープ逸脱を検出する安価な常設チェックnode（モデルは .graphhopper/config.json の agents で設定）。verifierとは対照的に実装前の計画のみを対象とし、メインとは別ベンダーで系列多様性を設計段階で得る",
     mode: "subagent",
     temperature: 0.2,
-    permission: { edit: "deny", bash: "deny" },
+    permission: { edit: "deny", bash: RG_ONLY_BASH },
     prompt: [
       "あなたはcritic。実装前に、設計ドキュメントの質を敵対的に検証する。",
       "",
@@ -72,6 +97,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "- 指摘は具体的に（該当セクション・該当行を引用）",
       "- 迎合して指摘を捏造しない。問題が無ければはっきりそう言う",
       "- コードは書かない。読み取りと指摘だけ",
+      ...SEARCH_RULES,
     ].join("\n"),
   },
 
@@ -80,7 +106,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "polishのsimplify用。route=polish（大diff）のときだけ呼ぶ単体agent。3レンズ（再利用・品質・効率）を1回のパスで見てコード整理の提案を出す。適用はメインが行う（モデルは .graphhopper/config.json の agents で設定）",
     mode: "subagent",
     temperature: 0.2,
-    permission: { edit: "deny", bash: "deny" },
+    permission: { edit: "deny", bash: RG_ONLY_BASH },
     prompt: [
       "あなたはsimplifyの提案者。変更diffを3つのレンズ（再利用・品質・効率）で1回のパスで見て、整理の提案を出す。",
       "",
@@ -102,6 +128,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "- 推測で指摘しない。実コードをReadで裏付けを取る",
       "- 効率は「確実に遅い/無駄」と分かるものだけ。計測できない推測はhighにしない",
       "- あなたは提案だけを返す。適用はメインが行う。コードは書かない",
+      ...SEARCH_RULES,
     ].join("\n"),
   },
 
@@ -110,7 +137,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "polish/advisorのverifier用。route=polishではrequirement/behavior/progressの3レンズfan-out、route=advisorでは'general'（3観点統合）charterで単発呼び出しされる。判断nodeなので上位品質モデルで使う（モデルは .graphhopper/config.json の agents で設定）。実装者本人（メインエージェント）とは独立した第三者チェックであることが呼び出しの目的そのもの",
     mode: "subagent",
     temperature: 0.2,
-    permission: { edit: "deny", bash: "deny" },
+    permission: { edit: "deny", bash: RG_ONLY_BASH },
     prompt: [
       "あなたは敵対的レビューアー。実装者ではなく第三者の立場でdiffのdrift（乖離）を検証する。",
       "",
@@ -125,6 +152,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "- 指摘は具体的に（ファイル:行を特定、該当行を引用）",
       "- 迎合して指摘を捏造しない。問題が無ければはっきりそう言う",
       "- コードは書かない。読み取りと指摘だけ",
+      ...SEARCH_RULES,
     ].join("\n"),
   },
 
@@ -133,7 +161,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "手詰まり時の相談役。graphhopper_attemptのfail_streakがstuck_thresholdに達した時に呼ぶ。アーキテクチャ判断・複雑なデバッグ・不慣れなパターンについて助言する（モデルは .graphhopper/config.json の agents で設定）",
     mode: "subagent",
     temperature: 0.2,
-    permission: { edit: "deny", bash: "deny" },
+    permission: { edit: "deny", bash: RG_ONLY_BASH },
     prompt: [
       "あなたはoracle。実装者が手詰まりになった時に相談される賢者。",
       "",
@@ -147,6 +175,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "- 「もう一度試す」だけの助言はしない。具体的に何を変えるかを示す",
       "- 不明点は不明点として明示する。分からないことを断定しない",
       "- コードは書かない。診断と助言だけ",
+      ...SEARCH_RULES,
     ].join("\n"),
   },
 };

@@ -177,7 +177,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             .boolean()
             .optional()
             .describe(
-              "complete 時に verifier 未clearでも強制完了する（人間の判断が見える場合のみ）",
+              "complete 時に verifier 未clearでも強制完了する、または resume 時に loop_stop_max のブロックを明示的に無視する（人間の判断が見える場合のみ。監査ログに loop_resume_forced が記録される）",
             ),
         },
         async execute(args, ctx) {
@@ -196,9 +196,18 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               return a ? `paused: "${a.goal.title}"` : "no active goal";
             }
             case "resume": {
-              const a = state.resumeGoal(root, ctx.sessionID);
+              if (state.isResumeBlocked(root) && !args.force) {
+                const s = state.getActive(root);
+                const max = state.readConfig(root).loop_stop_max;
+                const count = s?.state.loop_stop_count ?? 0;
+                return (
+                  `error: このgoalはループ検知による自動停止が loop_stop_max（${max}）回に達したため resume がブロックされています（現在 ${count}回）。` +
+                  "人間が原因を確認して graphhopper_goal(action: 'clear') でリセットするか、明示的に resume を続行する場合のみ force: true を使ってください（監査ログに loop_resume_forced が記録されます）。"
+                );
+              }
+              const a = state.resumeGoal(root, ctx.sessionID, args.force);
               return a
-                ? `resumed: "${a.goal.title}" | phase: ${a.state.phase}`
+                ? `resumed: "${a.goal.title}" | phase: ${a.state.phase}${args.force ? " (forced)" : ""}`
                 : "no active goal";
             }
             case "complete": {
@@ -218,7 +227,10 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             }
             case "clear": {
               const a = state.completeGoal(root);
-              if (a) state.setPhase(root, "designing", "");
+              if (a) {
+                state.resetLoopForClear(root);
+                state.setPhase(root, "designing", "");
+              }
               state.unbindSession(root, ctx.sessionID);
               return "cleared";
             }
@@ -247,6 +259,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               ? `critic_review: level=${a.state.critic_review.level} reason=${a.state.critic_review.reason}`
               : "critic_review: (none, opt-in)",
             `fail_streak: ${a.state.fail_streak}`,
+            `loop: stop_count=${a.state.loop_stop_count}/${state.readConfig(root).loop_stop_max} resume_blocked=${state.isResumeBlocked(root)} streak=${a.state.loop_streak}`,
             a.state.notes ? `notes: ${a.state.notes}` : null,
             state.planLogExists(root, a.goal.id)
               ? `log: .graphhopper/plans/${a.goal.id}.log.md`
@@ -597,6 +610,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             `- phase: ${s.phase}`,
             `- notes: ${s.notes || "(none)"}`,
             `- fail_streak: ${s.fail_streak}`,
+            `- loop: stop_count=${s.loop_stop_count}/${state.readConfig(root).loop_stop_max} resume_blocked=${state.isResumeBlocked(root)}`,
             `- eval_cmd: ${s.eval_cmd || "(none)"}`,
             s.router.route
               ? `- router: route=${s.router.route} diff_lines=${s.router.diff_lines}`
@@ -653,7 +667,95 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         if (active.state.phase === "done") return;
         if (active.state.session_id !== sessionID) return;
 
+        /* ================================================================ *
+         * 無限ループ検知（echoループ + 同一tool call反復）: assistant出力がそのまま
+         * 次のuser入力にミラーされる、または同じtool callを繰り返すと session.idle が
+         * 連続発火し、自動継続が延々回る。検知して loop_stop_threshold（echo無効時は
+         * loop_tool_repeat_threshold）回連続したら goal を pause して自動継続を止める。
+         * ================================================================ */
+        {
+          const cfg = state.readConfig(root);
+          const echoEnabled = cfg.loop_stop_threshold > 0;
+          const toolEnabled = cfg.loop_tool_repeat_threshold > 1;
+          if (echoEnabled || toolEnabled) {
+            try {
+              const res = await client.session.messages({
+                path: { id: sessionID },
+              });
+              const msgs = (res.data ?? []) as state.SessionMessageLike[];
+              const { detected, kind } = state.detectLoopKind(msgs, cfg);
+              const loop = state.updateLoopDetection(root, detected, kind);
+              if (loop.stopped) {
+                if (loop.justStopped) {
+                  state.stopLoopByPause(root);
+                  console.warn(
+                    "graphhopper: infinite loop detected (kind=%s streak=%d). paused goal=%s to stop auto-continuation",
+                    kind,
+                    loop.streak,
+                    active.goal.id,
+                  );
+                  // モデルに知らせて同じ応答の折り返しを止めさせる（1回だけ）
+                  try {
+                    await client.session.promptAsync({
+                      path: { id: sessionID },
+                      body: {
+                        parts: [
+                          {
+                            type: "text",
+                            text: "[graphhopper] 無限ループ（echo または同一tool callの反復）を検知したため自動継続を停止しました（goal は pause）。以後、同じ応答・同じtool callの繰り返しには応答せず、新しい実際の作業指示を待ってください。",
+                          },
+                        ],
+                      },
+                    });
+                  } catch {
+                    // 通知失敗でも停止は成立している
+                  }
+                }
+                return;
+              }
+            } catch {
+              // メッセージ取得失敗は検知をスキップ（駆動を止めない）
+            }
+          }
+        }
+
         let evalNote: string | null = null;
+
+        /* 継続注入 dedupe（空転ループ対策）: 前回注入以降に進展が無ければ
+         * 注入も eval 再実行もスキップして黙って戻る。進展の定義は
+         * state.continuationFingerprint（人間入力・tool 実行・phase・
+         * eval_cmd・直近 eval 結果）で、assistant の言い換え待機 ack だけでは
+         * 進展にならない。そのため「deny → 待機 → 注入 → 待機 …」の空転が
+         * echo 検知（文面一致・閾値6回）を待たずに1往復で止まる。
+         * 取得失敗時は注入継続（駆動を止めない）。 */
+        let idleMsgs: state.SessionMessageLike[] = [];
+        try {
+          const res = await client.session.messages({
+            path: { id: sessionID },
+          });
+          idleMsgs = (res.data ?? []) as state.SessionMessageLike[];
+          const marker = state.continuationFingerprint(
+            idleMsgs,
+            active.state.phase,
+            active.state.eval_cmd,
+            active.state.last_eval_fingerprint,
+          );
+          if (
+            active.state.last_continuation_marker !== null &&
+            active.state.last_continuation_marker === marker
+          ) {
+            if (active.goal.id) {
+              state.recordEvent(root, {
+                type: "continuation_skipped",
+                goal: active.goal.id,
+                marker,
+              });
+            }
+            return;
+          }
+        } catch {
+          // メッセージ取得失敗は注入継続（駆動を止めない）
+        }
 
         /* eval_cmd（Metric）: implementing中でeval_cmd設定済みなら自己申告に依存せず
          * ターンごとに機械実行する。graphhopper本体のloop-driver.shが毎Stop hookで
@@ -662,6 +764,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           const cmd = active.state.eval_cmd;
           const result = await state.runEval($, root, cmd);
           const tail = result.output.split("\n").slice(-20).join("\n");
+          // eval 結果のフィンガープリントを記録（同一失敗の再注入を抑止し、
+          // 結果変化での注入再開を判定する材料。dedupe 用）
+          state.noteEvalFingerprint(root, `${result.ok}:${state.fnv1a(tail)}`);
           // state.notesにはtail済みの短い文字列だけを残す（全文を永続化しない）
           const r = state.recordAttempt(
             root,
@@ -745,6 +850,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               {
                 type: "text",
                 text: [
+                  // 先頭マーカーで人間入力と区別する（tool 反復検知の
+                  // ウィンドウが自前注入でリセットされるのを防ぐ）
+                  state.CONTINUATION_MARKER,
                   evalNote,
                   handoffNote,
                   continuationText(active.goal, active.state),
@@ -755,6 +863,17 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             ],
           },
         });
+        // 注入時点の進展を記録する（次回 idle の skip 判定材料）。
+        // eval 実行済みなら active は refresh 済みで fingerprint も最新。
+        state.noteContinuation(
+          root,
+          state.continuationFingerprint(
+            idleMsgs,
+            active.state.phase,
+            active.state.eval_cmd,
+            active.state.last_eval_fingerprint,
+          ),
+        );
       } catch {
         // ループを止めないためイベントハンドラ内の例外は握りつぶす
       }

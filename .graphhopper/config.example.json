@@ -9,5 +9,9 @@
     "graphhopper-oracle": "anthropic/claude-opus-5"
   },
   "stuck_threshold": 3,
-  "handoff_nudge_chars": 500000
+  "handoff_nudge_chars": 500000,
+  "loop_stop_threshold": 6,
+  "loop_stop_max": 3,
+  "loop_tool_window": 8,
+  "loop_tool_repeat_threshold": 4
 }
