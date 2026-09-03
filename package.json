@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "graphhopper for opencode: designing/implementing/polish state machine plugin with a physical design-gate (tool.execute.before)",
+  "scripts": {
+    "typecheck": "npx tsc --noEmit",
+    "test": "bun test"
+  },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.3",
     "zod": "^3.25.0"

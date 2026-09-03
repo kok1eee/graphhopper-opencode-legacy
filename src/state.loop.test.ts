@@ -3,7 +3,7 @@
  * bun test で実行する: `bun test src/state.loop.test.ts`
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,16 +11,24 @@ import {
   type SessionMessageLike,
   CONTINUATION_MARKER,
   canonicalJSON,
+  clearActiveGoal,
   continuationFingerprint,
   detectLoopKind,
+  isDesignDocLocked,
+  isDesignGateBlocked,
   isEchoMessage,
   isHumanTextPart,
   isResumeBlocked,
   isToolRepeatLoop,
+  isValidBaselineRev,
   fnv1a,
+  lastHumanId,
+  measureDiffLines,
   noteContinuation,
   noteEvalFingerprint,
+  parseDiffShortstat,
   pauseGoal,
+  readGoals,
   readState,
   resetLoopForClear,
   resumeGoal,
@@ -92,12 +100,14 @@ describe("isEchoMessage", () => {
     ).toBe(true);
   });
 
-  test("パターン3: 連続assistant同一文（echoユーザーが挟まる構造）", () => {
+  test("パターン3: 連続assistant同一文（新規user入力後の繰り返し）", () => {
+    // [-3]と[-1]が共にassistantで同一文。間のuserは新規入力（echoでない）。
+    // パターン2（userがecho）とは別分岐のテスト
     expect(
       isEchoMessage([
         msg("user", "実装を始めよう"),
         msg("assistant", "已实施完毕。等待新的实际作业指示。以上。"),
-        msg("user", "已实施完毕。等待新的实际作业指示。以上。"),
+        msg("user", "別の作業をして"),
         msg("assistant", "已实施完毕。等待新的实际作业指示。以上。"),
       ]),
     ).toBe(true);
@@ -402,5 +412,263 @@ describe("継続注入dedupe", () => {
     expect(readState(root).last_continuation_marker).toBe("marker1");
     noteEvalFingerprint(root, "false:abc");
     expect(readState(root).last_eval_fingerprint).toBe("false:abc");
+  });
+
+  test("lastHumanId: 自前注入を飛ばして人間のidを返す・無ければnull", () => {
+    const human = msg("user", "実装して");
+    const humanId = human.info.id;
+    const msgs = [
+      human,
+      msg("assistant", "了解"),
+      {
+        info: { id: "c1", role: "user" },
+        parts: [{ type: "text", text: `${CONTINUATION_MARKER}\nfoo` }],
+      } as SessionMessageLike,
+    ];
+    expect(lastHumanId(msgs)).toBe(humanId);
+    expect(
+      lastHumanId([
+        msg("assistant", "待機します"),
+        msg("assistant", "待機しています"),
+      ]),
+    ).toBeNull();
+  });
+
+  test("スライドウィンドウ下でも注入1往復でfingerprint不変（ID化の回帰）", () => {
+    // deny/ack 空転: 人間アンカーが窓内にいる間は、注入前後で人間id・
+    // tool件数ともに不変のはず。旧実装（配列インデックス）ではウィンドウが
+    // 2件スライドして不一致になり毎 idle 再注入した
+    const base = [msg("user", "実装して"), msg("assistant", "了解、進めます")];
+    const m1 = continuationFingerprint(base, "implementing", null, null);
+    const after = [...base, contMsg("c1"), msg("assistant", "待機します")];
+    expect(continuationFingerprint(after, "implementing", null, null)).toBe(
+      m1,
+    );
+  });
+
+  test("人間が窓外に出ると一度だけ変化し以後安定する", () => {
+    // 実運用のスライド（先頭脱落）を再現: アンカー喪失の遷移は1回、
+    // その後のack追加では不変でなければならない
+    const full = [
+      msg("user", "実装して"),
+      msg("assistant", "了解"),
+      contMsg("c1"),
+      msg("assistant", "待機します"),
+    ];
+    const mFull = continuationFingerprint(full, "implementing", null, null);
+    const slid = full.slice(2);
+    const mSlid = continuationFingerprint(slid, "implementing", null, null);
+    expect(mSlid).not.toBe(mFull);
+    const more = [
+      ...slid,
+      contMsg("c2"),
+      msg("assistant", "待機しています"),
+    ];
+    expect(continuationFingerprint(more, "implementing", null, null)).toBe(
+      mSlid,
+    );
+  });
+
+  test("tool件数は窓内アンカー以降のみ数えスライド後は安定する", () => {
+    const t1 = toolMsg(
+      "assistant",
+      completedTool("k1", "bash", { command: "a" }),
+    );
+    const t2 = toolMsg(
+      "assistant",
+      completedTool("k2", "bash", { command: "a" }),
+    );
+    const full = [msg("user", "せよ"), t1, msg("assistant", "中間"), t2];
+    // full: h=U.id, t=2
+    const mFull = continuationFingerprint(full, "implementing", null, null);
+    // Uとt1が脱落 → h=null、窓内toolはt2のみ → 変化は一度だけ
+    const slid = full.slice(2);
+    const mSlid = continuationFingerprint(slid, "implementing", null, null);
+    expect(mSlid).not.toBe(mFull);
+    // 非tool ack追加では安定
+    const more = [...slid, msg("assistant", "待機")];
+    expect(continuationFingerprint(more, "implementing", null, null)).toBe(
+      mSlid,
+    );
+    // 新規toolは進展として検知（変化する）
+    const moreTool = [
+      ...slid,
+      toolMsg("assistant", completedTool("k3", "bash", { command: "b" })),
+    ];
+    expect(
+      continuationFingerprint(moreTool, "implementing", null, null),
+    ).not.toBe(mSlid);
+  });
+});
+
+describe("回帰: diff統計パース (insert-only/delete-only)", () => {
+  test("insert-only でも件数を返す（旧regexは両方必須で0に誤判定）", () => {
+    expect(parseDiffShortstat(" 1 file changed, 3 insertions(+)")).toBe(3);
+  });
+
+  test("delete-only でも件数を返す", () => {
+    expect(parseDiffShortstat(" 1 file changed, 2 deletions(-)")).toBe(2);
+  });
+
+  test("両方あれば合算", () => {
+    expect(
+      parseDiffShortstat(" 2 files changed, 10 insertions(+), 5 deletions(-)"),
+    ).toBe(15);
+  });
+
+  test("件数なしは null（呼び出し側で0扱い・fallback）", () => {
+    expect(parseDiffShortstat("")).toBeNull();
+    expect(parseDiffShortstat(" 1 file changed")).toBeNull();
+  });
+});
+
+describe("回帰: baseline検証", () => {
+  test("hex は許可", () => {
+    expect(isValidBaselineRev("73222ed4")).toBe(true);
+    expect(
+      isValidBaselineRev(
+        "0123456789abcdef0123456789abcdef01234567",
+      ),
+    ).toBe(true);
+  });
+
+  test("注入文字列・空白・空は拒否", () => {
+    expect(isValidBaselineRev("x; rm -rf /")).toBe(false);
+    expect(isValidBaselineRev("abc def")).toBe(false);
+    expect(isValidBaselineRev("")).toBe(false);
+    expect(isValidBaselineRev("HEAD~1")).toBe(false);
+  });
+
+  test("不正 baseline の measureDiffLines は shell を呼ばず 0", async () => {
+    const noShell = undefined as unknown as Parameters<
+      typeof measureDiffLines
+    >[0];
+    await expect(
+      measureDiffLines(noShell, tmpRoot(), "x; rm -rf /"),
+    ).resolves.toBe(0);
+    await expect(measureDiffLines(noShell, tmpRoot(), null)).resolves.toBe(
+      0,
+    );
+  });
+});
+
+describe("回帰: design gate の path 判定", () => {
+  const root = "/repo";
+
+  test("plans 配下の相対・絶対パスは許可", () => {
+    expect(
+      isDesignGateBlocked(root, CFG, "designing", ".graphhopper/plans/g-x.md"),
+    ).toBe(false);
+    expect(
+      isDesignGateBlocked(
+        root,
+        CFG,
+        "designing",
+        "/repo/.graphhopper/plans/g-x.md",
+      ),
+    ).toBe(false);
+  });
+
+  test("source は拒否・designing以外は素通り", () => {
+    expect(
+      isDesignGateBlocked(root, CFG, "designing", "src/index.ts"),
+    ).toBe(true);
+    expect(
+      isDesignGateBlocked(root, CFG, "implementing", "src/index.ts"),
+    ).toBe(false);
+  });
+
+  test("部分文字列の偽装は拒否（旧includesは許可していた）", () => {
+    // 別ディレクトリ配下の同名パス
+    expect(
+      isDesignGateBlocked(
+        root,
+        CFG,
+        "designing",
+        "/tmp/.graphhopper/plans/evil.md",
+      ),
+    ).toBe(true);
+    // 類似prefix
+    expect(
+      isDesignGateBlocked(
+        root,
+        CFG,
+        "designing",
+        "my.graphhopper/plans/x.md",
+      ),
+    ).toBe(true);
+    // traversal で plans 外へ脱出
+    expect(
+      isDesignGateBlocked(
+        root,
+        CFG,
+        "designing",
+        ".graphhopper/plans/../../src/x.ts",
+      ),
+    ).toBe(true);
+  });
+
+  test("design doc ロックは正規化後の完全一致・log は対象外", () => {
+    const id = "g-abc123";
+    expect(
+      isDesignDocLocked(root, "polish", id, `.graphhopper/plans/${id}.md`),
+    ).toBe(true);
+    expect(
+      isDesignDocLocked(
+        root,
+        "polish",
+        id,
+        `/repo/.graphhopper/plans/${id}.md`,
+      ),
+    ).toBe(true);
+    expect(
+      isDesignDocLocked(root, "polish", id, `.graphhopper/plans/${id}.log.md`),
+    ).toBe(false);
+    expect(
+      isDesignDocLocked(
+        root,
+        "designing",
+        id,
+        `.graphhopper/plans/${id}.md`,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("回帰: state 読み書きの堅牢化", () => {
+  test("破損 phase は designing にフォールバック", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    const path = join(root, ".graphhopper", "state.json");
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    raw.phase = "bogus-phase";
+    writeFileSync(path, JSON.stringify(raw), "utf8");
+    expect(readState(root).phase).toBe("designing");
+  });
+
+  test("canonicalJSON は stringify不能入力で 'undefined' を返す", () => {
+    expect(canonicalJSON(undefined)).toBe("undefined");
+    expect(canonicalJSON(() => {})).toBe("undefined");
+    expect(canonicalJSON({ b: 2, a: 1 })).toBe(canonicalJSON({ a: 1, b: 2 }));
+  });
+});
+
+describe("回帰: clear は goal_complete を記録しない", () => {
+  test("履歴汚染なし・goal は done・active は null", () => {
+    const root = tmpRoot();
+    const { goal } = startGoal(root, "test goal", "sess1");
+    const cleared = clearActiveGoal(root);
+    expect(cleared?.id).toBe(goal.id);
+
+    const goals = readGoals(root);
+    expect(goals.active).toBeNull();
+    expect(goals.goals.find((g) => g.id === goal.id)?.status).toBe("done");
+
+    const historyPath = join(root, ".graphhopper", "history.jsonl");
+    const history = existsSync(historyPath)
+      ? readFileSync(historyPath, "utf8")
+      : "";
+    expect(history).not.toContain("goal_complete");
+    expect(readState(root).phase).toBe("designing");
   });
 });

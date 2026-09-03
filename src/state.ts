@@ -336,11 +336,17 @@ function emptyState(): LoopState {
 
 export function readState(root: string): LoopState {
   const loaded = readJson<Partial<LoopState>>(statePath(root), emptyState());
-  return {
+  const merged: LoopState = {
     ...emptyState(),
     ...loaded,
     router: { ...emptyState().router, ...(loaded.router ?? {}) },
   };
+  // 破損 state.json の未知 phase は designing にフォールバックする。
+  // 未検証のまま通すと PHASE_ACTION[phase] 参照が undefined になる。
+  if (!(PHASES as readonly string[]).includes(merged.phase)) {
+    merged.phase = "designing";
+  }
+  return merged;
 }
 
 function writeGoals(root: string, data: GoalsFile): void {
@@ -460,6 +466,32 @@ export function completeGoal(root: string): ActiveLoop | null {
   return r;
 }
 
+/** clear 専用: goal を done 化するが `goal_complete` イベントは記録しない
+ * （clear は完了ではなく破棄のため、監査ログに完了として残さない）。
+ * done 化自体（status/done_at）は維持し、`active` からは外す。
+ * loop カウンタは0に戻し、phase は designing に戻す（phase イベントも記録しない）。 */
+export function clearActiveGoal(root: string): Goal | null {
+  const goals = readGoals(root);
+  if (!goals.active) return null;
+  const goal = goals.goals.find((g) => g.id === goals.active);
+  if (!goal) return null;
+  goal.status = "done";
+  goal.done_at = new Date().toISOString();
+  goals.active = null;
+  writeGoals(root, goals);
+  const s = readState(root);
+  writeState(root, {
+    ...s,
+    phase: "designing",
+    notes: "",
+    fail_streak: 0,
+    loop_streak: 0,
+    loop_stopped: false,
+    loop_stop_count: 0,
+  });
+  return goal;
+}
+
 /** clear 専用の loop 全リセット（completeGoal はカウンタを保持するので分離） */
 export function resetLoopForClear(root: string): void {
   const state = readState(root);
@@ -518,7 +550,11 @@ export async function captureBaselineRev(
         .nothrow()
         .quiet();
     const out = r.stdout.toString().trim();
-    if (r.exitCode === 0 && out) return out.split("\n")[0] ?? null;
+    if (r.exitCode === 0 && out) {
+      const rev = out.split("\n")[0] ?? null;
+      if (rev && isValidBaselineRev(rev)) return rev;
+      return null;
+    }
   } catch {
     // ignore
   }
@@ -528,11 +564,27 @@ export async function captureBaselineRev(
       .nothrow()
       .quiet();
     const out = r.stdout.toString().trim();
-    if (r.exitCode === 0 && out) return out;
+    if (r.exitCode === 0 && out && isValidBaselineRev(out)) return out;
   } catch {
     // ignore
   }
   return null;
+}
+
+/** baseline_rev の形式検証（jj commit_id / git sha は共に full hex）。
+ * VCS由来とはいえ shell 補間に渡す前に検証し、不正なら null 扱いにする。 */
+export function isValidBaselineRev(baseline: string): boolean {
+  return /^[0-9a-fA-F]+$/.test(baseline);
+}
+
+/** `--stat` / `--shortstat` 末行（"N files changed, M insertions(+), K deletions(-)"）
+ * をパースして挿入+削除行数を返す。insert-only / delete-only 対応。
+ * どちらも無ければ null（diff無しとパース不能を区別せず、呼び出し側で0扱い）。 */
+export function parseDiffShortstat(out: string): number | null {
+  const ins = out.match(/(\d+) insertion/);
+  const del = out.match(/(\d+) deletion/);
+  if (!ins && !del) return null;
+  return (ins ? Number(ins[1]) : 0) + (del ? Number(del[1]) : 0);
 }
 
 /** baseline からの diff 行数を測定する（jj → git fallback） */
@@ -541,28 +593,30 @@ export async function measureDiffLines(
   root: string,
   baseline: string | null,
 ): Promise<number> {
-  if (!baseline) return 0;
+  if (!baseline || !isValidBaselineRev(baseline)) return 0;
   try {
-    const r =
-      await shell`sh -c ${`jj diff --from ${baseline} --stat 2>/dev/null | tail -1`}`
-        .cwd(root)
-        .nothrow()
-        .quiet();
-    const out = r.stdout.toString().trim();
-    const m = out.match(/(\d+) insertions?.*?(\d+) deletions?/);
-    if (m) return Number(m[1]) + Number(m[2]);
+    // Bun shell の補間値は自動escapeされるため、baseline を直接埋め込む。
+    // 以前の `sh -c "jj diff --from ${baseline} ..."` は sh 内で無escapeだった。
+    // pipe (tail) を避け、末行の取り出しは JS で行う。
+    const r = await shell`jj diff --from ${baseline} --stat`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) {
+      const lines = r.stdout.toString().trim().split("\n");
+      const parsed = parseDiffShortstat(lines[lines.length - 1] ?? "");
+      if (parsed !== null) return parsed;
+    }
   } catch {
     // ignore
   }
   try {
-    const r = await shell`sh -c ${`git diff --shortstat ${baseline}`}`
+    const r = await shell`git diff --shortstat ${baseline}`
       .cwd(root)
       .nothrow()
       .quiet();
     const out = r.stdout.toString().trim();
-    const ins = out.match(/(\d+) insertion/);
-    const del = out.match(/(\d+) deletion/);
-    return (ins ? Number(ins[1]) : 0) + (del ? Number(del[1]) : 0);
+    return parseDiffShortstat(out) ?? 0;
   } catch {
     return 0;
   }
@@ -757,9 +811,13 @@ export interface LoopDetectionResult {
  * 出たらループとみなす。callID で dedupe、completed/error のみ数える。
  * ---------------------------------------------------------------- */
 
-/** JSONのcanonical形式（キーを再帰ソート）。入力の同一性を順序非依存で判定する */
+/** JSONのcanonical形式（キーを再帰ソート）。入力の同一性を順序非依存で判定する。
+ * stringify不能な入力（undefined / function / symbol）は "undefined" を返す。 */
 export function canonicalJSON(input: unknown): string {
-  if (input === null || typeof input !== "object") return JSON.stringify(input);
+  if (input === null || typeof input !== "object") {
+    const s = JSON.stringify(input);
+    return s === undefined ? "undefined" : s;
+  }
   if (Array.isArray(input)) {
     return "[" + input.map((v) => canonicalJSON(v)).join(",") + "]";
   }
@@ -921,31 +979,46 @@ export function updateLoopDetection(
  * echo 検知（文面一致・閾値6回）を待たずに1往復で止まる。
  * ---------------------------------------------------------------- */
 
-/** 最後の人間入力の到達位置（自動継続注入は人間扱いしない） */
-function lastHumanIndex(msgs: SessionMessageLike[]): number {
+/** 最後の人間入力メッセージの id（無ければ null）。
+ * id はスライドウィンドウをまたいで安定するため、dedupe の人間アンカーに使う。
+ * id 欠損時は空文字に倒す（null=不在と区別。衝突しても安定するため
+ * dedupe が壊れない）。 */
+export function lastHumanId(msgs: SessionMessageLike[]): string | null {
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (
       m.info.role === "user" &&
       (m.parts ?? []).some((p) => isHumanTextPart(p))
     ) {
-      return i;
+      const id: unknown = (m.info as { id?: unknown }).id;
+      return typeof id === "string" ? id : "";
     }
   }
-  return -1;
+  return null;
 }
 
-/** 進展フィンガープリントを計算する（純粋関数・テスト容易性のため分離） */
+/** 進展フィンガープリントを計算する（純粋関数・テスト容易性のため分離）。
+ * 人間アンカーは配列インデックスではなくメッセージ id で持つ。
+ * 末尾N取得のスライドウィンドウ下でも、deny/ack の追加では人間 id・tool 件数
+ * ともに不変のため dedupe「1往復で止まる」が成立する。 */
 export function continuationFingerprint(
   msgs: SessionMessageLike[],
   phase: Phase,
   evalCmd: string | null,
   evalFingerprint: string | null,
 ): string {
-  const h = lastHumanIndex(msgs);
+  const h = lastHumanId(msgs);
   let toolCalls = 0;
-  for (let i = h + 1; i < msgs.length; i++) {
-    for (const p of msgs[i]?.parts ?? []) {
+  let afterHuman = h === null;
+  for (const m of msgs) {
+    if (!afterHuman) {
+      const id: unknown = (m.info as { id?: unknown }).id;
+      if ((typeof id === "string" ? id : "") === h) {
+        afterHuman = true;
+      }
+      continue;
+    }
+    for (const p of m?.parts ?? []) {
       if (p.type === "tool" && p.callID) toolCalls++;
     }
   }
@@ -1068,13 +1141,29 @@ export function recordAttempt(
  * tool.execute.before hook から呼ばれる純関数（副作用なし）
  * ================================================================== */
 
+import { isAbsolute, normalize, relative, sep } from "node:path";
+
+/** gate判定用に filePath を root 相対・正規化する（`..` 解消・区切り統一）。
+ * root 外の絶対パスは `..` 始まりになり、許可prefixに一致しない（fail-closed）。 */
+function normalizeForGate(root: string, filePath: string): string {
+  const rel = isAbsolute(filePath) ? relative(root, filePath) : filePath;
+  return normalize(rel).split(sep).join("/");
+}
+
+function matchesAllowed(normalized: string, prefix: string): boolean {
+  const p = normalize(prefix).split(sep).join("/").replace(/\/+$/, "");
+  return normalized === p || normalized.startsWith(`${p}/`);
+}
+
 export function isDesignGateBlocked(
+  root: string,
   cfg: GraphhopperConfig,
   phase: Phase,
   filePath: string,
 ): boolean {
   if (phase !== "designing") return false;
-  return !cfg.design_gate_allow.some((prefix) => filePath.includes(prefix));
+  const n = normalizeForGate(root, filePath);
+  return !cfg.design_gate_allow.some((prefix) => matchesAllowed(n, prefix));
 }
 
 /** design doc不変化ゲート: designing終了後は該当goalのdesign docへの書き込みを常にブロックする
@@ -1083,12 +1172,16 @@ export function isDesignGateBlocked(
  * Goodhart's Lawの穴になる。決定の経緯・進捗は planLogPath（追記専用・ハードゲート無し）へ。
  * design_gate_allow とは独立（designing中はこの関数は常にfalseを返す）。 */
 export function isDesignDocLocked(
+  root: string,
   phase: Phase,
   goalId: string,
   filePath: string,
 ): boolean {
   if (phase === "designing") return false;
-  return filePath.includes(`.graphhopper/plans/${goalId}.md`);
+  // 正規化後の完全一致。`.log.md`（`${goalId}.log.md`）は対象外のまま。
+  return (
+    normalizeForGate(root, filePath) === `.graphhopper/plans/${goalId}.md`
+  );
 }
 
 /* ================================================================== *

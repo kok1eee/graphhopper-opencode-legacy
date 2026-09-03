@@ -52,6 +52,28 @@ const PHASE_ACTION: Record<state.Phase, string> = {
   done: "完了済み。graphhopper_goal(action: 'complete') を確認",
 };
 
+/* idle 取得の窓と上限（design g-mtl7l8j3 T1/T2）。
+ * TAIL_LIMIT: loop検知窓 (loop_tool_window=8) + echo 用履歴 + margin。
+ * TAIL_STALE_MS: idle 直後なのに窓内最新がこれより古ければ、limit が末尾窓を
+ *   返していないとみなす self-check 閾値。
+ * MAX_FETCH_CHARS: 全件フォールバック時の上限。これ超は検知・dedupe スキップ。
+ * NUDGE_EVERY: nudge 用の全文測定はこの idle 間隔に1回（間引き）。
+ * oversizeSticky / idleTick はモジュール変数（state 汚染回避。プロセス共有の
+ * ため混在時は厳しい判定が勝つ。compact 後は測定で回復する）。 */
+const TAIL_LIMIT = 50;
+const TAIL_STALE_MS = 10 * 60 * 1000;
+const MAX_FETCH_CHARS = 2_000_000;
+const NUDGE_EVERY = 10;
+let oversizeSticky = false;
+let idleTick = 0;
+
+/** メッセージの生成時刻（欠損時は 0）。取得順の正規化用 */
+function msgTime(m: state.SessionMessageLike): number {
+  const t: unknown = (m.info as { time?: { created?: unknown } }).time
+    ?.created;
+  return typeof t === "number" ? t : 0;
+}
+
 function continuationText(goal: state.Goal, s: state.LoopState): string {
   return [
     `[graphhopper] Goal: "${goal.title}" | phase: ${s.phase}`,
@@ -86,6 +108,28 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
   return {
     config: async (input) => {
       injectAgents(input, root);
+    },
+
+    /* compact 連携（design g-mtl7l8j3 T3）: 要約に goal の意図を残す。
+     * state は disk のためループ自体は compact を生き残るが、モデル側文脈の
+     * goal 意図が要約落ちするのを防ぐ。prompt は置換しない。 */
+    "experimental.session.compacting": async (_input, output) => {
+      try {
+        const active = state.getActive(root);
+        if (!active || active.goal.status !== "active") return;
+        output.context.push(
+          [
+            `[graphhopper] active goal: "${active.goal.title}" (${active.goal.id})`,
+            `phase: ${active.state.phase}`,
+            active.state.notes ? `notes: ${active.state.notes}` : null,
+            active.state.eval_cmd ? `eval_cmd: ${active.state.eval_cmd}` : null,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+      } catch {
+        // 要約を壊さないため例外は握りつぶす
+      }
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -124,7 +168,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       );
       if (!filePath) return;
 
-      if (state.isDesignGateBlocked(cfg, active.state.phase, filePath)) {
+      if (state.isDesignGateBlocked(root, cfg, active.state.phase, filePath)) {
         state.recordEvent(root, {
           type: "design_gate_block",
           goal: active.goal.id,
@@ -141,7 +185,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       /* design doc不変化: designing終了後はdesign doc自体への書き込みも常にブロックする
        * （verifierのdrift検出アンカーを守るため。graphhopper本体との対応関係を参照） */
       if (
-        state.isDesignDocLocked(active.state.phase, active.goal.id, filePath)
+        state.isDesignDocLocked(root, active.state.phase, active.goal.id, filePath)
       ) {
         state.recordEvent(root, {
           type: "design_doc_locked_block",
@@ -226,11 +270,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
                 : "no active goal";
             }
             case "clear": {
-              const a = state.completeGoal(root);
-              if (a) {
-                state.resetLoopForClear(root);
-                state.setPhase(root, "designing", "");
-              }
+              // clear は完了ではないため completeGoal を使わない
+              // （goal_complete イベントを監査ログに残さない。state.clearActiveGoal）
+              state.clearActiveGoal(root);
               state.unbindSession(root, ctx.sessionID);
               return "cleared";
             }
@@ -667,6 +709,76 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         if (active.state.phase === "done") return;
         if (active.state.session_id !== sessionID) return;
 
+        /* session.messages の取得戦略（design g-mtl7l8j3 T1/T2）。
+         * - 通常: 末尾 TAIL_LIMIT 件のみ（time.created 昇順に正規化）。
+         * - サンプリング turn（NUDGE_EVERY に1回）: 全文1本のみ。nudge 測定と
+         *   sticky からの回復確認を兼ね、検知にもそのまま使う。
+         * - self-check: idle 直後なのに窓内最新が古ければ limit が末尾窓を
+         *   返していないとみなし、全件にフォールバック（上限付き）。
+         * - 全件が MAX_FETCH_CHARS 超なら oversizeSticky を立て、検知・dedupe
+         *   をスキップして注入継続（駆動を止めない）。回復はサンプリングで。
+         * いずれも idle あたり fetch は1本（g-mtl65slm T5 の不変条件を維持）。 */
+        let idleMsgs: state.SessionMessageLike[] | null = null;
+        let measuredSize: number | null = null;
+        const orderMsgs = (arr: state.SessionMessageLike[]) =>
+          [...arr].sort((a, b) => msgTime(a) - msgTime(b));
+        const classifyFull = (all: state.SessionMessageLike[]) => {
+          const size = JSON.stringify(all).length;
+          measuredSize = size;
+          if (size > MAX_FETCH_CHARS) {
+            oversizeSticky = true;
+            return null;
+          }
+          oversizeSticky = false;
+          return orderMsgs(all);
+        };
+        try {
+          // nudge 済み・非 sticky なら測定不要のためサンプリング自体を省く
+          const needMeasure =
+            !active.state.handoff_nudged || oversizeSticky;
+          const sampling =
+            needMeasure && idleTick % NUDGE_EVERY === 0;
+          if (oversizeSticky && !sampling) {
+            // 巨大確定中は取得自体を省く（eval・注入は継続）
+            idleMsgs = null;
+          } else if (sampling || oversizeSticky) {
+            const res = await client.session.messages({
+              path: { id: sessionID },
+            });
+            idleMsgs = classifyFull(
+              (res.data ?? []) as state.SessionMessageLike[],
+            );
+          } else {
+            const res = await client.session.messages({
+              path: { id: sessionID },
+              query: { limit: TAIL_LIMIT },
+            });
+            const msgs = orderMsgs(
+              (res.data ?? []) as state.SessionMessageLike[],
+            );
+            const newest =
+              msgs.length > 0 ? msgTime(msgs[msgs.length - 1]!) : 0;
+            if (
+              msgs.length >= TAIL_LIMIT &&
+              Date.now() - newest > TAIL_STALE_MS
+            ) {
+              // limit が先頭N等、末尾窓になっていない → 全件で取り直す
+              const full = await client.session.messages({
+                path: { id: sessionID },
+              });
+              idleMsgs = classifyFull(
+                (full.data ?? []) as state.SessionMessageLike[],
+              );
+            } else {
+              oversizeSticky = false;
+              idleMsgs = msgs;
+            }
+          }
+        } catch {
+          // メッセージ取得失敗は検知をスキップ（駆動を止めない）
+        }
+        idleTick++;
+
         /* ================================================================ *
          * 無限ループ検知（echoループ + 同一tool call反復）: assistant出力がそのまま
          * 次のuser入力にミラーされる、または同じtool callを繰り返すと session.idle が
@@ -677,44 +789,36 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           const cfg = state.readConfig(root);
           const echoEnabled = cfg.loop_stop_threshold > 0;
           const toolEnabled = cfg.loop_tool_repeat_threshold > 1;
-          if (echoEnabled || toolEnabled) {
-            try {
-              const res = await client.session.messages({
-                path: { id: sessionID },
-              });
-              const msgs = (res.data ?? []) as state.SessionMessageLike[];
-              const { detected, kind } = state.detectLoopKind(msgs, cfg);
-              const loop = state.updateLoopDetection(root, detected, kind);
-              if (loop.stopped) {
-                if (loop.justStopped) {
-                  state.stopLoopByPause(root);
-                  console.warn(
-                    "graphhopper: infinite loop detected (kind=%s streak=%d). paused goal=%s to stop auto-continuation",
-                    kind,
-                    loop.streak,
-                    active.goal.id,
-                  );
-                  // モデルに知らせて同じ応答の折り返しを止めさせる（1回だけ）
-                  try {
-                    await client.session.promptAsync({
-                      path: { id: sessionID },
-                      body: {
-                        parts: [
-                          {
-                            type: "text",
-                            text: "[graphhopper] 無限ループ（echo または同一tool callの反復）を検知したため自動継続を停止しました（goal は pause）。以後、同じ応答・同じtool callの繰り返しには応答せず、新しい実際の作業指示を待ってください。",
-                          },
-                        ],
-                      },
-                    });
-                  } catch {
-                    // 通知失敗でも停止は成立している
-                  }
+          if (idleMsgs !== null && (echoEnabled || toolEnabled)) {
+            const { detected, kind } = state.detectLoopKind(idleMsgs, cfg);
+            const loop = state.updateLoopDetection(root, detected, kind);
+            if (loop.stopped) {
+              if (loop.justStopped) {
+                state.stopLoopByPause(root);
+                console.warn(
+                  "graphhopper: infinite loop detected (kind=%s streak=%d). paused goal=%s to stop auto-continuation",
+                  kind,
+                  loop.streak,
+                  active.goal.id,
+                );
+                // モデルに知らせて同じ応答の折り返しを止めさせる（1回だけ）
+                try {
+                  await client.session.promptAsync({
+                    path: { id: sessionID },
+                    body: {
+                      parts: [
+                        {
+                          type: "text",
+                          text: "[graphhopper] 無限ループ（echo または同一tool callの反復）を検知したため自動継続を停止しました（goal は pause）。以後、同じ応答・同じtool callの繰り返しには応答せず、新しい実際の作業指示を待ってください。",
+                        },
+                      ],
+                    },
+                  });
+                } catch {
+                  // 通知失敗でも停止は成立している
                 }
-                return;
               }
-            } catch {
-              // メッセージ取得失敗は検知をスキップ（駆動を止めない）
+              return;
             }
           }
         }
@@ -727,13 +831,8 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
          * eval_cmd・直近 eval 結果）で、assistant の言い換え待機 ack だけでは
          * 進展にならない。そのため「deny → 待機 → 注入 → 待機 …」の空転が
          * echo 検知（文面一致・閾値6回）を待たずに1往復で止まる。
-         * 取得失敗時は注入継続（駆動を止めない）。 */
-        let idleMsgs: state.SessionMessageLike[] = [];
-        try {
-          const res = await client.session.messages({
-            path: { id: sessionID },
-          });
-          idleMsgs = (res.data ?? []) as state.SessionMessageLike[];
+         * 取得失敗時（idleMsgs === null）は注入継続（駆動を止めない）。 */
+        if (idleMsgs !== null) {
           const marker = state.continuationFingerprint(
             idleMsgs,
             active.state.phase,
@@ -753,8 +852,6 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             }
             return;
           }
-        } catch {
-          // メッセージ取得失敗は注入継続（駆動を止めない）
         }
 
         /* eval_cmd（Metric）: implementing中でeval_cmd設定済みなら自己申告に依存せず
@@ -822,21 +919,15 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
 
         /* handoff一度きり通知: 会話サイズ（session.messagesのJSON文字数、transcriptサイズの
          * 代理指標）が閾値を超えたら知らせる。対応必須ではないため、doneには持ち込まない
-         * （dedupで無限ループ化を防ぐ。graphhopper本体 hooks/loop-driver.sh 参照） */
+         * （dedupで無限ループ化を防ぐ。graphhopper本体 hooks/loop-driver.sh 参照）。
+         * サイズはサンプリング turn の全文測定値を使い回す（測定の無い turn・
+         * fetch失敗時はスキップ。最大 NUDGE_EVERY-1 idle の遅延）。 */
         let handoffNote: string | null = null;
-        if (!active.state.handoff_nudged) {
-          try {
-            const cfg = state.readConfig(root);
-            const msgs = await client.session.messages({
-              path: { id: sessionID },
-            });
-            const sizeChars = JSON.stringify(msgs.data ?? []).length;
-            if (sizeChars >= cfg.handoff_nudge_chars) {
-              state.setHandoffNudged(root, sizeChars);
-              handoffNote = `graphhopper: 会話が大きくなっています（推定サイズ${sizeChars}文字・閾値${cfg.handoff_nudge_chars}文字）。対応必須ではありません。必要なら graphhopper_handoff で別セッションへ引き継げます（このgoalでは1回だけの通知）。`;
-            }
-          } catch {
-            // サイズ取得失敗はnudgeをスキップするだけでループを止めない
+        if (!active.state.handoff_nudged && measuredSize !== null) {
+          const cfg = state.readConfig(root);
+          if (measuredSize >= cfg.handoff_nudge_chars) {
+            state.setHandoffNudged(root, measuredSize);
+            handoffNote = `graphhopper: 会話が大きくなっています（推定サイズ${measuredSize}文字・閾値${cfg.handoff_nudge_chars}文字）。対応必須ではありません。必要なら graphhopper_handoff で別セッションへ引き継げます（このgoalでは1回だけの通知）。`;
           }
         }
 
@@ -865,15 +956,18 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         });
         // 注入時点の進展を記録する（次回 idle の skip 判定材料）。
         // eval 実行済みなら active は refresh 済みで fingerprint も最新。
-        state.noteContinuation(
-          root,
-          state.continuationFingerprint(
-            idleMsgs,
-            active.state.phase,
-            active.state.eval_cmd,
-            active.state.last_eval_fingerprint,
-          ),
-        );
+        // fetch失敗時は記録しない（次回は必ず注入する従来動作を保つ）。
+        if (idleMsgs !== null) {
+          state.noteContinuation(
+            root,
+            state.continuationFingerprint(
+              idleMsgs,
+              active.state.phase,
+              active.state.eval_cmd,
+              active.state.last_eval_fingerprint,
+            ),
+          );
+        }
       } catch {
         // ループを止めないためイベントハンドラ内の例外は握りつぶす
       }
