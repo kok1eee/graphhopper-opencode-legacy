@@ -56,7 +56,7 @@ graphhopper-opencode/
 | `graphhopper_status` | 現在 goal + フェーズ + router + verifier 表示 |
 | `graphhopper_phase` | フェーズ遷移（designing → implementing → polish → done） |
 | `graphhopper_router_check` | diffサイズを機械測定し advisor(verifier×1)/polish(verifier×3) に分岐（loop-driver.sh相当） |
-| `graphhopper_verifier_set` | verifier結果（clean/drift）を記録。lensが空だとエラーになる（self-graded完了防止の機械ゲート） |
+| `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート） |
 | `graphhopper_set_eval` | implementingの合否判定コマンド（本体のeval_cmd相当）を設定。設定後はターン終了ごと自動実行され、pass=polish自動遷移／fail=fail_streak機械カウント |
 | `graphhopper_discover_start` / `_tick` / `_clear` | loop-until-dry 探索（round cap/dedupeをtool側で強制） |
 | `graphhopper_critic_set` | designing終了前のdesign.md質レビュー結果（clean/drift）を記録する。opt-in・ハードゲート無し（`graphhopper_phase`の前提条件にはしない） |

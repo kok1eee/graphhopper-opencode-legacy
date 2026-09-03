@@ -120,6 +120,20 @@ export interface LoopState {
   /** ループ検知による自動停止の累積回数（goalごと）。loop_stop_max に達すると resume を
    * 拒否して人間に判断を委ねる。明示 pause はカウントしない。clear で0に戻る。 */
   loop_stop_count: number;
+  /** 直近に edit/write されたファイル（正規化前パス）。同一ファイル再編集の
+   * 検知アンカー。別ファイル・eval pass・phase 遷移・resume でリセット */
+  edit_file: string | null;
+  /** 同一ファイルへの連続 edit/write 回数。stuck_edit_repeat に達したら
+   * stuck 扱い（堂々巡りの再編集の機械検知） */
+  edit_streak: number;
+  /** 直近に測定したワーキングコピー差分行数。diff 停滞の検知アンカー */
+  last_diff_lines: number | null;
+  /** ワーキングコピー差分が変わらない idle  eval 回数。stuck_diff_stall に
+   * 達したら stuck 扱い。差分変化・eval pass・phase 遷移・resume でリセット */
+  diff_stall: number;
+  /** 直近に stuck 通知した理由集合。同一理由の再通知を抑止する。
+   * resume でクリアする */
+  last_stuck_reasons: string[];
   updated_at: string;
 }
 
@@ -154,6 +168,17 @@ export interface GraphhopperConfig {
   /** 直近 loop_tool_window 件の tool call 内で同一 (tool名+入力ハッシュ) がこの回数
    * 出たらループと判定する。1以下なら tool 検知を無効化 */
   loop_tool_repeat_threshold: number;
+  /** eval_cmd / attempt の連続失敗数がこれに達したら giveUp し goal を pause する
+   * （既定 6 = stuck_threshold 既定 3 の2倍。fail 3,4,5 で escalate 相談→
+   * 改善なければ 6 で諦めの順序）。0以下で無効。有効時は stuck_threshold
+   * 以上にクランプされる（相談前に諦める逆転を防ぐ） */
+  max_eval_fails: number;
+  /** 同一ファイルへの連続 edit/write がこの回数に達したら stuck 扱いにする。
+   * 1以下で無効 */
+  stuck_edit_repeat: number;
+  /** ワーキングコピー差分が変わらない idle eval がこの回数続いたら stuck 扱い。
+   * 1以下で無効 */
+  stuck_diff_stall: number;
 }
 
 export const DEFAULT_CONFIG: GraphhopperConfig = {
@@ -166,6 +191,9 @@ export const DEFAULT_CONFIG: GraphhopperConfig = {
   loop_stop_max: 3,
   loop_tool_window: 8,
   loop_tool_repeat_threshold: 4,
+  max_eval_fails: 6,
+  stuck_edit_repeat: 5,
+  stuck_diff_stall: 4,
 };
 
 function dir(root: string): string {
@@ -242,6 +270,8 @@ export type HistoryEvent =
     }
   | { type: "eval_set"; goal: string; cmd: string }
   | { type: "eval_run"; goal: string; ok: boolean; fail_streak: number }
+  | { type: "eval_gave_up"; goal: string; fail_streak: number }
+  | { type: "stuck_hint"; goal: string; reasons: string[] }
   | {
       type: "loop_detected";
       goal: string;
@@ -284,13 +314,16 @@ function atomicWrite(path: string, data: unknown): void {
 
 export function readConfig(root: string): GraphhopperConfig {
   const raw = readJson<Partial<GraphhopperConfig>>(configPath(root), {});
+  const stuck_threshold =
+    raw.stuck_threshold ?? DEFAULT_CONFIG.stuck_threshold;
+  const maxRaw = raw.max_eval_fails ?? DEFAULT_CONFIG.max_eval_fails;
   return {
     router_threshold_lines:
       raw.router_threshold_lines ?? DEFAULT_CONFIG.router_threshold_lines,
     design_gate_allow:
       raw.design_gate_allow ?? DEFAULT_CONFIG.design_gate_allow,
     agents: { ...(DEFAULT_CONFIG.agents ?? {}), ...(raw.agents ?? {}) },
-    stuck_threshold: raw.stuck_threshold ?? DEFAULT_CONFIG.stuck_threshold,
+    stuck_threshold,
     handoff_nudge_chars:
       raw.handoff_nudge_chars ?? DEFAULT_CONFIG.handoff_nudge_chars,
     loop_stop_threshold:
@@ -301,6 +334,12 @@ export function readConfig(root: string): GraphhopperConfig {
     loop_tool_repeat_threshold:
       raw.loop_tool_repeat_threshold ??
       DEFAULT_CONFIG.loop_tool_repeat_threshold,
+    // 相談 (stuck) より諦め (giveUp) が先に発火しないよう下限を揃える
+    max_eval_fails: maxRaw <= 0 ? maxRaw : Math.max(maxRaw, stuck_threshold),
+    stuck_edit_repeat:
+      raw.stuck_edit_repeat ?? DEFAULT_CONFIG.stuck_edit_repeat,
+    stuck_diff_stall:
+      raw.stuck_diff_stall ?? DEFAULT_CONFIG.stuck_diff_stall,
   };
 }
 
@@ -330,6 +369,11 @@ function emptyState(): LoopState {
     loop_streak: 0,
     loop_stopped: false,
     loop_stop_count: 0,
+    edit_file: null,
+    edit_streak: 0,
+    last_diff_lines: null,
+    diff_stall: 0,
+    last_stuck_reasons: [],
     updated_at: new Date().toISOString(),
   };
 }
@@ -441,7 +485,20 @@ export function resumeGoal(
   if (isResumeBlocked(root) && !force) return null;
   const r = mutateActive(root, () => ({
     goal: { status: "active" },
-    state: { session_id: sessionID, loop_streak: 0, loop_stopped: false },
+    // pause→人間修正→resume の運用で eval リトライ・stuck 信号を数え直すため
+    // fail_streak・stuck系も戻す（loop 停止からの resume でも escalate は再カウント）。
+    // loop_stop_count（恒久ブロック予算）は維持する
+    state: {
+      session_id: sessionID,
+      loop_streak: 0,
+      loop_stopped: false,
+      fail_streak: 0,
+      edit_file: null,
+      edit_streak: 0,
+      last_diff_lines: null,
+      diff_stall: 0,
+      last_stuck_reasons: [],
+    },
   }));
   if (r) {
     recordEvent(root, { type: "goal_resume", goal: r.goal.id });
@@ -511,8 +568,18 @@ export function setPhase(
   if (!PHASES.includes(phase)) return null;
   const before = getActive(root);
   const r = mutateActive(root, () => ({
-    // phaseが変わるたびfail_streakをリセット（implementingに戻ってきた時も0から数え直す）
-    state: { phase, fail_streak: 0, ...(notes !== undefined ? { notes } : {}) },
+    // phaseが変わるたびfail系・stuck系カウンタをリセット
+    // （implementingに戻ってきた時も0から数え直す。巻き戻し直後のインフレ防止）
+    state: {
+      phase,
+      fail_streak: 0,
+      edit_file: null,
+      edit_streak: 0,
+      last_diff_lines: null,
+      diff_stall: 0,
+      last_stuck_reasons: [],
+      ...(notes !== undefined ? { notes } : {}),
+    },
   }));
   if (r && before && before.state.phase !== phase) {
     recordEvent(root, {
@@ -647,6 +714,76 @@ export function recordRouterCheck(
       route,
     });
   return next;
+}
+
+/** verifier fan-out の1レンズ分の結果（verifier_set の results 要素） */
+export interface VerifierResult {
+  lens: VerifierLens;
+  level: VerdictLevel;
+  target?: DriftTarget | null;
+}
+
+/** verifier_set 入力の検証。通れば null、ダメならエラー文（tool がそのまま返す）。
+ * self-graded 完了防止の機械ゲート（旧 lens 空拒否の後継）。 */
+export function checkVerifierResults(
+  results: VerifierResult[] | null | undefined,
+): string | null {
+  if (!Array.isArray(results) || results.length === 0) {
+    return "error: results が空です。graphhopper_verifier_set は task(subagent_type: 'graphhopper-verifier') を実際に呼んだ後にしか記録できません（self-graded完了を防ぐための機械的ゲート）。route=advisorでも最低1回、'general'charterで呼んでください。";
+  }
+  const known: VerifierLens[] = [
+    "requirement",
+    "behavior",
+    "progress",
+    "general",
+  ];
+  const seen = new Set<string>();
+  for (const r of results) {
+    if (!r || typeof r !== "object") return "error: results の要素が不正です";
+    if (!known.includes(r.lens)) {
+      return `error: 未知の lens です: ${String((r as { lens?: unknown }).lens)}`;
+    }
+    if (seen.has(r.lens)) {
+      return `error: lens が重複しています: ${r.lens}`;
+    }
+    seen.add(r.lens);
+    if (r.level !== "clean" && r.level !== "drift") {
+      return `error: 不正な level です: ${String((r as { level?: unknown }).level)}`;
+    }
+    if (
+      r.target !== undefined &&
+      r.target !== null &&
+      r.target !== "implementing" &&
+      r.target !== "design" &&
+      r.target !== "requirements"
+    ) {
+      return `error: 不正な target です: ${String(r.target)}`;
+    }
+    if (r.level === "drift" && !r.target) {
+      return `error: drift には target が必要です (lens: ${r.lens})`;
+    }
+  }
+  return null;
+}
+
+/** verifier fan-out 結果の集約ルール（純粋関数）。
+ * 前提: checkVerifierResults で検証済み（非空・既知lens・重複なし・
+ * drift に target 必須）。「confidence高 & severity high/critical のみ採用」
+ * というメインの裁量だった基準をコード化したもの:
+ * - 1つでも drift → 全体 drift。target は `implementing` を優先
+ *   （即時巻き戻し可能な唯一の行き先）、無ければ先頭の drift target。
+ * - 全 clean → clean (target null)。 */
+export function aggregateVerdicts(results: VerifierResult[]): {
+  level: VerdictLevel;
+  target: DriftTarget | null;
+} {
+  const drifts = results.filter((r) => r.level === "drift");
+  if (drifts.length === 0) return { level: "clean", target: null };
+  const impl = drifts.find((r) => r.target === "implementing");
+  return {
+    level: "drift",
+    target: (impl ?? drifts[0])?.target ?? null,
+  };
 }
 
 export function setVerifierVerdict(
@@ -1081,6 +1218,8 @@ export function isResumeBlocked(root: string): boolean {
 export interface AttemptResult {
   fail_streak: number;
   escalate: boolean;
+  /** 連続失敗が max_eval_fails に達し、goal を pause すべきか */
+  giveUp: boolean;
 }
 
 export function setEvalCmd(root: string, cmd: string): LoopState {
@@ -1121,9 +1260,20 @@ export function recordAttempt(
 ): AttemptResult {
   const state = readState(root);
   const fail_streak = ok ? 0 : state.fail_streak + 1;
-  writeState(root, { ...state, fail_streak, notes: note || state.notes });
+  // ok は進展の証拠: edit 堂々巡り・diff 停滞もリセットする
+  // （idle の eval 経路と attempt(ok) 自己申告経路の両方に効く）
+  writeState(root, {
+    ...state,
+    fail_streak,
+    notes: note || state.notes,
+    ...(ok
+      ? { edit_file: null, edit_streak: 0, diff_stall: 0 }
+      : {}),
+  });
   const cfg = readConfig(root);
   const escalate = !ok && fail_streak >= cfg.stuck_threshold;
+  const giveUp =
+    !ok && cfg.max_eval_fails > 0 && fail_streak >= cfg.max_eval_fails;
   if (state.goal_id) {
     recordEvent(root, {
       type: "attempt",
@@ -1133,7 +1283,147 @@ export function recordAttempt(
       note,
     });
   }
-  return { fail_streak, escalate };
+  return { fail_streak, escalate, giveUp };
+}
+
+/* ================================================================== *
+ * stuck 信号の追加: fail_streak（連続失敗）に加え、同一ファイル再編集と
+ * diff 停滞を機械カウントし、いずれかが閾値で oracle への相談を促す。
+ * 「相談」と「諦め (giveUp)」は別軸——こちらは pause しない。
+ * ================================================================== */
+
+/** 同一ファイル連続編集の純粋遷移。同一 → +1、別 → リセット */
+export function nextEditStreak(
+  prev: { file: string | null; streak: number },
+  file: string,
+): { file: string; streak: number } {
+  if (prev.file === file) return { file, streak: prev.streak + 1 };
+  return { file, streak: 1 };
+}
+
+/** edit/write 成功時に同一ファイル streak を更新する */
+export function noteEdit(root: string, filePath: string): LoopState {
+  const state = readState(root);
+  const next = nextEditStreak(
+    { file: state.edit_file, streak: state.edit_streak },
+    filePath,
+  );
+  const updated: LoopState = {
+    ...state,
+    edit_file: next.file,
+    edit_streak: next.streak,
+  };
+  writeState(root, updated);
+  return updated;
+}
+
+/** ワーキングコピー差分（親比）の行数を測る。stateless 測定のため
+ * baseline 不要。jj → git fallback。両失敗時は null（何もしない）。 */
+export async function measureWorkingCopyLines(
+  shell: Shell,
+  root: string,
+): Promise<number | null> {
+  try {
+    const r = await shell`jj diff --stat`.cwd(root).nothrow().quiet();
+    if (r.exitCode === 0) {
+      const lines = r.stdout.toString().trim().split("\n");
+      const parsed = parseDiffShortstat(lines[lines.length - 1] ?? "");
+      if (parsed !== null) return parsed;
+      // stat 出力なし（差分ゼロ）の判定: 空出力なら 0
+      if (r.stdout.toString().trim() === "") return 0;
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const r = await shell`git diff --shortstat`.cwd(root).nothrow().quiet();
+    if (r.exitCode === 0) {
+      const out = r.stdout.toString().trim();
+      if (out === "") return 0;
+      return parseDiffShortstat(out) ?? 0;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/** diff 停滞の純粋遷移。同一行数 → +1、変化・測定不能 → リセット */
+export function nextDiffStall(
+  prev: { lines: number | null; stall: number },
+  lines: number | null,
+): { lines: number | null; stall: number } {
+  if (lines === null) return { lines: prev.lines, stall: 0 };
+  if (prev.lines === lines) return { lines, stall: prev.stall + 1 };
+  return { lines, stall: 0 };
+}
+
+/** diff 停滞を更新する（測定不能時は現状維持） */
+export function noteDiffLines(
+  root: string,
+  lines: number | null,
+): LoopState {
+  const state = readState(root);
+  const next = nextDiffStall(
+    { lines: state.last_diff_lines, stall: state.diff_stall },
+    lines,
+  );
+  const updated: LoopState = {
+    ...state,
+    last_diff_lines: next.lines,
+    diff_stall: next.stall,
+  };
+  writeState(root, updated);
+  return updated;
+}
+
+export interface StuckStatus {
+  escalate: boolean;
+  reasons: string[];
+}
+
+/** stuck 信号の集約判定（読み取り専用。書き込みは note 系に分離）。
+ * fail_streak・同一ファイル再編集・diff 停滞の OR。
+ * recordAttempt が書き込んだ fail_streak を読むだけで、再計算・二重記録はしない。 */
+export function checkStuck(root: string): StuckStatus {
+  const cfg = readConfig(root);
+  const state = readState(root);
+  const reasons: string[] = [];
+  if (state.fail_streak >= cfg.stuck_threshold && cfg.stuck_threshold > 0) {
+    reasons.push(`fail_streak=${state.fail_streak}`);
+  }
+  if (
+    cfg.stuck_edit_repeat > 1 &&
+    state.edit_streak >= cfg.stuck_edit_repeat
+  ) {
+    reasons.push(`edit_repeat(${state.edit_file}×${state.edit_streak})`);
+  }
+  if (
+    cfg.stuck_diff_stall > 1 &&
+    state.diff_stall >= cfg.stuck_diff_stall
+  ) {
+    reasons.push(`diff_stall×${state.diff_stall}`);
+  }
+  return { escalate: reasons.length > 0, reasons };
+}
+
+/** stuck 通知した理由集合を記録する。同一理由なら stuck_hint を出さず
+ * false を返す（通知スキップ）。理由変化で true＋イベント記録。 */
+export function noteStuckNotified(root: string, reasons: string[]): boolean {
+  const state = readState(root);
+  const prev = state.last_stuck_reasons;
+  const same =
+    prev.length === reasons.length && prev.every((r, i) => r === reasons[i]);
+  if (same) return false;
+  writeState(root, { ...state, last_stuck_reasons: [...reasons] });
+  if (state.goal_id) {
+    recordEvent(root, {
+      type: "stuck_hint",
+      goal: state.goal_id,
+      reasons: [...reasons],
+    });
+  }
+  return true;
 }
 
 /* ================================================================== *

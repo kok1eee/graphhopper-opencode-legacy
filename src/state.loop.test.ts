@@ -3,14 +3,17 @@
  * bun test で実行する: `bun test src/state.loop.test.ts`
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type GraphhopperConfig,
   type SessionMessageLike,
   CONTINUATION_MARKER,
+  aggregateVerdicts,
   canonicalJSON,
+  checkStuck,
+  checkVerifierResults,
   clearActiveGoal,
   continuationFingerprint,
   detectLoopKind,
@@ -23,6 +26,11 @@ import {
   isValidBaselineRev,
   fnv1a,
   lastHumanId,
+  nextDiffStall,
+  nextEditStreak,
+  noteDiffLines,
+  noteEdit,
+  noteStuckNotified,
   measureDiffLines,
   noteContinuation,
   noteEvalFingerprint,
@@ -30,6 +38,7 @@ import {
   pauseGoal,
   readGoals,
   readState,
+  recordAttempt,
   resetLoopForClear,
   resumeGoal,
   startGoal,
@@ -47,6 +56,9 @@ const CFG: GraphhopperConfig = {
   loop_stop_max: 3,
   loop_tool_window: 8,
   loop_tool_repeat_threshold: 4,
+  max_eval_fails: 6,
+  stuck_edit_repeat: 5,
+  stuck_diff_stall: 4,
 };
 
 function tmpRoot(): string {
@@ -670,5 +682,298 @@ describe("回帰: clear は goal_complete を記録しない", () => {
       : "";
     expect(history).not.toContain("goal_complete");
     expect(readState(root).phase).toBe("designing");
+  });
+});
+
+describe("evalリトライ上限 giveUp", () => {
+  test("上限到達でgiveUp（escalateは先に発火）", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    let r = recordAttempt(root, false, "");
+    expect(r.escalate).toBe(false);
+    expect(r.giveUp).toBe(false);
+    r = recordAttempt(root, false, "");
+    expect(r.escalate).toBe(false);
+    r = recordAttempt(root, false, "");
+    expect(r.fail_streak).toBe(3);
+    expect(r.escalate).toBe(true); // stuck_threshold=3
+    expect(r.giveUp).toBe(false);
+    r = recordAttempt(root, false, "");
+    r = recordAttempt(root, false, "");
+    expect(r.fail_streak).toBe(5);
+    expect(r.giveUp).toBe(false);
+    r = recordAttempt(root, false, "");
+    expect(r.fail_streak).toBe(6);
+    expect(r.giveUp).toBe(true); // max_eval_fails=6
+  });
+
+  test("okでリセットされる", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    recordAttempt(root, false, "");
+    recordAttempt(root, false, "");
+    const r = recordAttempt(root, true, "");
+    expect(r.fail_streak).toBe(0);
+    expect(r.escalate).toBe(false);
+    expect(r.giveUp).toBe(false);
+  });
+
+  function rootWithConfig(cfg: object): string {
+    const root = tmpRoot();
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "config.json"),
+      JSON.stringify(cfg),
+      "utf8",
+    );
+    startGoal(root, "test goal", "sess1");
+    return root;
+  }
+
+  test("無効時(0以下)はgiveUpしない", () => {
+    const root = rootWithConfig({ max_eval_fails: 0 });
+    let r = recordAttempt(root, false, "");
+    for (let i = 0; i < 9; i++) r = recordAttempt(root, false, "");
+    expect(r.fail_streak).toBe(10);
+    expect(r.escalate).toBe(true);
+    expect(r.giveUp).toBe(false);
+  });
+
+  test("クランプ: stuck 10 / max 6 → 実効10", () => {
+    const root = rootWithConfig({ stuck_threshold: 10, max_eval_fails: 6 });
+    let r = recordAttempt(root, false, "");
+    for (let i = 0; i < 8; i++) r = recordAttempt(root, false, "");
+    expect(r.fail_streak).toBe(9);
+    expect(r.giveUp).toBe(false);
+    r = recordAttempt(root, false, "");
+    expect(r.fail_streak).toBe(10);
+    expect(r.giveUp).toBe(true);
+  });
+
+  test("resumeでfail_streakがリセットされる", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    recordAttempt(root, false, "");
+    recordAttempt(root, false, "");
+    expect(readState(root).fail_streak).toBe(2);
+    pauseGoal(root);
+    resumeGoal(root, "sess1");
+    expect(readState(root).fail_streak).toBe(0);
+  });
+});
+
+describe("verifier集約 aggregateVerdicts / checkVerifierResults", () => {
+  test("全clean → clean", () => {
+    expect(
+      aggregateVerdicts([
+        { lens: "requirement", level: "clean" },
+        { lens: "behavior", level: "clean" },
+        { lens: "progress", level: "clean" },
+      ]),
+    ).toEqual({ level: "clean", target: null });
+  });
+
+  test("単一drift → drift", () => {
+    expect(
+      aggregateVerdicts([
+        { lens: "requirement", level: "clean" },
+        { lens: "behavior", level: "drift", target: "design" },
+        { lens: "progress", level: "clean" },
+      ]),
+    ).toEqual({ level: "drift", target: "design" });
+  });
+
+  test("混在時はimplementingを優先", () => {
+    expect(
+      aggregateVerdicts([
+        { lens: "requirement", level: "drift", target: "design" },
+        { lens: "behavior", level: "drift", target: "implementing" },
+        { lens: "progress", level: "clean" },
+      ]),
+    ).toEqual({ level: "drift", target: "implementing" });
+  });
+
+  test("advisor単発（general 1件）", () => {
+    expect(
+      aggregateVerdicts([{ lens: "general", level: "clean" }]),
+    ).toEqual({ level: "clean", target: null });
+    expect(
+      aggregateVerdicts([
+        { lens: "general", level: "drift", target: "requirements" },
+      ]),
+    ).toEqual({ level: "drift", target: "requirements" });
+  });
+
+  test("空配列は拒否", () => {
+    expect(checkVerifierResults([])).toMatch(/^error/);
+    expect(checkVerifierResults(null)).toMatch(/^error/);
+    expect(checkVerifierResults(undefined)).toMatch(/^error/);
+  });
+
+  test("未知lens・重複lensは拒否", () => {
+    expect(
+      checkVerifierResults([
+        // @ts-expect-error 未知lensのテスト
+        { lens: "unknown", level: "clean" },
+      ]),
+    ).toMatch(/^error/);
+    expect(
+      checkVerifierResults([
+        { lens: "requirement", level: "clean" },
+        { lens: "requirement", level: "clean" },
+      ]),
+    ).toMatch(/^error/);
+  });
+
+  test("driftのtarget無しは拒否・cleanは通る", () => {
+    expect(
+      checkVerifierResults([{ lens: "behavior", level: "drift" }]),
+    ).toMatch(/^error/);
+    expect(
+      checkVerifierResults([
+        { lens: "behavior", level: "drift", target: "implementing" },
+      ]),
+    ).toBeNull();
+    expect(
+      checkVerifierResults([{ lens: "general", level: "clean" }]),
+    ).toBeNull();
+  });
+});
+
+describe("stuck信号: 同一ファイル再編集", () => {
+  test("同一連続で発火・別ファイルでリセット（純粋）", () => {
+    let s = { file: null as string | null, streak: 0 };
+    s = nextEditStreak(s, "src/a.ts");
+    expect(s).toEqual({ file: "src/a.ts", streak: 1 });
+    s = nextEditStreak(s, "src/a.ts");
+    expect(s.streak).toBe(2);
+    s = nextEditStreak(s, "src/b.ts");
+    expect(s).toEqual({ file: "src/b.ts", streak: 1 });
+  });
+
+  test("noteEditで蓄積しcheckStuckが発火する", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    for (let i = 0; i < 4; i++) noteEdit(root, "src/a.ts");
+    expect(checkStuck(root).escalate).toBe(false);
+    noteEdit(root, "src/a.ts");
+    const s = checkStuck(root);
+    expect(s.escalate).toBe(true);
+    expect(s.reasons.join(",")).toContain("edit_repeat(src/a.ts×5)");
+  });
+
+  test("eval pass（ok）でリセットされる", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    noteEdit(root, "src/a.ts");
+    noteEdit(root, "src/a.ts");
+    recordAttempt(root, true, "");
+    const st = readState(root);
+    expect(st.edit_streak).toBe(0);
+    expect(st.edit_file).toBeNull();
+  });
+});
+
+describe("stuck信号: diff停滞", () => {
+  test("同一行数で発火・変化でリセット（純粋）", () => {
+    let s = { lines: null as number | null, stall: 0 };
+    s = nextDiffStall(s, 10);
+    expect(s).toEqual({ lines: 10, stall: 0 });
+    s = nextDiffStall(s, 10);
+    s = nextDiffStall(s, 10);
+    expect(s.stall).toBe(2);
+    s = nextDiffStall(s, 12);
+    expect(s).toEqual({ lines: 12, stall: 0 });
+    s = nextDiffStall(s, null);
+    expect(s.stall).toBe(0);
+  });
+
+  test("noteDiffLinesで蓄積しcheckStuckが発火する", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    noteDiffLines(root, 100);
+    for (let i = 0; i < 2; i++) noteDiffLines(root, 100);
+    expect(checkStuck(root).escalate).toBe(false); // stall=2
+    noteDiffLines(root, 100);
+    expect(checkStuck(root).escalate).toBe(false); // stall=3
+    noteDiffLines(root, 100);
+    const s = checkStuck(root); // stall=4
+    expect(s.escalate).toBe(true);
+    expect(s.reasons.join(",")).toContain("diff_stall×4");
+  });
+});
+
+describe("stuck集約と通知抑止", () => {
+  test("信号なしではescalateしない", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    expect(checkStuck(root)).toEqual({ escalate: false, reasons: [] });
+  });
+
+  test("同一理由の再通知はスキップ・変化で再通知", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    const reasons = ["edit_repeat(src/a.ts×5)"];
+    expect(noteStuckNotified(root, reasons)).toBe(true);
+    expect(noteStuckNotified(root, reasons)).toBe(false);
+    expect(noteStuckNotified(root, [...reasons, "diff_stall×4"])).toBe(true);
+  });
+
+  test("historyにstuck_hintが記録される", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    noteStuckNotified(root, ["fail_streak=3"]);
+    const history = readFileSync(
+      join(root, ".graphhopper", "history.jsonl"),
+      "utf8",
+    );
+    expect(history).toContain("stuck_hint");
+  });
+
+  test("無効時(stuck_edit_repeat<=1)は発火しない", () => {
+    for (const v of [0, 1]) {
+      const root = tmpRoot();
+      mkdirSync(join(root, ".graphhopper"), { recursive: true });
+      writeFileSync(
+        join(root, ".graphhopper", "config.json"),
+        JSON.stringify({ stuck_edit_repeat: v }),
+        "utf8",
+      );
+      startGoal(root, "test goal", "sess1");
+      for (let i = 0; i < 10; i++) noteEdit(root, "src/a.ts");
+      expect(checkStuck(root).escalate).toBe(false);
+    }
+  });
+
+  test("無効時(stuck_diff_stall<=1)は発火しない", () => {
+    for (const v of [0, 1]) {
+      const root = tmpRoot();
+      mkdirSync(join(root, ".graphhopper"), { recursive: true });
+      writeFileSync(
+        join(root, ".graphhopper", "config.json"),
+        JSON.stringify({ stuck_diff_stall: v }),
+        "utf8",
+      );
+      startGoal(root, "test goal", "sess1");
+      for (let i = 0; i < 10; i++) noteDiffLines(root, 100);
+      expect(checkStuck(root).escalate).toBe(false);
+    }
+  });
+
+  test("複数信号の同時発火でreasonsに両方入る", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    for (let i = 0; i < 5; i++) noteEdit(root, "src/a.ts");
+    for (let i = 0; i < 5; i++) noteDiffLines(root, 100);
+    const s = checkStuck(root);
+    expect(s.escalate).toBe(true);
+    expect(s.reasons.length).toBe(2);
+  });
+
+  test("測定不能時はlines保持・stallリセット", () => {
+    expect(nextDiffStall({ lines: 10, stall: 3 }, null)).toEqual({
+      lines: 10,
+      stall: 0,
+    });
   });
 });

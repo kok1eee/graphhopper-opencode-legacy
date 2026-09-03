@@ -49,6 +49,11 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
     失敗試行（何を試して何が起きたか）を渡し、助言を受けて別のアプローチで再試行する
   - **これはrouter gate（diffサイズ）とは別軸のタイミング判断**——無条件で毎回opusを呼ぶのではなく、
     本当に詰まった時だけ上位モデルのコストを払う graph engineering の分岐点
+  - stuck 信号は3系統ある（いずれかで escalate。eval_cmd 運用では idle の eval 失敗文に自動追記される）:
+    - `fail_streak`（連続失敗。`ok`・phase 遷移・resume でリセット）
+    - 同一ファイル再編集（`stuck_edit_repeat` 既定5連。別ファイル・eval pass でリセット）
+    - diff 停滞（`stuck_diff_stall` 既定4。ワーキングコピー差分が変わらない idle eval の連続。差分変化・eval pass でリセット）
+  - 連続失敗が `max_eval_fails`（既定6）に達すると相談ではなく goal が pause する（giveUp）。修正して resume せよ
 - 全タスク実施したら `graphhopper_router_check` を呼ぶ（diffサイズを機械測定してrouteを決める）
 
 ### polish
@@ -76,13 +81,13 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 #### verifier（drift 検出）
 
 `graphhopper_router_check` の `route` に従う。**いずれのrouteでも `graphhopper-verifier` への
-第三者チェックは省略できない**（`graphhopper_verifier_set` はlensが空だとエラーを返す機械ゲートがある。
-自己レビューだけでのclean記録は不可能）:
+第三者チェックは省略できない**（`graphhopper_verifier_set` はresultsが空だとエラーを返す機械ゲートがある。
+自己レビューだけでのclean記録は不可能。level/targetの最終決定は機械集約される）:
 
 - **route=advisor**（小diff）: `task(subagent_type: "graphhopper-verifier")` を**1回だけ**、
   `general`charterで呼ぶ。「実装がdesign.mdの意図から外れていないか・テストが実際のユーザーパスを
   検証しているか・変更がgoalに収束しているか、3観点をまとめてレビューせよ」と渡す。
-  結果を `graphhopper_verifier_set(level: ..., reason: ..., lens: ["general"])` で記録
+  結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
 - **route=polish**（大diff・閾値超）: adversarial verifier fan-out を行う
   1. `task(subagent_type: "graphhopper-verifier")` を3回呼ぶ。それぞれ以下のcharterをプロンプトに含める:
      - requirement: 「実装がdesign.mdの意図から外れていないか（実装漏れ・解釈ズレ・スコープ逸脱）を検証せよ」
@@ -90,12 +95,15 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
      - progress: 「変更がgoalに収束しているか（堂々巡り・残骸・goal無関係な混入）を見よ」
   2. 各verifierに `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / diff（`jj diff --from <baseline>` または `git diff <baseline>`）を渡す
   3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
-  4. 3体の結果を集約し、confidence高 & severity high/critical のものだけ採用して
-     `graphhopper_verifier_set(level: "drift" | "clean", reason: ..., target: ..., lens: [...])` で記録
+  4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
+     `graphhopper_verifier_set(results: [...], reason: ...)` で1回記録する。
+     level/target の最終決定は機械集約（いずれか drift → drift、target は
+     implementing 優先）であり、メインの裁量で「重大なものだけ採用」といった
+     後段フィルタはしない
 
 ### done
 
-- `level: "clean"` が記録されていれば `graphhopper_phase(phase: "done")` → `graphhopper_goal(action: "complete")`
+- `集約 clean` が記録されていれば `graphhopper_phase(phase: "done")` → `graphhopper_goal(action: "complete")`
 - self-graded完了は禁止（`graphhopper_goal(complete)` は直近verifierがcleanでないとエラーを返す）
 
 ## handoff（別セッションへの引き継ぎ）
@@ -118,7 +126,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **route=advisor なのに simplify を実行しない**: simplify は route=polish（大diff）のときだけの条件分岐 node。advisor（小diff）ではスキップが正しい。逆に polish で飛ばすのも禁止
 - **simplify で critical を自動適用して設計を変えない**: interface / signature / 公開 API の振る舞いを変える提案は high 扱いで人間に提示。勝手に直すと design レベルの変更になる
 - **simplify 適用後に eval_cmd を再実行しないで verifier に進まない**: critical 適用でコードが再変更されている。機械確認してから verifier を呼ぶ
-- **route=advisorだからverifier呼び出し自体を省略しない**: 「小diffだから自分で見れば十分」は禁止。`graphhopper_verifier_set`はlensが空だと機械的にエラーを返す（self-graded完了防止のゲート）ので、必ず`task(graphhopper-verifier, charter: 'general')`を1回呼んでから記録する
-- **verifier fan-outへの指示を「重大な問題だけ報告」にしない**: 全件報告→confidence/severityで後段フィルタが正しい順序（保守的な指示は再現率を落とす）
+- **route=advisorだからverifier呼び出し自体を省略しない**: 「小diffだから自分で見れば十分」は禁止。`graphhopper_verifier_set`はresultsが空だと機械的にエラーを返す（self-graded完了防止のゲート）ので、必ず`task(graphhopper-verifier, charter: 'general')`を1回呼んでから記録する
+- **verifier fan-outへの指示を「重大な問題だけ報告」にしない**: 全件報告→機械集約が正しい順序（保守的な指示は再現率を落とす）。`results` に詰めるのは各charterの level そのまま。メインの裁量でdriftを握り潰さない（集約ルールがコード側にあるため握り潰せない）
 - **`graphhopper_attempt`を省略しない**: 呼ばなければfail_streakが0のまま止まり、詰まっていても oracle への相談が起動しない。実装試行のたびに毎回呼ぶ
 - **escalate: trueが出たのに自力でもう一度だけ試そうとしない**: 閾値はコード側の機械カウント。無視して回すと同じ失敗を繰り返すだけになりがちなので、必ずoracleに相談してから再試行する

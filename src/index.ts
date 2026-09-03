@@ -48,7 +48,7 @@ const PHASE_ACTION: Record<state.Phase, string> = {
   implementing:
     "design.md のタスクを実装する。まず graphhopper_set_eval(cmd) で合否を機械判定できるコマンド（テスト/lint/typecheck）を1度設定せよ。設定後はターン終了ごとに自動実行され、passならpolishへ自動遷移、failならfail_streakが機械カウントされ、escalateが返ったら task(subagent_type: 'graphhopper-oracle') に相談する。eval_cmdが無い（機械判定できない）場合のみ graphhopper_attempt(ok, note) の自己申告にフォールバックする",
   polish:
-    "graphhopper_router_check の route に従う。route=polish（大diff）ならまず simplify を実行する: メインが router.baseline_rev から diff を /tmp/gh-simplify-diff.txt に退避し、task(subagent_type: 'graphhopper-simplify') を1回呼んで提案を集める（3レンズ統合）。適用はメインが行う: 各 finding を Read で裏付け、critical は挙動不変・局所的なものだけ自動適用、high は人間確認、medium/note は報告のみ。適用後は eval_cmd を再実行して機械確認。route=advisor（小diff）なら simplify はスキップ。その後 verifier: route=polish なら requirement/behavior/progress の3charterで、route=advisor なら general charter で task(subagent_type: 'graphhopper-verifier') を呼び、結果を graphhopper_verifier_set で記録。level=clean で graphhopper_phase(phase: 'done') へ。level=drift かつ target=implementing なら implementing に戻る。advisor でも第三者チェック（verifier）は省略不可",
+    "graphhopper_router_check の route に従う。route=polish（大diff）ならまず simplify を実行する: メインが router.baseline_rev から diff を /tmp/gh-simplify-diff.txt に退避し、task(subagent_type: 'graphhopper-simplify') を1回呼んで提案を集める（3レンズ統合）。適用はメインが行う: 各 finding を Read で裏付け、critical は挙動不変・局所的なものだけ自動適用、high は人間確認、medium/note は報告のみ。適用後は eval_cmd を再実行して機械確認。route=advisor（小diff）なら simplify はスキップ。その後 verifier: route=polish なら requirement/behavior/progress の3charterで、route=advisor なら general charter で task(subagent_type: 'graphhopper-verifier') を呼び、結果を graphhopper_verifier_set で記録。集約 clean で graphhopper_phase(phase: 'done') へ。集約 drift かつ target=implementing なら implementing に戻る。advisor でも第三者チェック（verifier）は省略不可",
   done: "完了済み。graphhopper_goal(action: 'complete') を確認",
 };
 
@@ -201,6 +201,27 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       }
     },
 
+    /* 信号A: 同一ファイル再編集の計数。成功した edit/write のみ数えるため
+     * after フックを使う（before は design gate のブロック判定専用）。
+     * args は input 側にある点に注意（before と非対称）。 */
+    "tool.execute.after": async (input) => {
+      try {
+        const toolName = input.tool?.toLowerCase();
+        if (toolName !== "write" && toolName !== "edit") return;
+
+        const active = state.getActive(root);
+        if (!active || active.goal.status !== "active") return;
+        if (active.state.phase !== "implementing") return;
+        if (!input.sessionID || input.sessionID !== active.state.session_id)
+          return;
+        const filePath = resolveFilePath(input.args);
+        if (!filePath) return;
+        state.noteEdit(root, filePath);
+      } catch {
+        // 計数失敗で編集自体を壊さない
+      }
+    },
+
     tool: {
       graphhopper_goal: tool({
         description:
@@ -260,7 +281,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               // self-graded done 禁止: 直近の verifier clean を機械要求する（drift残りの完了を防ぐ）
               if (!args.force && a.state.last_verifier?.level !== "clean") {
                 return (
-                  "error: complete には直近の graphhopper_verifier_set(level: 'clean') が必要です（self-graded 完了は禁止）。" +
+                  "error: complete には直近の graphhopper_verifier_set（集約 clean）が必要です（self-graded 完了は禁止）。" +
                   "小diffで verifier fan-out が不要なら、人間の明示的な判断がある場合のみ force: true を使ってください。"
                 );
               }
@@ -378,11 +399,37 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           if (!active) return "error: no active goal";
           const r = state.recordAttempt(root, args.ok, args.note);
           if (args.ok) return "attempt recorded: ok (fail_streak reset to 0)";
+          // attempt 経路の giveUp も eval 経路と同型に pause + イベントまで
+          // 配線する（通知 promptAsync は不要＝戻り値テキストで伝わる）。
+          if (r.giveUp) {
+            const paused = state.pauseGoal(root);
+            if (paused) {
+              state.recordEvent(root, {
+                type: "eval_gave_up",
+                goal: paused.goal.id,
+                fail_streak: r.fail_streak,
+              });
+            }
+            return [
+              `attempt recorded: fail (fail_streak=${r.fail_streak})`,
+              `giveUp: true — 連続失敗が上限に達したため goal を pause した。修正して graphhopper_goal(action: 'resume') で再開せよ（fail_streak は 0 に戻る）。`,
+            ].join("\n");
+          }
           if (r.escalate) {
             return [
               `attempt recorded: fail (fail_streak=${r.fail_streak})`,
               "escalate: true",
               "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行（何を試して何が起きたか）を渡すこと。",
+            ].join("\n");
+          }
+          // 新信号でも同じ提案を出す（r.escalate 優先の else-if で重複回避）。
+          // fail 時のみ。pause 等はしない提案文だけ。
+          const stuck = state.checkStuck(root);
+          if (stuck.escalate && state.noteStuckNotified(root, stuck.reasons)) {
+            return [
+              `attempt recorded: fail (fail_streak=${r.fail_streak})`,
+              `escalate: true (stuck: ${stuck.reasons.join(", ")})`,
+              "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。",
             ].join("\n");
           }
           return `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false`;
@@ -412,56 +459,61 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             `route: ${route}`,
             route === "polish"
               ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
-              : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(lens: ['general'])で記録する（自己レビューだけでの完了は不可）",
+              : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(results: [{lens: 'general', level}])で記録する（自己レビューだけでの完了は不可）",
           ].join("\n");
         },
       }),
 
       graphhopper_verifier_set: tool({
         description:
-          "polish/advisorのverifier結果（clean/drift）を記録する。drift かつ target=implementing なら implementing に巻き戻し可能。target=design/requirementsは人間のhand-back待ち。self-graded完了防止のため、lensが1つも無い（=task(graphhopper-verifier)を一度も呼んでいない）場合はエラーになる",
+          "polish/advisorのverifier結果を記録する。各charterの結果をresultsに詰めるとlevel/targetは機械集約される（drift かつ target=implementing なら implementing に巻き戻し可能。target=design/requirementsは人間のhand-back待ち）。self-graded完了防止のため、resultsが空（=task(graphhopper-verifier)を一度も呼んでいない）場合はエラーになる",
         args: {
-          level: tool.schema.enum(["clean", "drift"]),
-          reason: tool.schema
-            .string()
-            .describe("採用したdrift、またはcleanの根拠を1〜3文で"),
-          target: tool.schema
-            .enum(["implementing", "design", "requirements"])
-            .optional()
-            .describe("drift時の巻き戻し先。clean時は不要"),
-          lens: tool.schema
+          results: tool.schema
             .array(
-              tool.schema.enum([
-                "requirement",
-                "behavior",
-                "progress",
-                "general",
-              ]),
+              tool.schema.object({
+                lens: tool.schema.enum([
+                  "requirement",
+                  "behavior",
+                  "progress",
+                  "general",
+                ]),
+                level: tool.schema.enum(["clean", "drift"]),
+                target: tool.schema
+                  .enum(["implementing", "design", "requirements"])
+                  .optional()
+                  .describe(
+                    "drift時の巻き戻し先（level=drift なら必須）。clean時は不要",
+                  ),
+              }),
             )
             .describe(
-              "実際にtask(graphhopper-verifier)を呼んで得たレンズ。route=advisorなら['general']1つで良いが、必ず1つ以上必要（第三者チェック無しのself-graded完了を防ぐため空配列は拒否される）",
+              "実際にtask(graphhopper-verifier)を呼んで得た各charterの結果。route=advisorならgeneral 1件、route=polishならrequirement/behavior/progressの3件。level/targetの最終決定は機械集約（state.aggregateVerdicts）で行う",
+            ),
+          reason: tool.schema
+            .string()
+            .describe(
+              "集約結果の要約（1〜3文。監査証跡のため必須）。採用基準自体は機械集約される",
             ),
         },
         async execute(args) {
-          if (args.level === "drift" && !args.target)
-            return "error: drift には target が必要です";
-          if (!args.lens || args.lens.length === 0) {
-            return "error: lens が空です。graphhopper_verifier_set は task(subagent_type: 'graphhopper-verifier') を実際に呼んだ後にしか記録できません（self-graded完了を防ぐための機械的ゲート）。route=advisorでも最低1回、'general'charterで呼んでください。";
-          }
+          const results = (args.results ?? []) as state.VerifierResult[];
+          const rejected = state.checkVerifierResults(results);
+          if (rejected) return rejected;
+          const decided = state.aggregateVerdicts(results);
           const result = state.setVerifierVerdict(root, {
-            level: args.level,
+            level: decided.level,
             reason: args.reason,
-            target: args.target ?? null,
-            lens: args.lens,
+            target: decided.target,
+            lens: results.map((r) => r.lens),
           });
           if (result.last_verifier?.level === "clean") {
             return "verifier verdict: clean\ngraphhopper_phase(phase: 'done') で完了に進める。";
           }
           return [
-            `verifier verdict: drift -> ${args.target}`,
+            `verifier verdict: drift -> ${decided.target}`,
             `reason: ${args.reason}`,
-            `lens: ${args.lens?.join(",") || "-"}`,
-            args.target === "implementing"
+            `lens: ${results.map((r) => `${r.lens}=${r.level}`).join(",")}`,
+            decided.target === "implementing"
               ? "次: graphhopper_phase(phase: 'implementing') で巻き戻し"
               : "次: 人間の hand-back を待つ（design/requirementsは自動で戻らない）",
           ].join("\n");
@@ -470,7 +522,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
 
       /* ============================================================ *
        * design.md質レビュー（graphhopper-critic）の記録。opt-in・ハードゲート無し。
-       * verifier_setのようなlens空拒否（self-graded防止）は付けない——design時点では
+       * verifier_setのようなresults空拒否（self-graded防止）は付けない——design時点では
        * 客観的な閾値が存在せず、ゲート化すると「薄く書いて回避する」自己判断エロージョンを
        * 再生産するだけのため。呼ぶかどうかはメインエージェントの裁量（graphhopper本体の
        * design-set / ROADMAP.md の判断を参照）。
@@ -870,6 +922,11 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             result.ok,
             result.ok ? "" : `eval failed: ${cmd}`,
           );
+          // 信号B: ワーキングコピー差分の停滞を測る（eval 成否問わず。
+          // ok 時は recordAttempt が stall を 0 にしているため、ここでは
+          // 変化比較だけ行う。測定不能時は現状維持）
+          const wcLines = await state.measureWorkingCopyLines($, root);
+          if (wcLines !== null) state.noteDiffLines(root, wcLines);
           if (active.goal.id)
             state.recordEvent(root, {
               type: "eval_run",
@@ -902,13 +959,60 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               state.recordRouterCheck(root, baseline, 0, "advisor");
               evalNote = `eval_cmd passed but diff_lines=0 since baseline — まだ何も実装していない。polishへは進めない。実装を進めよ: ${cmd}`;
             }
+          } else if (r.giveUp) {
+            // リトライ上限: 無限の eval 失敗駆動を止める。loop 停止と同型の
+            // pause + 1回通知。loop_stop_count は消費しない（pauseGoal 直使い。
+            // eval 壊れと echo ループの混線を避ける。design g-mtl8vjnc T1）。
+            const paused = state.pauseGoal(root);
+            if (paused) {
+              state.recordEvent(root, {
+                type: "eval_gave_up",
+                goal: paused.goal.id,
+                fail_streak: r.fail_streak,
+              });
+              console.warn(
+                "graphhopper: eval_cmd failed %d times in a row. paused goal=%s to stop auto-continuation",
+                r.fail_streak,
+                paused.goal.id,
+              );
+              try {
+                await client.session.promptAsync({
+                  path: { id: sessionID },
+                  body: {
+                    parts: [
+                      {
+                        type: "text",
+                        text: `[graphhopper] eval_cmd が ${r.fail_streak} 回連続失敗したため自動継続を停止しました（goal は pause）。eval を修正してから graphhopper_goal(action: 'resume') で再開してください（fail_streak は resume 時に 0 に戻ります）。\n${cmd}\n${tail}`,
+                      },
+                    ],
+                  },
+                });
+              } catch {
+                // 通知失敗でも停止は成立している
+              }
+            }
+            return;
           } else {
+            // 新信号 (edit_repeat/diff_stall) でも r.escalate と同じ提案を出す。
+            // 重複時は1回のみ（r.escalate 優先の else-if）。giveUp が最優先で
+            // 先に処理済みのためここには来ない。
+            let stuckLine = "";
+            if (r.escalate) {
+              stuckLine =
+                "escalate: task(subagent_type: 'graphhopper-oracle') に相談せよ。";
+            } else {
+              const stuck = state.checkStuck(root);
+              if (
+                stuck.escalate &&
+                state.noteStuckNotified(root, stuck.reasons)
+              ) {
+                stuckLine = `stuck: ${stuck.reasons.join(", ")} — task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。`;
+              }
+            }
             evalNote = [
               `eval_cmd FAILED (fail_streak=${r.fail_streak}): ${cmd}`,
               tail,
-              r.escalate
-                ? "escalate: task(subagent_type: 'graphhopper-oracle') に相談せよ。"
-                : "",
+              stuckLine,
             ]
               .filter(Boolean)
               .join("\n");
