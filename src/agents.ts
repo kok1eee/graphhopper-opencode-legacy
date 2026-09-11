@@ -48,15 +48,58 @@ const SEARCH_RULES: readonly string[] = [
 ];
 
 /**
- * 読み取り専用を保ったまま `rg` / `fd` だけ許可する bash 権限。
- * 全subagentは edit deny + bash 検索コマンドのみ（plain grep・find 等の他コマンドは deny）。
+ * 読み取り専用を保ったまま検索・確認系コマンドだけ許可する bash 権限（design g-mtwlqzbb）。
+ * 全subagentは edit deny + bash はこの許可リストのみ（plain grep・find 等の他コマンドは deny）。
+ *
+ * 重要: opencodeのbash permissionはfindLast（最後にマッチしたルールが勝つ）で評価される。
+ * このオブジェクトの記述順がそのまま評価優先度になるため、以下の構造を厳守すること:
+ *   1. base deny（"*": "deny"）— 先頭
+ *   2. 個別allow群 — 中盤
+ *   3. リダイレクト・引数注入対策のdeny群 — 必ずallow群より後方（末尾）
+ * 将来コマンドを追記する際、allow行を末尾に追加すると3のdeny群より後に来てしまい、
+ * リダイレクト対策が静かに無効化される。追記は必ず2の位置（deny群より前）に行うこと。
  */
 const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "*": "deny",
+  // 1. 個別allow群（検索・確認系のみ。書き込み・外部実行系オプションを持つコマンドは
+  // 引数注入対策(下記3)と対で追加する）
   rg: "allow",
   "rg *": "allow",
   fd: "allow",
   "fd *": "allow",
+  "tgrep search*": "allow", // index/serveは状態変更を伴うため対象外、searchのみ
+  cat: "allow",
+  "cat *": "allow",
+  head: "allow",
+  "head *": "allow",
+  tail: "allow",
+  "tail *": "allow",
+  "wc *": "allow",
+  pwd: "allow",
+  ls: "allow",
+  "ls *": "allow",
+  "git status": "allow",
+  "git status *": "allow",
+  "git diff": "allow",
+  "git diff *": "allow",
+  "git log": "allow",
+  "git log *": "allow",
+  "jj status": "allow",
+  "jj status *": "allow",
+  "jj diff": "allow",
+  "jj diff *": "allow",
+  "jj log": "allow",
+  "jj log *": "allow",
+  // 2. リダイレクト対策（allow群より後方。空白ありの `>`/`>>` のみ対象。
+  // 無空白リダイレクト(`2>/dev/null`等)は受容リスクとして残る）
+  "* > *": "deny",
+  "* >> *": "deny",
+  // 3. 引数注入対策。--output/--tool等の危険フラグはコマンド名直後より後ろの
+  // 任意位置に来るため、コマンド名の直後に `*` を挟んで前方一致にする
+  "git diff* --output*": "deny",
+  "git log* --output*": "deny",
+  "jj diff* --tool*": "deny",
+  "jj diff* --edit*": "deny",
 };
 
 export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
