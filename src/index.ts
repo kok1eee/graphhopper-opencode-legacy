@@ -52,6 +52,17 @@ const PHASE_ACTION: Record<state.Phase, string> = {
   done: "完了済み。graphhopper_goal(action: 'complete') を確認",
 };
 
+/* continuation（session.idle → promptAsync）のuser向け表示用の1行要約。
+ * LLM向けの詳細指示は PHASE_ACTION のまま chat.system.transform 側で注入する
+ * （design g-mtwhdb4t）。done は continuation 自体が発火しない（idle ハンドラが
+ * phase==="done" で早期return）ため実質未使用だが、Record の型完全性のために残す。 */
+const PHASE_ACTION_SHORT: Record<state.Phase, string> = {
+  designing: "設計ドキュメントを書き、criticレビュー後にimplementingへ",
+  implementing: "design.mdのタスクを実装し、eval_cmdを設定",
+  polish: "router_checkのrouteに従いsimplify/verifierを実行",
+  done: "goalをcompleteする",
+};
+
 /* idle 取得の窓と上限（design g-mtl7l8j3 T1/T2）。
  * TAIL_LIMIT: loop検知窓 (loop_tool_window=8) + echo 用履歴 + margin。
  * TAIL_STALE_MS: idle 直後なのに窓内最新がこれより古ければ、limit が末尾窓を
@@ -86,7 +97,7 @@ function continuationText(goal: state.Goal, s: state.LoopState): string {
       ? `last_verifier: ${s.last_verifier.level} (${s.last_verifier.reason})`
       : null,
     s.fail_streak > 0 ? `fail_streak: ${s.fail_streak}` : null,
-    `次のアクション: ${PHASE_ACTION[s.phase]}`,
+    `Next: ${PHASE_ACTION_SHORT[s.phase]}`,
     "フェーズのexit条件を満たしたら graphhopper_phase で遷移する。",
     "ブロックしたら回らずに理由を述べて停止。完了したら graphhopper_goal(complete)。無駄な空転は禁止。",
   ]
@@ -141,6 +152,22 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       // 注記: graphhopper_phase(implementing) を呼ぶターン自体はプロンプト組み立て済みで
       // 注入されない。注入は次ターンから（session.idle → continuation → 新ターン）。
       const active = state.getActive(root);
+
+      // continuation（user向け表示）はSHORT要約のみ。LLM向けの詳細指示は
+      // ここで system prompt に注入する（design g-mtwhdb4t）。PONYTAILゲートと
+      // 同型の4条件 + phase!=="done"（done後はcontinuation自体が発火しないため不要）。
+      if (
+        active &&
+        active.goal.status === "active" &&
+        active.state.phase !== "done" &&
+        input.sessionID &&
+        input.sessionID === active.state.session_id
+      ) {
+        output.system.push(
+          `## graphhopper 次のアクション（詳細）\n\n${PHASE_ACTION[active.state.phase]}`,
+        );
+      }
+
       if (
         active &&
         active.goal.status === "active" &&
