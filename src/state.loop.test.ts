@@ -50,7 +50,6 @@ const CFG: GraphhopperConfig = {
   router_threshold_lines: 400,
   design_gate_allow: [".graphhopper/plans/"],
   agents: {},
-  handoff_nudge_chars: 500_000,
   stuck_threshold: 3,
   loop_stop_threshold: 6,
   loop_stop_max: 3,

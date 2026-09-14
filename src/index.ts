@@ -21,8 +21,7 @@
  * - hook:
  *   - tool.execute.before : designing フェーズで edit/write を許可パス（plans/ 配下）以外に通さない
  * - event:
- *   - session.idle    : active goal があれば継続プロンプトを注入（ループの心臓）。
- *                        会話サイズが handoff_nudge_chars を超えたら一度だけ handoff を促す
+ *   - session.idle    : active goal があれば継続プロンプトを注入（ループの心臓）
  *   - session.deleted : セッション紐付けを解除
  *
  * state は `.graphhopper/` に保存される（state.ts 参照）。
@@ -68,13 +67,15 @@ const PHASE_ACTION_SHORT: Record<state.Phase, string> = {
  * TAIL_STALE_MS: idle 直後なのに窓内最新がこれより古ければ、limit が末尾窓を
  *   返していないとみなす self-check 閾値。
  * MAX_FETCH_CHARS: 全件フォールバック時の上限。これ超は検知・dedupe スキップ。
- * NUDGE_EVERY: nudge 用の全文測定はこの idle 間隔に1回（間引き）。
+ * SAMPLING_EVERY: oversizeSticky 検出・回復用の全文測定はこの idle 間隔に1回（間引き。
+ *   design g-mtwoelz7でnudge機能削除に伴い NUDGE_EVERY から改名。役割はサンプリング
+ *   間隔そのものであり、nudgeとは無関係）。
  * oversizeSticky / idleTick はモジュール変数（state 汚染回避。プロセス共有の
  * ため混在時は厳しい判定が勝つ。compact 後は測定で回復する）。 */
 const TAIL_LIMIT = 50;
 const TAIL_STALE_MS = 10 * 60 * 1000;
 const MAX_FETCH_CHARS = 2_000_000;
-const NUDGE_EVERY = 10;
+const SAMPLING_EVERY = 10;
 let oversizeSticky = false;
 let idleTick = 0;
 
@@ -790,20 +791,18 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
 
         /* session.messages の取得戦略（design g-mtl7l8j3 T1/T2）。
          * - 通常: 末尾 TAIL_LIMIT 件のみ（time.created 昇順に正規化）。
-         * - サンプリング turn（NUDGE_EVERY に1回）: 全文1本のみ。nudge 測定と
-         *   sticky からの回復確認を兼ね、検知にもそのまま使う。
+         * - サンプリング turn（SAMPLING_EVERY に1回）: 全文1本のみ。sticky からの
+         *   回復確認を兼ね、検知にもそのまま使う。
          * - self-check: idle 直後なのに窓内最新が古ければ limit が末尾窓を
          *   返していないとみなし、全件にフォールバック（上限付き）。
          * - 全件が MAX_FETCH_CHARS 超なら oversizeSticky を立て、検知・dedupe
          *   をスキップして注入継続（駆動を止めない）。回復はサンプリングで。
          * いずれも idle あたり fetch は1本（g-mtl65slm T5 の不変条件を維持）。 */
         let idleMsgs: state.SessionMessageLike[] | null = null;
-        let measuredSize: number | null = null;
         const orderMsgs = (arr: state.SessionMessageLike[]) =>
           [...arr].sort((a, b) => msgTime(a) - msgTime(b));
         const classifyFull = (all: state.SessionMessageLike[]) => {
           const size = JSON.stringify(all).length;
-          measuredSize = size;
           if (size > MAX_FETCH_CHARS) {
             oversizeSticky = true;
             return null;
@@ -812,11 +811,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           return orderMsgs(all);
         };
         try {
-          // nudge 済み・非 sticky なら測定不要のためサンプリング自体を省く
-          const needMeasure =
-            !active.state.handoff_nudged || oversizeSticky;
-          const sampling =
-            needMeasure && idleTick % NUDGE_EVERY === 0;
+          const sampling = idleTick % SAMPLING_EVERY === 0;
           if (oversizeSticky && !sampling) {
             // 巨大確定中は取得自体を省く（eval・注入は継続）
             idleMsgs = null;
@@ -1048,23 +1043,6 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           if (!active) return;
         }
 
-        /* handoff一度きり通知: 会話サイズ（session.messagesのJSON文字数、transcriptサイズの
-         * 代理指標）が閾値を超えたら知らせる。対応必須ではないため、doneには持ち込まない
-         * （dedupで無限ループ化を防ぐ。graphhopper本体 hooks/loop-driver.sh 参照）。
-         * サイズはサンプリング turn の全文測定値を使い回す（測定の無い turn・
-         * fetch失敗時はスキップ。最大 NUDGE_EVERY-1 idle の遅延）。 */
-        let handoffNote: string | null = null;
-        if (!active.state.handoff_nudged && measuredSize !== null) {
-          const cfg = state.readConfig(root);
-          if (measuredSize >= cfg.handoff_nudge_chars) {
-            state.setHandoffNudged(root, measuredSize);
-            handoffNote = `graphhopper: 会話が大きくなっています（推定サイズ${measuredSize}文字・閾値${cfg.handoff_nudge_chars}文字）。対応必須ではありません。必要なら graphhopper_handoff で別セッションへ引き継げます（このgoalでは1回だけの通知）。`;
-          }
-        }
-
-        active = state.getActive(root);
-        if (!active) return;
-
         await client.session.promptAsync({
           path: { id: sessionID },
           body: {
@@ -1076,7 +1054,6 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
                   // ウィンドウが自前注入でリセットされるのを防ぐ）
                   state.CONTINUATION_MARKER,
                   evalNote,
-                  handoffNote,
                   continuationText(active.goal, active.state),
                 ]
                   .filter(Boolean)

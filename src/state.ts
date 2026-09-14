@@ -80,8 +80,6 @@ export interface LoopState {
   last_verifier: VerifierVerdict | null;
   /** designing終了前のcritic review結果。null = 未実行（opt-in、setPhaseの前提条件にはしない） */
   critic_review: CriticVerdict | null;
-  /** handoffの一度きり通知（会話サイズ閾値超）を出したか。goalにつき1回だけ通知するためのdedup */
-  handoff_nudged: boolean;
   /**
    * implementing での連続失敗数（graphhopper_attempt が機械カウント）。
    * stuck_threshold に達したら graphhopper-oracle への相談を促す。
@@ -151,10 +149,6 @@ export interface GraphhopperConfig {
   agents: { [name: string]: string };
   /** implementing の連続失敗数がこれに達したら graphhopper-oracle への相談を促す */
   stuck_threshold: number;
-  /** handoff一度きり通知の閾値（session.messagesのJSON文字数、transcriptサイズの代理指標）。
-   * Claude Code版の GH_HANDOFF_THRESHOLD_KB（既定500KB）相当。opencodeにはtranscript_pathが
-   * 無いため client.session.messages() のJSONシリアライズ長で近似する */
-  handoff_nudge_chars: number;
   /** echoループ（直前のassistantメッセージとほぼ同一のuserメッセージ）を
    * 何回連続で検知したら自動継続注入を止めるか。0以下なら echo 検知を無効化
    * （tool検知は loop_tool_repeat_threshold で独立に制御される） */
@@ -185,7 +179,6 @@ export const DEFAULT_CONFIG: GraphhopperConfig = {
   router_threshold_lines: 400,
   design_gate_allow: [".graphhopper/plans/"],
   agents: {},
-  handoff_nudge_chars: 500_000,
   stuck_threshold: 3,
   loop_stop_threshold: 6,
   loop_stop_max: 3,
@@ -281,7 +274,6 @@ export type HistoryEvent =
     }
   | { type: "loop_stopped"; goal: string; count: number }
   | { type: "loop_resume_forced"; goal: string }
-  | { type: "handoff_nudged"; goal: string; size_chars: number }
   | { type: "continuation_skipped"; goal: string; marker: string };
 
 /** append-only の履歴ログ。LLMの自己申告ではなくplugin機械記録の監査証跡 */
@@ -324,8 +316,6 @@ export function readConfig(root: string): GraphhopperConfig {
       raw.design_gate_allow ?? DEFAULT_CONFIG.design_gate_allow,
     agents: { ...(DEFAULT_CONFIG.agents ?? {}), ...(raw.agents ?? {}) },
     stuck_threshold,
-    handoff_nudge_chars:
-      raw.handoff_nudge_chars ?? DEFAULT_CONFIG.handoff_nudge_chars,
     loop_stop_threshold:
       raw.loop_stop_threshold ?? DEFAULT_CONFIG.loop_stop_threshold,
     loop_stop_max: raw.loop_stop_max ?? DEFAULT_CONFIG.loop_stop_max,
@@ -361,7 +351,6 @@ function emptyState(): LoopState {
     },
     last_verifier: null,
     critic_review: null,
-    handoff_nudged: false,
     fail_streak: 0,
     eval_cmd: null,
     last_continuation_marker: null,
@@ -825,23 +814,6 @@ export function setCriticVerdict(
       type: "critic_review_set",
       goal: state.goal_id,
       level: verdict.level,
-    });
-  }
-  return next;
-}
-
-/** handoffの一度きり通知を送ったことを記録する（goalにつき1回だけ通知するためのdedup）。
- * 会話が大きいこと自体はeval失敗やverdict未記録のような「直すべき異常」ではないため、
- * 一度知らせたら二度と鳴らさない（graphhopper本体 hooks/loop-driver.sh のdedupと同じ思想）。 */
-export function setHandoffNudged(root: string, sizeChars: number): LoopState {
-  const state = readState(root);
-  const next: LoopState = { ...state, handoff_nudged: true };
-  writeState(root, next);
-  if (state.goal_id) {
-    recordEvent(root, {
-      type: "handoff_nudged",
-      goal: state.goal_id,
-      size_chars: sizeChars,
     });
   }
   return next;

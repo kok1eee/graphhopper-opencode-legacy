@@ -108,9 +108,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 ## handoff（別セッションへの引き継ぎ）
 
-- 会話が大きくなると `session.idle` が一度だけ `graphhopper_handoff` の利用を促す通知を挟む
-  （`.graphhopper/config.json` の `handoff_nudge_chars`、既定500,000文字。goalにつき1回だけ）
-- 通知は対応必須ではない。使うなら `graphhopper_handoff(session_id: "<ID>")`
+- 会話が大きくなった等、必要に応じて明示的に `graphhopper_handoff(session_id: "<ID>")` を呼ぶ
   （`session_id`未指定なら候補セッション列挙のみ、送信しない）。信頼できるセッション
   同士でのみ使う（opencodeにはClaude Codeの`crossSessionInbound`相当の受信制御が無く、
   受け手は許可なしで自動処理するため）
