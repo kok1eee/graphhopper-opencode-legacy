@@ -36,6 +36,7 @@ import {
   noteEvalFingerprint,
   parseDiffShortstat,
   pauseGoal,
+  readConfig,
   readGoals,
   readState,
   recordAttempt,
@@ -661,6 +662,79 @@ describe("回帰: state 読み書きの堅牢化", () => {
     expect(canonicalJSON(undefined)).toBe("undefined");
     expect(canonicalJSON(() => {})).toBe("undefined");
     expect(canonicalJSON({ b: 2, a: 1 })).toBe(canonicalJSON({ a: 1, b: 2 }));
+  });
+});
+
+describe("config 2層解決（グローバル既定 → プロジェクト上書き）", () => {
+  /** GRAPHHOPPER_CONFIG を差分ファイルに向けて readConfig を実行する（実ユーザー設定を読まない） */
+  function withGlobal(json: object | null, fn: () => void): void {
+    const prev = process.env.GRAPHHOPPER_CONFIG;
+    const path = join(tmpRoot(), "global.json");
+    if (json !== null) writeFileSync(path, JSON.stringify(json), "utf8");
+    process.env.GRAPHHOPPER_CONFIG = path; // 未作成なら readJson が {} を返す
+    try {
+      fn();
+    } finally {
+      if (prev === undefined) delete process.env.GRAPHHOPPER_CONFIG;
+      else process.env.GRAPHHOPPER_CONFIG = prev;
+    }
+  }
+
+  function withProject(root: string, cfg: object): void {
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "config.json"),
+      JSON.stringify(cfg),
+      "utf8",
+    );
+  }
+
+  test("プロジェクト設定が無ければグローバル既定が効く", () => {
+    withGlobal({ agents: { "graphhopper-verifier": "zai/glm" }, stuck_threshold: 9 }, () => {
+      const cfg = readConfig(tmpRoot());
+      expect(cfg.agents["graphhopper-verifier"]).toBe("zai/glm");
+      expect(cfg.stuck_threshold).toBe(9);
+    });
+  });
+
+  test("プロジェクトは同名だけ上書きし、他はグローバルを継承する", () => {
+    withGlobal(
+      {
+        agents: { "graphhopper-verifier": "global-v", "graphhopper-critic": "global-c" },
+        stuck_threshold: 9,
+      },
+      () => {
+        const root = tmpRoot();
+        withProject(root, { agents: { "graphhopper-verifier": "project-v" } });
+        const cfg = readConfig(root);
+        expect(cfg.agents["graphhopper-verifier"]).toBe("project-v");
+        expect(cfg.agents["graphhopper-critic"]).toBe("global-c");
+        expect(cfg.stuck_threshold).toBe(9);
+      },
+    );
+  });
+
+  test("グローバル・プロジェクトとも無ければ DEFAULT にフォールバック", () => {
+    withGlobal(null, () => {
+      const cfg = readConfig(tmpRoot());
+      expect(cfg.agents).toEqual({});
+      expect(cfg.stuck_threshold).toBe(CFG.stuck_threshold);
+    });
+  });
+
+  test("グローバル設定が壊れていても既定で動く（例外を投げない）", () => {
+    const prev = process.env.GRAPHHOPPER_CONFIG;
+    const path = join(tmpRoot(), "broken.json");
+    writeFileSync(path, "{ not json", "utf8");
+    process.env.GRAPHHOPPER_CONFIG = path;
+    try {
+      const cfg = readConfig(tmpRoot());
+      expect(cfg.agents).toEqual({});
+      expect(cfg.stuck_threshold).toBe(CFG.stuck_threshold);
+    } finally {
+      if (prev === undefined) delete process.env.GRAPHHOPPER_CONFIG;
+      else process.env.GRAPHHOPPER_CONFIG = prev;
+    }
   });
 });
 

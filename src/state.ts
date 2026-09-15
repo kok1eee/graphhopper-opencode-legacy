@@ -8,6 +8,10 @@
  * - history.jsonl : 監査ログ（append-only）
  * - plans/<goal-id>.md : design ドキュメント（designing フェーズで書く唯一の許可パス）
  *
+ * config は「グローバル既定 → プロジェクト上書き」の2層で解決する（readConfig）。
+ * グローバル既定は `~/.config/opencode/graphhopper.json`（`GRAPHHOPPER_CONFIG` で変更可）。
+ * 全プロジェクトで同じ agents 設定を使いたい場合はグローバルに1枚置けばよい。
+ *
  * 外部依存なし（node stdlib のみ）。全ての書き込みは tmp+rename で原子的に行う。
  * flywheel-opencode (src/state.ts) の atomic write パターンを踏襲。
  */
@@ -19,6 +23,7 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 /** graphhopper 本体（Claude Code版）の3相グラフに合わせる。flywheelの8フェーズより薄い */
@@ -205,6 +210,14 @@ function configPath(root: string): string {
   return join(dir(root), "config.json");
 }
 
+/** 全プロジェクト共通の既定設定。`GRAPHHOPPER_CONFIG` で明示指定も可能。 */
+function globalConfigPath(): string {
+  return (
+    process.env.GRAPHHOPPER_CONFIG ??
+    join(homedir(), ".config", "opencode", "graphhopper.json")
+  );
+}
+
 function historyPath(root: string): string {
   return join(dir(root), "history.jsonl");
 }
@@ -305,7 +318,15 @@ function atomicWrite(path: string, data: unknown): void {
 }
 
 export function readConfig(root: string): GraphhopperConfig {
-  const raw = readJson<Partial<GraphhopperConfig>>(configPath(root), {});
+  // グローバル既定 < プロジェクト上書き。agents だけは name 単位でマージする
+  // （プロジェクト側で一部の subagent だけ別モデルに差し替えられるように）。
+  const global = readJson<Partial<GraphhopperConfig>>(globalConfigPath(), {});
+  const project = readJson<Partial<GraphhopperConfig>>(configPath(root), {});
+  const raw: Partial<GraphhopperConfig> = {
+    ...global,
+    ...project,
+    agents: { ...(global.agents ?? {}), ...(project.agents ?? {}) },
+  };
   const stuck_threshold =
     raw.stuck_threshold ?? DEFAULT_CONFIG.stuck_threshold;
   const maxRaw = raw.max_eval_fails ?? DEFAULT_CONFIG.max_eval_fails;
