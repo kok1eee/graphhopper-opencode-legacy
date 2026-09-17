@@ -33,16 +33,19 @@ import type { Config } from "@opencode-ai/plugin";
 import type { AgentConfig } from "@opencode-ai/sdk";
 
 /**
- * 全subagent共通の探索ルール（graft-first + rg固定）。
+ * 全subagent共通の探索ルール（graft-first）。
  * 背景: researcher/critic/verifier が Grep ツール連打・graft MCP 未使用で
  * トークンを浪費する事例が多発したため、prompt レベルで強制する。
- * - コード探索は graft MCP を先に使う。graft で絞りきれない時だけ rg にフォールバック。
+ * tier（design g-mu4wradt D4）: graft（意味・構造の入口）→ sg（構造パターン）
+ *   → tgrep（巨大repoの高速regex。serve稼働時のみ。index/serveは状態変更のためdeny=BYOS）
+ *   → rg（テキスト最終手段）。
  * - テキスト検索は plain grep ではなく必ず `rg`（bash経由）。
  * - 同じ概念の検索を繰り返さない。Read 全文取得の直後に同じファイルへ Grep しない。
  */
 const SEARCH_RULES: readonly string[] = [
-  "- コード探索は graft MCP を先に使う（graft_find_code=定義・意味検索 / graft_find_all=全出現 / graft_trace_calls=呼び出し元・先と blast radius / graft_file_api=ファイルのAPI一覧 / graft_repo_map=未踏リポジトリの把握）。graft で絞りきれない場合だけ rg にフォールバックする",
-  "- テキスト検索は plain grep ではなく必ず `rg` を使う（例: `rg -n <pattern> <path>`）。同じ概念の検索を繰り返さない",
+  "- コード探索は graft MCP を先に使う（graft_find_code=定義・意味検索 / graft_find_all=全出現 / graft_trace_calls=呼び出し元・先と blast radius / graft_file_api=ファイルのAPI一覧 / graft_repo_map=未踏リポジトリの把握）。graft で絞りきれない場合だけ sg にフォールバックする",
+  "- 構造パターン検索は `sg`（ast-grep）を使う（例: `sg -p 'function $NAME($$$)' <path>`、YAMLルールは `sg --rule rule.yaml`）。巨大repoの高速正規表現が必要で `tgrep serve` 稼働中の場合のみ `tgrep search` を使う（BYOS。serve/indexは状態変更のため使わない）",
+  "- テキスト検索は最終手段として `rg` を使う（例: `rg -n <pattern> <path>`）。plain grep は使わない。同じ概念の検索を繰り返さない",
   "- ファイル名・ディレクトリ探索は `fd` を使う（例: `fd --type f <name> <path>`、`fd --max-depth 2 --type d <name>`）。単純なパターン一致は Glob ツールでも可。`find` は使わない",
   "- Read で全文取得した直後に同じファイルへ Grep しない（全文が手元にある）",
 ];
@@ -59,7 +62,7 @@ const SEARCH_RULES: readonly string[] = [
  * 将来コマンドを追記する際、allow行を末尾に追加すると3のdeny群より後に来てしまい、
  * リダイレクト対策が静かに無効化される。追記は必ず2の位置（deny群より前）に行うこと。
  */
-const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
+export const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "*": "deny",
   // 1. 個別allow群（検索・確認系のみ。書き込み・外部実行系オプションを持つコマンドは
   // 引数注入対策(下記3)と対で追加する）
@@ -90,6 +93,22 @@ const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "jj diff *": "allow",
   "jj log": "allow",
   "jj log *": "allow",
+  pyright: "allow",
+  "pyright *": "allow",
+  "ruff check": "allow",
+  "ruff check *": "allow",
+  "tsc --noEmit": "allow",
+  "tsc --noEmit *": "allow",
+  sg: "allow",
+  "sg *": "allow",
+  "ast-grep": "allow",
+  "ast-grep *": "allow",
+  "npx tsc --noEmit": "allow",
+  "npx tsc --noEmit *": "allow",
+  "npx pyright": "allow",
+  "npx pyright *": "allow",
+  "npx ruff check": "allow",
+  "npx ruff check *": "allow",
   // 2. リダイレクト対策（allow群より後方。空白ありの `>`/`>>` のみ対象。
   // 無空白リダイレクト(`2>/dev/null`等)は受容リスクとして残る）
   "* > *": "deny",
@@ -100,12 +119,22 @@ const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "git log* --output*": "deny",
   "jj diff* --tool*": "deny",
   "jj diff* --edit*": "deny",
+  "ruff check* --fix*": "deny",
+  "ruff format*": "deny",
+  "npx ruff check* --fix*": "deny",
+  "npx ruff format*": "deny",
+  "pyright *--createstub*": "deny",
+  "npx pyright *--createstub*": "deny",
+  "sg *--update-all*": "deny",
+  "sg *-U*": "deny",
+  "ast-grep *--update-all*": "deny",
+  "ast-grep *-U*": "deny",
 };
 
 export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-researcher": {
     description:
-      "コードベース探索と外部調査の統合エージェント。ファイル検索・構造把握・公式ドキュメント調査。高頻度に呼ばれるためコストティア最下層で使う（モデルは .graphhopper/config.json の agents で設定）",
+      "コードベース事実収集エージェント（graft-first）。ファイル検索・構造把握・呼び出し関係の特定。高頻度に呼ばれるためコストティア最下層で使う（モデルは .graphhopper/config.json の agents で設定）。外部公式ドキュメント調査は graphhopper-librarian に委ねる",
     mode: "subagent",
     temperature: 0.1,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
@@ -113,7 +142,28 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "あなたは調査専門家。与えられた問いに対し、コードベースを探索して根拠（ファイル:行）付きの回答を返す。",
       "",
       "ルール:",
-      "- 推測で答えない。必ず graft MCP / rg / glob / read で裏付けを取る",
+      "- 推測で答えない。必ず graft MCP / sg / rg / glob / read で裏付けを取る",
+      "- 外部公式ドキュメント・仕様調査が必要なら、その旨を明記して graphhopper-librarian への委譲を提案する（自分でwebfetchしない。コードベース事実収集に専念する）",
+      ...SEARCH_RULES,
+      "- 回答は「結論 → 根拠 → 不明点」の形式",
+      "- 見つからなかった場合は見つからなかったと言う",
+      "- コードは書かない。調査と報告だけ",
+    ].join("\n"),
+  },
+
+  "graphhopper-librarian": {
+    description:
+      "外部公式ドキュメント・仕様調査専用の安価エージェント。公式doc・仕様・横断的意味質問の事実収集。判断は含まない（モデルは .graphhopper/config.json の agents で設定）",
+    mode: "subagent",
+    temperature: 0.1,
+    permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
+    prompt: [
+      "あなたはlibrarian。外部公式ドキュメント・仕様を調査して根拠（URL・引用）付きの事実を返す。",
+      "判断は含まない。判断が必要なら「判断が必要」と明記して呼び出し側に返す。",
+      "",
+      "ルール:",
+      "- 推測で答えない。公式doc・一次情報を優先し、URLと引用を付ける",
+      "- コードベースの探索は graft-first で行い、必要なら sg / tgrep search / rg を使う",
       ...SEARCH_RULES,
       "- 回答は「結論 → 根拠 → 不明点」の形式",
       "- 見つからなかった場合は見つからなかったと言う",
@@ -194,6 +244,11 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "drift（乖離）を検出したら全件報告する（confidence/severity付き、閾値カットしない）。",
       "無ければfindings: []とsummaryに「driftなし」と明記する。",
       "",
+      "診断証拠:",
+      "- 変更ファイルに型・lint診断を実行し、findingsの裏付け・反証に使え（例: `npx tsc --noEmit` / `npx pyright` / `npx ruff check`、構造確認は `sg`）",
+      "- 診断クリーンはdriftなしの根拠にならない（挙動driftは診断に出ない）。診断結果は補助証拠として扱う",
+      "- 診断が実行不可（tool未install等）の場合はfindingsに「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない",
+      "",
       "ルール:",
       "- 指摘は具体的に（ファイル:行を特定、該当行を引用）",
       "- 迎合して指摘を捏造しない。問題が無ければはっきりそう言う",
@@ -234,6 +289,19 @@ export function injectAgents(
   input.agent ??= {};
   for (const [name, def] of Object.entries(GRAPHHOPPER_AGENTS)) {
     const override = cfg.agents[name];
-    input.agent[name] ??= override ? { ...def, model: override } : def;
+    // subagentはread-only不変条件: 新tool graphhopper_edit を明示denyする。
+    // graphhopper_hash はread-onlyのため許可のまま（診断・調査に使える）。
+    // ユーザー側の同名agent定義があってもguardだけは必ずマージする
+    // （??= で捨てると事前定義経由でguardが外れる）。
+    const readOnlyGuard = { graphhopper_edit: false };
+    const base: AgentConfig = {
+      ...def,
+      tools: { ...def.tools, ...readOnlyGuard },
+    };
+    const merged: AgentConfig = override ? { ...base, model: override } : base;
+    const prev = input.agent[name] as AgentConfig | undefined;
+    input.agent[name] = prev
+      ? { ...prev, tools: { ...prev.tools, ...readOnlyGuard } }
+      : merged;
   }
 }

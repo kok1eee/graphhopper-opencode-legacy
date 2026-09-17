@@ -287,7 +287,14 @@ export type HistoryEvent =
     }
   | { type: "loop_stopped"; goal: string; count: number }
   | { type: "loop_resume_forced"; goal: string }
-  | { type: "continuation_skipped"; goal: string; marker: string };
+  | { type: "continuation_skipped"; goal: string; marker: string }
+  | { type: "hash_edit_applied"; goal: string; path: string }
+  | {
+      type: "hash_edit_refused";
+      goal: string;
+      path: string;
+      reason: string;
+    };
 
 /** append-only の履歴ログ。LLMの自己申告ではなくplugin機械記録の監査証跡 */
 export function recordEvent(root: string, event: HistoryEvent): void {

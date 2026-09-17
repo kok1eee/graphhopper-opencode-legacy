@@ -29,6 +29,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - 書けたら `task(subagent_type: "graphhopper-critic")` で**設計を1回敵対レビュー**する
   （要件漏れ・設計の穴・スコープ逸脱を検出。安価モデル = 常設nodeなので毎goal必ず呼ぶ）
 - critic の指摘を design.md に反映してから `graphhopper_phase(phase: "implementing")`
+- 要件の公式doc裏付けが必要なら `task(subagent_type: "graphhopper-librarian")` を使う
+  （researcherはコードベース事実収集に専念し、外部調査はlibrarianに委ねる）
 - 任意で `graphhopper_critic_set(level, reason)` に結果を記録できる（opt-in、`graphhopper_phase`
   の前提条件にはならない。self-graded防止機構は付けない——「critic を呼んだか」自体の
   機械チェックはしないので、記録するかどうかもメインエージェントの裁量）
@@ -42,7 +44,10 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 ### implementing
 
 - design.md のタスクを1つずつ実装する
-- 詰まったら `task(subagent_type: "graphhopper-researcher")` で並列調査
+- goal中のsource編集は `graphhopper_hash` でhash取得→ `graphhopper_edit`（hash検証付き）を使え。
+  素のedit/writeはフォールバック。拒否（throw）はhash再取得の合図
+- 詰まったら `task(subagent_type: "graphhopper-researcher")` で並列調査。
+  外部公式doc裏付けが必要なら `task(subagent_type: "graphhopper-librarian")` を使う
 - **実装試行のたびに `graphhopper_attempt(ok, note)` を呼ぶ**（成否をコード側で機械カウントする）
   - `ok: false` が続き `fail_streak` が `stuck_threshold`（既定3）に達すると `escalate: true` が返る
   - `escalate: true` が返ったら `task(subagent_type: "graphhopper-oracle")` に相談する。これまでの
@@ -87,13 +92,16 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **route=advisor**（小diff）: `task(subagent_type: "graphhopper-verifier")` を**1回だけ**、
   `general`charterで呼ぶ。「実装がdesign.mdの意図から外れていないか・テストが実際のユーザーパスを
   検証しているか・変更がgoalに収束しているか、3観点をまとめてレビューせよ」と渡す。
+  verifierは変更ファイルに型・lint診断（`npx tsc --noEmit` / `npx pyright` / `npx ruff check`）を実行し、
+  findingsの裏付け・反証に使え。ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
+  診断が実行不可なら「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
   結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
 - **route=polish**（大diff・閾値超）: adversarial verifier fan-out を行う
   1. `task(subagent_type: "graphhopper-verifier")` を3回呼ぶ。それぞれ以下のcharterをプロンプトに含める:
      - requirement: 「実装がdesign.mdの意図から外れていないか（実装漏れ・解釈ズレ・スコープ逸脱）を検証せよ」
      - behavior: 「テストが実際のユーザーパスを検証しているか（モック過多・ハッピーパスのみ・エラー握り潰し）を疑え」
      - progress: 「変更がgoalに収束しているか（堂々巡り・残骸・goal無関係な混入）を見よ」
-  2. 各verifierに `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / diff（`jj diff --from <baseline>` または `git diff <baseline>`）を渡す
+  2. 各verifierに `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / diff（`jj diff --from <baseline>` または `git diff <baseline>`）を渡す。behavior charterでは診断証拠（型・lint実行結果）を要求する
   3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
   4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
      `graphhopper_verifier_set(results: [...], reason: ...)` で1回記録する。
@@ -115,6 +123,10 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - 受け手は `graphhopper_resume` → `graphhopper_status` で引き継ぐ
 
 ## Gotchas
+
+- **コード探索のtier**: graft（意味・構造の入口）→ sg（構造パターン: `sg -p '<pattern>' <path>` / `sg --rule rule.yaml`）→ tgrep（巨大repoの高速正規表現。`tgrep serve` 稼働時のみBYOSで `tgrep search`。index/serveは状態変更のため使わない）→ rg（テキスト最終手段）。plain grep・findは使わない
+- **書き換え系フラグは禁止**: `sg --update-all` / `sg -U`、`ruff --fix` / `ruff format`、`pyright --createstub` はsubagent read-only不変条件のためdeny。使わない
+- **診断クリーンをdriftなしの根拠にしない**: 挙動driftは診断に出ない。診断は補助証拠
 
 - **designing中に無理にEdit/Writeしようとしてエラーになったら**: 設計が先という合図。design.md を先に書いてから implementing へ遷移する
 - **designing終了後にdesign.mdを書き直そうとしてエラーになったら**: 仕様変更や見落としがあっても design.md 自体は書き換えない。`.graphhopper/plans/<goal-id>.log.md` に決定の経緯・棄却した代替案を追記する（design.mdはverifierのdrift検出アンカーなので不変を保つ）
