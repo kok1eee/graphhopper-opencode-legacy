@@ -36,15 +36,17 @@ import type { AgentConfig } from "@opencode-ai/sdk";
  * 全subagent共通の探索ルール（graft-first）。
  * 背景: researcher/critic/verifier が Grep ツール連打・graft MCP 未使用で
  * トークンを浪費する事例が多発したため、prompt レベルで強制する。
- * tier（design g-mu4wradt D4）: graft（意味・構造の入口）→ sg（構造パターン）
- *   → tgrep（巨大repoの高速regex。serve稼働時のみ。index/serveは状態変更のためdeny=BYOS）
- *   → rg（テキスト最終手段）。
+ * tier: graft（意味・構造の入口）→ ast-grep（構造パターン）→ rg（テキスト最終手段）。
+ *   tgrep は表現力が rg と同じで利点が「巨大repoでの速度」だけであり、index/serve を
+ *   deny している（BYOS）以上・通常repoでは rg と等価で判定ノイズになるため tier から外した。
+ *   逃走経路として SKILL.md の Gotchas にのみ記載し、allowlist には `tgrep search*` を残す
+ *   （design g-mu4wradt D4 の事後改訂）。
  * - テキスト検索は plain grep ではなく必ず `rg`（bash経由）。
  * - 同じ概念の検索を繰り返さない。Read 全文取得の直後に同じファイルへ Grep しない。
  */
 const SEARCH_RULES: readonly string[] = [
-  "- コード探索は graft MCP を先に使う（graft_find_code=定義・意味検索 / graft_find_all=全出現 / graft_trace_calls=呼び出し元・先と blast radius / graft_file_api=ファイルのAPI一覧 / graft_repo_map=未踏リポジトリの把握）。graft で絞りきれない場合だけ sg にフォールバックする",
-  "- 構造パターン検索は `sg`（ast-grep）を使う（例: `sg -p 'function $NAME($$$)' <path>`、YAMLルールは `sg --rule rule.yaml`）。巨大repoの高速正規表現が必要で `tgrep serve` 稼働中の場合のみ `tgrep search` を使う（BYOS。serve/indexは状態変更のため使わない）",
+  "- コード探索は graft MCP を先に使う（graft_find_code=定義・意味検索 / graft_find_all=全出現 / graft_trace_calls=呼び出し元・先と blast radius / graft_file_api=ファイルのAPI一覧 / graft_repo_map=未踏リポジトリの把握）。graft で絞りきれない場合だけ ast-grep にフォールバックする",
+  "- 構造パターン検索は `ast-grep` を使う（例: `ast-grep -p 'function $NAME($$$)' <path>`、YAMLルールは `ast-grep --rule rule.yaml`）。`sg` はLinuxで newgrp を指すため使わない",
   "- テキスト検索は最終手段として `rg` を使う（例: `rg -n <pattern> <path>`）。plain grep は使わない。同じ概念の検索を繰り返さない",
   "- ファイル名・ディレクトリ探索は `fd` を使う（例: `fd --type f <name> <path>`、`fd --max-depth 2 --type d <name>`）。単純なパターン一致は Glob ツールでも可。`find` は使わない",
   "- Read で全文取得した直後に同じファイルへ Grep しない（全文が手元にある）",
@@ -70,7 +72,7 @@ export const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "rg *": "allow",
   fd: "allow",
   "fd *": "allow",
-  "tgrep search*": "allow", // index/serveは状態変更を伴うため対象外、searchのみ
+  "tgrep search*": "allow", // 逃走経路（巨大repoのみ・SKILL.md Gotchas参照）。index/serveは状態変更のためdeny
   cat: "allow",
   "cat *": "allow",
   head: "allow",
@@ -99,8 +101,9 @@ export const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "ruff check *": "allow",
   "tsc --noEmit": "allow",
   "tsc --noEmit *": "allow",
-  sg: "allow",
-  "sg *": "allow",
+  // 構造検索は canonical 名の `ast-grep` のみ許可する。`sg` は macOS では ast-grep の
+  // deprecated shim だが、Linux（Amazon Linux 等）では newgrp への symlink であり
+  // 「別グループでの任意コマンド実行」になる。機械依存の穴を作らないため sg は deny（下記）。
   "ast-grep": "allow",
   "ast-grep *": "allow",
   "npx tsc --noEmit": "allow",
@@ -125,10 +128,11 @@ export const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "npx ruff format*": "deny",
   "pyright *--createstub*": "deny",
   "npx pyright *--createstub*": "deny",
-  "sg *--update-all*": "deny",
-  "sg *-U*": "deny",
   "ast-grep *--update-all*": "deny",
   "ast-grep *-U*": "deny",
+  // Linux では sg = newgrp（別グループで任意コマンド実行）。allow群より後方で明示deny。
+  sg: "deny",
+  "sg *": "deny",
 };
 
 export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
@@ -142,7 +146,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "あなたは調査専門家。与えられた問いに対し、コードベースを探索して根拠（ファイル:行）付きの回答を返す。",
       "",
       "ルール:",
-      "- 推測で答えない。必ず graft MCP / sg / rg / glob / read で裏付けを取る",
+      "- 推測で答えない。必ず graft MCP / ast-grep / rg / glob / read で裏付けを取る",
       "- 外部公式ドキュメント・仕様調査が必要なら、その旨を明記して graphhopper-librarian への委譲を提案する（自分でwebfetchしない。コードベース事実収集に専念する）",
       ...SEARCH_RULES,
       "- 回答は「結論 → 根拠 → 不明点」の形式",
@@ -163,7 +167,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "",
       "ルール:",
       "- 推測で答えない。公式doc・一次情報を優先し、URLと引用を付ける",
-      "- コードベースの探索は graft-first で行い、必要なら sg / tgrep search / rg を使う",
+      "- コードベースの探索は graft-first で行い、必要なら ast-grep / rg を使う",
       ...SEARCH_RULES,
       "- 回答は「結論 → 根拠 → 不明点」の形式",
       "- 見つからなかった場合は見つからなかったと言う",
@@ -245,7 +249,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "無ければfindings: []とsummaryに「driftなし」と明記する。",
       "",
       "診断証拠:",
-      "- 変更ファイルに型・lint診断を実行し、findingsの裏付け・反証に使え（例: `npx tsc --noEmit` / `npx pyright` / `npx ruff check`、構造確認は `sg`）",
+      "- 変更ファイルに型・lint診断を実行し、findingsの裏付け・反証に使え（例: `npx tsc --noEmit` / `npx pyright` / `npx ruff check`、構造確認は `ast-grep`）",
       "- 診断クリーンはdriftなしの根拠にならない（挙動driftは診断に出ない）。診断結果は補助証拠として扱う",
       "- 診断が実行不可（tool未install等）の場合はfindingsに「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない",
       "",

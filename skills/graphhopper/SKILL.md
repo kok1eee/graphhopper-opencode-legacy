@@ -124,8 +124,10 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 ## Gotchas
 
-- **コード探索のtier**: graft（意味・構造の入口）→ sg（構造パターン: `sg -p '<pattern>' <path>` / `sg --rule rule.yaml`）→ tgrep（巨大repoの高速正規表現。`tgrep serve` 稼働時のみBYOSで `tgrep search`。index/serveは状態変更のため使わない）→ rg（テキスト最終手段）。plain grep・findは使わない
-- **書き換え系フラグは禁止**: `sg --update-all` / `sg -U`、`ruff --fix` / `ruff format`、`pyright --createstub` はsubagent read-only不変条件のためdeny。使わない
+- **コード探索のtier**: graft（意味・構造の入口）→ ast-grep（構造パターン: `ast-grep -p '<pattern>' <path>` / `ast-grep --rule rule.yaml`）→ rg（テキスト最終手段）。plain grep・findは使わない
+- **`sg` は使わない**: macOSではast-grepのshimだが、Linux（Amazon Linux等）では newgrp へのsymlink＝「別グループで任意コマンド実行」。canonical名 `ast-grep` のみ使う（allowlistはsgをdeny済み）
+- **tgrepはtier外の逃走経路**: 表現力は rg と同じで、利点は巨大repoでの速度のみ。通常は rg で足りる。どうしても遅い巨大repoでのみ、自分で `tgrep index .` または `tgrep serve .` を立てて `tgrep search` を使う（index/serve は状態変更のため allowlist では deny＝BYOS。stale index は取りこぼしの原因になるので更新に注意）
+- **書き換え系フラグは禁止**: `ast-grep --update-all` / `ast-grep -U`、`ruff --fix` / `ruff format`、`pyright --createstub` はsubagent read-only不変条件のためdeny。使わない
 - **診断クリーンをdriftなしの根拠にしない**: 挙動driftは診断に出ない。診断は補助証拠
 
 - **designing中に無理にEdit/Writeしようとしてエラーになったら**: 設計が先という合図。design.md を先に書いてから implementing へ遷移する

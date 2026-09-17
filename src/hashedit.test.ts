@@ -175,8 +175,6 @@ describe("SEARCH_ONLY_BASH順序不変条件（findLast規律）", () => {
       "npx ruff format*",
       "pyright *--createstub*",
       "npx pyright *--createstub*",
-      "sg *--update-all*",
-      "sg *-U*",
       "ast-grep *--update-all*",
       "ast-grep *-U*",
     ]) {
@@ -184,12 +182,16 @@ describe("SEARCH_ONLY_BASH順序不変条件（findLast規律）", () => {
     }
   });
 
+  test("sg は deny（Linuxでは newgrp のため機械依存の穴を作らない）", () => {
+    expect(SEARCH_ONLY_BASH["sg"]).toBe("deny");
+    expect(SEARCH_ONLY_BASH["sg *"]).toBe("deny");
+  });
+
   test("診断allow群が存在", () => {
     for (const a of [
       "pyright *",
       "ruff check *",
       "tsc --noEmit *",
-      "sg *",
       "ast-grep *",
       "npx tsc --noEmit *",
       "npx pyright *",
