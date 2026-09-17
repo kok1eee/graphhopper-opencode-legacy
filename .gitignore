@@ -3,5 +3,11 @@ node_modules/
 !.graphhopper/config.example.json
 *.tsbuildinfo
 
+# Claude Code local settings — machine-specific, not shared.
+.claude/settings.local.json
+
+# tgrep local trigram index — regenerable, not committed (run `tgrep index .`).
+.tgrep/
+
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
