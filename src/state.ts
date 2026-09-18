@@ -178,6 +178,8 @@ export interface GraphhopperConfig {
   /** ワーキングコピー差分が変わらない idle eval がこの回数続いたら stuck 扱い。
    * 1以下で無効 */
   stuck_diff_stall: number;
+  /** 追加LSP server定義（design g-mu5atclj D4）。同extensionsはbuiltinを上書き、未知は追記 */
+  lsp_servers: { command: string; args: string[]; extensions: string[] }[];
 }
 
 export const DEFAULT_CONFIG: GraphhopperConfig = {
@@ -192,6 +194,7 @@ export const DEFAULT_CONFIG: GraphhopperConfig = {
   max_eval_fails: 6,
   stuck_edit_repeat: 5,
   stuck_diff_stall: 4,
+  lsp_servers: [],
 };
 
 function dir(root: string): string {
@@ -358,6 +361,7 @@ export function readConfig(root: string): GraphhopperConfig {
       raw.stuck_edit_repeat ?? DEFAULT_CONFIG.stuck_edit_repeat,
     stuck_diff_stall:
       raw.stuck_diff_stall ?? DEFAULT_CONFIG.stuck_diff_stall,
+    lsp_servers: raw.lsp_servers ?? DEFAULT_CONFIG.lsp_servers,
   };
 }
 

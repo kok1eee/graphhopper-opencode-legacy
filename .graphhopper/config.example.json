@@ -6,7 +6,7 @@
     "graphhopper-verifier": "anthropic/claude-opus-5",
     "graphhopper-critic": "anthropic/claude-sonnet-5",
     "graphhopper-simplify": "anthropic/claude-sonnet-5",
-    "graphhopper-librarian": "anthropic/claude-sonnet-5",
+    "graphhopper-librarian": "opencode/deepseek-v4-flash",
     "graphhopper-oracle": "anthropic/claude-opus-5"
   },
   "stuck_threshold": 3,

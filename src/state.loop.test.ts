@@ -59,6 +59,7 @@ const CFG: GraphhopperConfig = {
   max_eval_fails: 6,
   stuck_edit_repeat: 5,
   stuck_diff_stall: 4,
+  lsp_servers: [],
 };
 
 function tmpRoot(): string {

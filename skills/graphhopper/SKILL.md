@@ -48,10 +48,20 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   素のedit/writeはフォールバック。拒否（throw）はhash再取得の合図
 - 詰まったら `task(subagent_type: "graphhopper-researcher")` で並列調査。
   外部公式doc裏付けが必要なら `task(subagent_type: "graphhopper-librarian")` を使う
+- researcher / librarian の使い分け（調査の内外分離。両方とも最安tier・read-only）:
+  - researcher = repo**内**（定義・構造・呼び出し関係をgraft-firstで）。librarian = repo**外**
+    （公式doc・仕様・実装例を webfetch / context7 で。URLと引用付き、判断なし。
+    context7に無い一般web（issue・blog・changelog）はwebsearch MCP（Exa）、
+    コード例はgrep.app MCPにフォールバック）
+  - 独立した問いなら `task()` で2体を**並列**に呼び、メインが統合する（discover fan-outと同型）
+  - 外部問いが内部findingsに依存するなら**直列**にする（researcherで対象ライブラリ・版を
+    特定してからlibrarianにdocを引かせる。逆順・同時投げは版ズレの温床）
+  - researcherは外部調査を自分でやらずlibrarian委譲を提案し、librarianは判断を含めない（境界の二重化）
 - **実装試行のたびに `graphhopper_attempt(ok, note)` を呼ぶ**（成否をコード側で機械カウントする）
   - `ok: false` が続き `fail_streak` が `stuck_threshold`（既定3）に達すると `escalate: true` が返る
   - `escalate: true` が返ったら `task(subagent_type: "graphhopper-oracle")` に相談する。これまでの
     失敗試行（何を試して何が起きたか）を渡し、助言を受けて別のアプローチで再試行する
+  - 同一goal内の2回目以降のoracle相談は新規ではなく `task(task_id: "<前回のID>")` で同subagent継続として呼ぶ（OmOのresume=session_id相当。文脈を失わず重複説明を省く）
   - **これはrouter gate（diffサイズ）とは別軸のタイミング判断**——無条件で毎回opusを呼ぶのではなく、
     本当に詰まった時だけ上位モデルのコストを払う graph engineering の分岐点
   - stuck 信号は3系統ある（いずれかで escalate。eval_cmd 運用では idle の eval 失敗文に自動追記される）:
@@ -93,7 +103,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   `general`charterで呼ぶ。「実装がdesign.mdの意図から外れていないか・テストが実際のユーザーパスを
   検証しているか・変更がgoalに収束しているか、3観点をまとめてレビューせよ」と渡す。
   verifierは変更ファイルに型・lint診断（`npx tsc --noEmit` / `npx pyright` / `npx ruff check`）を実行し、
-  findingsの裏付け・反証に使え。ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
+  findingsの裏付け・反証に使え。LSP照会が使える環境なら診断証拠はlsp_diagnosticsを優先してよい（速い・安い）。
+  ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
   診断が実行不可なら「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
   結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
 - **route=polish**（大diff・閾値超）: adversarial verifier fan-out を行う
@@ -124,7 +135,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 ## Gotchas
 
-- **コード探索のtier**: graft（意味・構造の入口）→ ast-grep（構造パターン: `ast-grep -p '<pattern>' <path>` / `ast-grep --rule rule.yaml`）→ rg（テキスト最終手段）。plain grep・findは使わない
+- **コード探索のtier**: graft（意味・構造の入口）→ LSP（点照会: file＋line特定済みの定義・参照・hover・診断のみ）→ ast-grep（構造パターン: `ast-grep -p '<pattern>' <path>` / `ast-grep --rule rule.yaml`）→ rg（テキスト最終手段）。plain grep・findは使わない。graftの絞り込み前にlsp_workspace_symbolsを投げない（版ズレ・ノイズの温床）
 - **`sg` は使わない**: macOSではast-grepのshimだが、Linux（Amazon Linux等）では newgrp へのsymlink＝「別グループで任意コマンド実行」。canonical名 `ast-grep` のみ使う（allowlistはsgをdeny済み）
 - **tgrepはtier外の逃走経路**: 表現力は rg と同じで、利点は巨大repoでの速度のみ。通常は rg で足りる。どうしても遅い巨大repoでのみ、自分で `tgrep index .` または `tgrep serve .` を立てて `tgrep search` を使う（index/serve は状態変更のため allowlist では deny＝BYOS。stale index は取りこぼしの原因になるので更新に注意）
 - **書き換え系フラグは禁止**: `ast-grep --update-all` / `ast-grep -U`、`ruff --fix` / `ruff format`、`pyright --createstub` はsubagent read-only不変条件のためdeny。使わない

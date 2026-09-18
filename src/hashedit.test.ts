@@ -18,7 +18,7 @@ import {
   isGateTargetTool,
   readGraphhopperHash,
   runGraphhopperEdit,
-} from "./index";
+} from "./gate";
 import {
   isDesignDocLocked,
   isDesignGateBlocked,
@@ -39,6 +39,7 @@ const CFG: GraphhopperConfig = {
   max_eval_fails: 6,
   stuck_edit_repeat: 5,
   stuck_diff_stall: 4,
+  lsp_servers: [],
 };
 
 describe("hashedit", () => {

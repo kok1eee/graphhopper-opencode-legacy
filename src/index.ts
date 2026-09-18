@@ -27,12 +27,37 @@
  * state は `.graphhopper/` に保存される（state.ts 参照）。
  */
 import { tool, type Plugin } from "@opencode-ai/plugin";
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
 import { injectAgents } from "./agents";
-import { applySingleEdit, decodeUtf8Strict, sha1Hex, verifyHash } from "./hashedit";
+import {
+  designDocLockedRefusal,
+  designGateRefusal,
+  isGateTargetTool,
+  PHASE_ACTION,
+  PHASE_ACTION_SHORT,
+  readGraphhopperHash,
+  runGraphhopperEdit,
+} from "./gate";
 import { PONYTAIL_RULES } from "./ponytail-rules";
 import * as state from "./state";
+/* LSP読取subset（design g-mu5atclj・自前実装）。Manager singletonは
+ * src/lsp/ 内に閉じ込め、entryには関数以外の値を置かない（index.ts:110-113の制約）。 */
+import { LSPServerManager } from "./lsp/client";
+import { BUILTIN_SERVERS } from "./lsp/config";
+import {
+  formatDiagnostics,
+  formatHover,
+  formatLocations,
+  formatSymbols,
+} from "./lsp/format";
+import {
+  extOf,
+  languageIdFor,
+  readFileText,
+  serversFor,
+  serversWithWarnings,
+  withLspClient,
+} from "./lsp/helpers";
+import { toZeroBased } from "./lsp/types";
 
 const SYSTEM_GUIDE = `## graphhopper（designing/implementing/polishループ）の存在
 
@@ -44,26 +69,10 @@ designing フェーズでは source ファイルの edit/write は物理的に�
 
 active な goal が既にあるなら graphhopper_status で状態を確認し、ループの継続として振る舞え。`;
 
-const PHASE_ACTION: Record<state.Phase, string> = {
-  designing:
-    "goalを理解し、設計判断・実装タスク列を .graphhopper/plans/<goal-id>.md に書く。source編集はここではブロックされる。書けたら task(subagent_type: 'graphhopper-critic') で設計を1回敵対レビューし、指摘を design.md に反映してから graphhopper_phase(phase: 'implementing') へ（任意で graphhopper_critic_set に結果を記録できる。opt-inでphase遷移の前提条件ではない）。design.md はこのフェーズを抜けた後は不変になる（verifierのdrift検出アンカーのため）——決定の経緯・棄却した代替案・進捗はここで固めず、実装中は .graphhopper/plans/<goal-id>.log.md に追記すること",
-  implementing:
-    "design.md のタスクを実装する。goal中のsource編集は graphhopper_edit（hash検証付き）を使え、素のedit/writeはフォールバック。まず graphhopper_set_eval(cmd) で合否を機械判定できるコマンド（テスト/lint/typecheck）を1度設定せよ。設定後はターン終了ごとに自動実行され、passならpolishへ自動遷移、failならfail_streakが機械カウントされ、escalateが返ったら task(subagent_type: 'graphhopper-oracle') に相談する。eval_cmdが無い（機械判定できない）場合のみ graphhopper_attempt(ok, note) の自己申告にフォールバックする。外部公式doc裏付けが必要なら task(subagent_type: 'graphhopper-librarian') を使える",
-  polish:
-    "graphhopper_router_check の route に従う。route=polish（大diff）ならまず simplify を実行する: メインが router.baseline_rev から diff を /tmp/gh-simplify-diff.txt に退避し、task(subagent_type: 'graphhopper-simplify') を1回呼んで提案を集める（3レンズ統合）。適用はメインが行う: 各 finding を Read で裏付け、critical は挙動不変・局所的なものだけ自動適用、high は人間確認、medium/note は報告のみ。適用後は eval_cmd を再実行して機械確認。route=advisor（小diff）なら simplify はスキップ。その後 verifier: route=polish なら requirement/behavior/progress の3charterで、route=advisor なら general charter で task(subagent_type: 'graphhopper-verifier') を呼び、verifierは変更ファイルに型・lint診断を実行して裏付けに使え（診断クリーン≠driftなし）。結果を graphhopper_verifier_set で記録。集約 clean で graphhopper_phase(phase: 'done') へ。集約 drift かつ target=implementing なら implementing に戻る。advisor でも第三者チェック（verifier）は省略不可",
-  done: "完了済み。graphhopper_goal(action: 'complete') を確認",
-};
-
-/* continuation（session.idle → promptAsync）のuser向け表示用の1行要約。
- * LLM向けの詳細指示は PHASE_ACTION のまま chat.system.transform 側で注入する
- * （design g-mtwhdb4t）。done は continuation 自体が発火しない（idle ハンドラが
- * phase==="done" で早期return）ため実質未使用だが、Record の型完全性のために残す。 */
-const PHASE_ACTION_SHORT: Record<state.Phase, string> = {
-  designing: "設計ドキュメントを書き、criticレビュー後にimplementingへ",
-  implementing: "design.mdのタスクを実装し、eval_cmdを設定",
-  polish: "router_checkのrouteに従いsimplify/verifierを実行",
-  done: "goalをcompleteする",
-};
+/* NOTE: PHASE_ACTION / PHASE_ACTION_SHORT は ./gate.ts が単一源泉
+ * （plugin entryに非関数値を置くとloaderがload失敗するため）。
+ * continuationのuser向け表示はSHORT要約のみ、LLM向け詳細は
+ * chat.system.transform 側で PHASE_ACTION を注入する（design g-mtwhdb4t）。 */
 
 /* idle 取得の窓と上限（design g-mtl7l8j3 T1/T2）。
  * TAIL_LIMIT: loop検知窓 (loop_tool_window=8) + echo 用履歴 + margin。
@@ -117,139 +126,10 @@ function resolveFilePath(args: unknown): string | undefined {
   return typeof raw === "string" ? raw : undefined;
 }
 
-/* design gate・信号A計数の対象tool（D2a/D2b）。before/after両hookで共有する
- * 単一の真実源。3名のいずれかが漏れると新tool経由でgate/stuck検知が
- * バイパスされるため、hashedit.test.tsで機械検証する。 */
-export const GATE_TARGET_TOOLS = ["write", "edit", "graphhopper_edit"] as const;
-
-export function isGateTargetTool(toolName: string | undefined): boolean {
-  return (
-    typeof toolName === "string" &&
-    (GATE_TARGET_TOOLS as readonly string[]).includes(toolName.toLowerCase())
-  );
-}
-
-/* graphhopper_edit executeの事前判定（D2c＋goal外仕様）。純粋関数として
- * 分離し機械検証する。拒否はthrow（after計数に混入しない。万一afterが
- * throw時にも発火する実装でもstreak加算はfail-closed側＝早期escalateに倒れる）。 */
-export type HashEditAccess = "ok" | "no-goal" | "subagent";
-
-export function checkHashEditAccess(
-  sessionID: string | undefined,
-  mainSessionID: string | null | undefined,
-  hasActiveGoal: boolean,
-): HashEditAccess {
-  if (!hasActiveGoal) return "no-goal";
-  // 未バインド（session削除後等）はgoal外扱い。design D2の
-  // 「active goalなし、または state.session_id がnull」条項。
-  if (!mainSessionID) return "no-goal";
-  if (!sessionID || sessionID !== mainSessionID) return "subagent";
-  return "ok";
-}
-
-/* graphhopper_hash の本体（exportして機械検証する）。
- * hash基準は graphhopper_edit と揃えてutf8デコード文字列とする
- * （生バイトだと非UTF-8でペア不整合になる。F3対応）。 */
-export function readGraphhopperHash(root: string, filePath: string): string {
-  const p = isAbsolute(filePath) ? filePath : join(root, filePath);
-  const content = decodeUtf8Strict(readFileSync(p));
-  const st = statSync(p);
-  return JSON.stringify({
-    path: filePath,
-    sha1: sha1Hex(content),
-    size: Buffer.byteLength(content, "utf8"),
-    mtime: st.mtime.toISOString(),
-  });
-}
-
-export interface HashEditArgs {
-  filePath: string;
-  expectedHash: string;
-  oldString: string;
-  newString: string;
-}
-
-/* graphhopper_edit の本体（exportして機械検証する）。
- * tool.execute の薄いラッパーにし、分岐→アクション対応
- * （no-goal→軟質return / subagent→throw / 拒否→記録+throw /
- * 成功→記録+新hash返却）をテストで固定する。 */
-export function runGraphhopperEdit(
-  root: string,
-  sessionID: string | undefined,
-  args: HashEditArgs,
-): string {
-  const active = state.getActive(root);
-  const access = checkHashEditAccess(
-    sessionID,
-    active?.state.session_id,
-    !!active && active.goal.status === "active",
-  );
-  if (access === "no-goal") {
-    return "error: no active goal (use plain edit as fallback, no event recorded)";
-  }
-  if (access === "subagent") {
-    throw new Error(
-      "Refused: graphhopper_edit from subagent session is blocked (read-only invariant)",
-    );
-  }
-  if (!active) return "error: no active goal (unexpected)";
-  const p = isAbsolute(args.filePath)
-    ? args.filePath
-    : join(root, args.filePath);
-  let content: string;
-  try {
-    content = decodeUtf8Strict(readFileSync(p));
-  } catch (e) {
-    state.recordEvent(root, {
-      type: "hash_edit_refused",
-      goal: active.goal.id,
-      path: args.filePath,
-      reason: e instanceof Error ? e.message : String(e),
-    });
-    throw new Error(
-      `hash_edit_refused: cannot read ${args.filePath} (${e instanceof Error ? e.message : String(e)})`,
-    );
-  }
-  try {
-    verifyHash(content, args.expectedHash);
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    state.recordEvent(root, {
-      type: "hash_edit_refused",
-      goal: active.goal.id,
-      path: args.filePath,
-      reason,
-    });
-    throw e instanceof Error ? e : new Error(reason);
-  }
-  let next: string;
-  try {
-    next = applySingleEdit(content, args.oldString, args.newString);
-  } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    state.recordEvent(root, {
-      type: "hash_edit_refused",
-      goal: active.goal.id,
-      path: args.filePath,
-      reason,
-    });
-    throw e instanceof Error ? e : new Error(reason);
-  }
-  mkdirSync(dirname(p), { recursive: true });
-  const tmp = `${p}.${process.pid}.tmp`;
-  writeFileSync(tmp, next, "utf8");
-  renameSync(tmp, p);
-  state.recordEvent(root, {
-    type: "hash_edit_applied",
-    goal: active.goal.id,
-    path: args.filePath,
-  });
-  return JSON.stringify({
-    path: args.filePath,
-    sha1: sha1Hex(next),
-    size: Buffer.byteLength(next, "utf8"),
-  });
-}
+/* NOTE: design gate・hash検証editの本体は ./gate.ts にある。
+ * opencodeのplugin loaderはentryの全export値を走査し、関数でない値が
+ * 1つでもあると "Plugin export is not a function" でload全体が失敗する。
+ * そのためentryはplugin関数（Graphhopper）のみをexportする。 */
 
 export const Graphhopper: Plugin = async ({ client, $, directory }) => {
   const root = directory;
@@ -341,9 +221,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           path: filePath,
         });
         throw new Error(
-          `Refused: ${toolName} to ${filePath} is blocked because the goal is in the "designing" phase. ` +
-            `Only paths under ${cfg.design_gate_allow.join(", ")} may be written while designing. ` +
-            `Write the design doc first, then graphhopper_phase(phase: "implementing") before editing source.`,
+          designGateRefusal(toolName, filePath, cfg.design_gate_allow),
         );
       }
 
@@ -359,9 +237,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           path: filePath,
         });
         throw new Error(
-          `Refused: ${toolName} to ${filePath} is blocked because the design doc is immutable once the "designing" phase ends ` +
-            `(it anchors verifier drift detection — rewriting it to match the implementation would let drift be erased by editing the doc instead of fixing the code). ` +
-            `Record decisions/rejected alternatives/progress in .graphhopper/plans/${active.goal.id}.log.md instead (no gate on that path).`,
+          designDocLockedRefusal(toolName, filePath, active.goal.id),
         );
       }
     },
@@ -940,12 +816,155 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           ].join("\n");
         },
       }),
+
+      /* LSP読取subset（design g-mu5atclj・自前実装・読取専用7件）。
+       * 座標はtool境界1-based、client内部で0-based変換。失敗時は文字列返却。 */
+      lsp_hover: tool({
+        description:
+          "LSP hover: 指定位置（file:line:col・1-based）のホバー情報を返す。位置特定済みの問い専用",
+        args: {
+          filePath: tool.schema.string().describe("対象ファイルパス"),
+          line: tool.schema.number().describe("行（1-based）"),
+          col: tool.schema.number().describe("列（1-based）"),
+        },
+        async execute(args) {
+          const extra = state.readConfig(root).lsp_servers;
+          const out = await withLspClient(args.filePath, extra, async (c) => {
+            const h = await c.hover(args.filePath, toZeroBased(args.line, args.col));
+            return formatHover(h);
+          });
+          return String(out);
+        },
+      }),
+
+      lsp_goto_definition: tool({
+        description:
+          "LSP goto_definition: 指定位置の定義位置を返す。位置特定済みの問い専用",
+        args: {
+          filePath: tool.schema.string().describe("対象ファイルパス"),
+          line: tool.schema.number().describe("行（1-based）"),
+          col: tool.schema.number().describe("列（1-based）"),
+        },
+        async execute(args) {
+          const extra = state.readConfig(root).lsp_servers;
+          const out = await withLspClient(args.filePath, extra, async (c) => {
+            const locs = await c.definition(args.filePath, toZeroBased(args.line, args.col));
+            return formatLocations("definitions", locs);
+          });
+          return String(out);
+        },
+      }),
+
+      lsp_find_references: tool({
+        description:
+          "LSP find_references: 指定位置の参照位置を返す（宣言含む・上限200）。位置特定済みの問い専用",
+        args: {
+          filePath: tool.schema.string().describe("対象ファイルパス"),
+          line: tool.schema.number().describe("行（1-based）"),
+          col: tool.schema.number().describe("列（1-based）"),
+        },
+        async execute(args) {
+          const extra = state.readConfig(root).lsp_servers;
+          const out = await withLspClient(args.filePath, extra, async (c) => {
+            const locs = await c.references(args.filePath, toZeroBased(args.line, args.col));
+            return formatLocations("references", locs);
+          });
+          return String(out);
+        },
+      }),
+
+      lsp_document_symbols: tool({
+        description: "LSP document_symbols: 当該ファイルのシンボル一覧を返す",
+        args: {
+          filePath: tool.schema.string().describe("対象ファイルパス"),
+        },
+        async execute(args) {
+          const extra = state.readConfig(root).lsp_servers;
+          const out = await withLspClient(args.filePath, extra, async (c) => {
+            const syms = await c.documentSymbols(args.filePath);
+            return formatSymbols(syms);
+          });
+          return String(out);
+        },
+      }),
+
+      lsp_workspace_symbols: tool({
+        description:
+          "LSP workspace_symbols: ワークスペース横断のシンボル検索（query最小2文字・空クエリ拒否・上限200）",
+        args: {
+          query: tool.schema.string().describe("検索クエリ（2文字以上）"),
+          filePath: tool.schema
+            .string()
+            .optional()
+            .describe("起点ファイル（server解決用。省略時はroot直下のダミーで解決できないため必須に近い）"),
+        },
+        async execute(args) {
+          const q = (args.query ?? "").trim();
+          if (q.length < 2) return "error: query must be at least 2 characters";
+          const extra = state.readConfig(root).lsp_servers;
+          // server解決の起点: filePath指定があればそれ、無ければ各builtinを順に試す
+          const probe = args.filePath ?? `${root}/probe.ts`;
+          const out = await withLspClient(probe, extra, async (c) => {
+            const syms = await c.workspaceSymbols(q);
+            return formatSymbols(syms);
+          });
+          return String(out);
+        },
+      }),
+
+      lsp_diagnostics: tool({
+        description:
+          "LSP diagnostics: 指定ファイルの即時診断を返す（didOpen→待機→didClose）",
+        args: {
+          filePath: tool.schema.string().describe("対象ファイルパス"),
+        },
+        async execute(args) {
+          const text = readFileText(args.filePath);
+          if (text === null) return `error: cannot read ${args.filePath}`;
+          const extra = state.readConfig(root).lsp_servers;
+          const out = await withLspClient(args.filePath, extra, async (c) => {
+            const diags = await c.diagnostics(
+              args.filePath,
+              text,
+              languageIdFor(extOf(args.filePath)),
+            );
+            return formatDiagnostics(diags);
+          });
+          return String(out);
+        },
+      }),
+
+      lsp_servers: tool({
+        description: "LSP servers: 対応server表（builtin＋config追加分）を返す",
+        args: {},
+        async execute() {
+          const extra = state.readConfig(root).lsp_servers;
+          const { servers: merged, ignored } = serversWithWarnings(extra);
+          const builtin = new Set(BUILTIN_SERVERS.map((s) => s.command));
+          const lines = merged.map(
+            (s) =>
+              `${s.command} ${s.args.join(" ")} [${s.extensions.join(",")}]${builtin.has(s.command) ? "" : " (config)"}`,
+          );
+          if (ignored > 0) {
+            lines.push(
+              `warning: ignored ${ignored} invalid lsp_servers entries (must have {command:string, args:string[], extensions:string[]})`,
+            );
+          }
+          return lines.join("\n");
+        },
+      }),
     },
 
     event: async ({ event }) => {
       try {
         if (event.type === "session.deleted") {
           state.unbindSession(root, event.properties.info.id);
+          // LSP子プロセスのbest-effort停止（明示unloadフックが無いためのフォールバック）
+          try {
+            await LSPServerManager.stopAll();
+          } catch {
+            // 停止失敗は無視（idle timeout 60sが最終防御）
+          }
           return;
         }
         if (event.type !== "session.idle") return;

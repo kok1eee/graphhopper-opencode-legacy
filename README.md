@@ -136,6 +136,37 @@ lens空を拒否するため、diffサイズに関わらず最低1回のverifier
 勝手に自動送信はしない設計（明示呼び出しのみ）。受け手は「handoff received」応答で受領を示し、
 `graphhopper_resume` で引き継ぐ。
 
+## MCP ブリッジ（API 経由セッション用）
+
+plugin tool は opencode ランタイム内のセッションにしか配膳されず、API 経由の
+セッション（`default.*` toolset）には届かない。MCP だけが両方に届く実証済みの道のため、
+`src/mcp.ts` が state 操作を MCP tool（stdio）として公開する:
+
+- plugin と同名・同-semantics の 13 tool（`graphhopper_goal`〜`graphhopper_edit`。
+  `graphhopper_handoff` は opencode SDK client が必要なため対象外）
+- `root`（対象プロジェクト）・`session_id`（bind 先）を明示指定する。
+  MCP には `session.idle` 駆動が無いため、`graphhopper_set_eval` 後に
+  `graphhopper_eval` で明示実行する（遷移ルールは plugin の idle eval 経路と同型）
+- 指示文は `src/gate.ts` の `PHASE_ACTION` が単一源泉（plugin/MCP 共通）
+
+`~/.config/opencode/opencode.json` の `mcp` に登録:
+
+```json
+{
+  "graphhopper": {
+    "type": "local",
+    "command": ["<mise-shims>/bun", "<repo>/src/mcp.ts"],
+    "enabled": true
+  }
+}
+```
+
+制約: opencode の plugin loader は entry module の全 export 値を走査し、
+関数でない値が1つでもあると `Plugin export is not a function` で load 全体が
+失敗する。そのため `src/index.ts`（entry）は plugin 関数 `Graphhopper` のみを
+export し、helper・定数は `src/gate.ts` に置く。entry に非関数 export を足すと
+plugin が黙って消える（`~/.local/share/opencode/log/opencode.log` に ERROR）。
+
 ## state の場所
 
 ```

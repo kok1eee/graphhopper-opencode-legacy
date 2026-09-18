@@ -46,6 +46,7 @@ import type { AgentConfig } from "@opencode-ai/sdk";
  */
 const SEARCH_RULES: readonly string[] = [
   "- コード探索は graft MCP を先に使う（graft_find_code=定義・意味検索 / graft_find_all=全出現 / graft_trace_calls=呼び出し元・先と blast radius / graft_file_api=ファイルのAPI一覧 / graft_repo_map=未踏リポジトリの把握）。graft で絞りきれない場合だけ ast-grep にフォールバックする",
+  "- file＋line（col任意）が手元にある場合のみLSP点照会（lsp_hover/lsp_goto_definition/lsp_find_references/lsp_document_symbols/lsp_diagnostics）を先に使う。symbol名のみ・『どこにあるか』自体が問いならgraft-firstを維持する。graftの絞り込み前にlsp_workspace_symbolsを投げない",
   "- 構造パターン検索は `ast-grep` を使う（例: `ast-grep -p 'function $NAME($$$)' <path>`、YAMLルールは `ast-grep --rule rule.yaml`）。`sg` はLinuxで newgrp を指すため使わない",
   "- テキスト検索は最終手段として `rg` を使う（例: `rg -n <pattern> <path>`）。plain grep は使わない。同じ概念の検索を繰り返さない",
   "- ファイル名・ディレクトリ探索は `fd` を使う（例: `fd --type f <name> <path>`、`fd --max-depth 2 --type d <name>`）。単純なパターン一致は Glob ツールでも可。`find` は使わない",
@@ -136,10 +137,14 @@ export const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
 };
 
 export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
+  /* modeは "all"（design g-mu5d6avj A1）。
+   * `opencode run --agent` はsubagent modeを拒否してdefault agentにフォールバックするため、
+   * MCP経由invoke（graphhopper_invoke）で --agent 指定できるよう "all" にする。
+   * Task経路のsubagent利用・read-only権限は不変。副作用: TUIのTab切替候補に載る。 */
   "graphhopper-researcher": {
     description:
       "コードベース事実収集エージェント（graft-first）。ファイル検索・構造把握・呼び出し関係の特定。高頻度に呼ばれるためコストティア最下層で使う（モデルは .graphhopper/config.json の agents で設定）。外部公式ドキュメント調査は graphhopper-librarian に委ねる",
-    mode: "subagent",
+    mode: "all",
     temperature: 0.1,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
@@ -158,7 +163,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-librarian": {
     description:
       "外部公式ドキュメント・仕様調査専用の安価エージェント。公式doc・仕様・横断的意味質問の事実収集。判断は含まない（モデルは .graphhopper/config.json の agents で設定）",
-    mode: "subagent",
+    mode: "all",
     temperature: 0.1,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
@@ -167,6 +172,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "",
       "ルール:",
       "- 推測で答えない。公式doc・一次情報を優先し、URLと引用を付ける",
+      "- ライブラリ・フレームワークの最新仕様は context7 MCP（resolve-library-id → get-library-docs）を公式docと併せて使う。context7 に無いもの（issue・blog・changelog・コード例）は websearch MCP（Exa・一般web）と grep.app MCP（コード例検索）にフォールバックする",
       "- コードベースの探索は graft-first で行い、必要なら ast-grep / rg を使う",
       ...SEARCH_RULES,
       "- 回答は「結論 → 根拠 → 不明点」の形式",
@@ -178,7 +184,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-critic": {
     description:
       "designingフェーズのdesign.mdを敵対レビューする。要件漏れ・設計の穴・スコープ逸脱を検出する安価な常設チェックnode（モデルは .graphhopper/config.json の agents で設定）。verifierとは対照的に実装前の計画のみを対象とし、メインとは別ベンダーで系列多様性を設計段階で得る",
-    mode: "subagent",
+    mode: "all",
     temperature: 0.2,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
@@ -204,7 +210,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-simplify": {
     description:
       "polishのsimplify用。route=polish（大diff）のときだけ呼ぶ単体agent。3レンズ（再利用・品質・効率）を1回のパスで見てコード整理の提案を出す。適用はメインが行う（モデルは .graphhopper/config.json の agents で設定）",
-    mode: "subagent",
+    mode: "all",
     temperature: 0.2,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
@@ -235,7 +241,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-verifier": {
     description:
       "polish/advisorのverifier用。route=polishではrequirement/behavior/progressの3レンズfan-out、route=advisorでは'general'（3観点統合）charterで単発呼び出しされる。判断nodeなので上位品質モデルで使う（モデルは .graphhopper/config.json の agents で設定）。実装者本人（メインエージェント）とは独立した第三者チェックであることが呼び出しの目的そのもの",
-    mode: "subagent",
+    mode: "all",
     temperature: 0.2,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
@@ -264,7 +270,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   "graphhopper-oracle": {
     description:
       "手詰まり時の相談役。graphhopper_attemptのfail_streakがstuck_thresholdに達した時に呼ぶ。アーキテクチャ判断・複雑なデバッグ・不慣れなパターンについて助言する（モデルは .graphhopper/config.json の agents で設定）",
-    mode: "subagent",
+    mode: "all",
     temperature: 0.2,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
@@ -285,6 +291,27 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   },
 };
 
+/**
+ * LSP読取7件の公開範囲（design g-mu5atclj D5）。
+ * main＋researcher＋verifier＋oracleに公開し、
+ * critic/simplify/librarianには明示denyする（deny-guard方式）。
+ */
+const LSP_TOOLS = [
+  "lsp_hover",
+  "lsp_goto_definition",
+  "lsp_find_references",
+  "lsp_document_symbols",
+  "lsp_workspace_symbols",
+  "lsp_diagnostics",
+  "lsp_servers",
+] as const;
+
+const LSP_DENY_AGENTS: ReadonlySet<string> = new Set([
+  "graphhopper-critic",
+  "graphhopper-simplify",
+  "graphhopper-librarian",
+]);
+
 export function injectAgents(
   input: { agent?: Config["agent"] },
   root: string,
@@ -298,14 +325,18 @@ export function injectAgents(
     // ユーザー側の同名agent定義があってもguardだけは必ずマージする
     // （??= で捨てると事前定義経由でguardが外れる）。
     const readOnlyGuard = { graphhopper_edit: false };
+    const lspGuard: Record<string, boolean> = {};
+    if (LSP_DENY_AGENTS.has(name)) {
+      for (const t of LSP_TOOLS) lspGuard[t] = false;
+    }
     const base: AgentConfig = {
       ...def,
-      tools: { ...def.tools, ...readOnlyGuard },
+      tools: { ...def.tools, ...readOnlyGuard, ...lspGuard },
     };
     const merged: AgentConfig = override ? { ...base, model: override } : base;
     const prev = input.agent[name] as AgentConfig | undefined;
     input.agent[name] = prev
-      ? { ...prev, tools: { ...prev.tools, ...readOnlyGuard } }
+      ? { ...prev, tools: { ...prev.tools, ...readOnlyGuard, ...lspGuard } }
       : merged;
   }
 }
