@@ -200,3 +200,82 @@ describe("graphhopper-mcp edit gate（plugin hook と同型）", () => {
     await client.close();
   });
 });
+
+describe("graphhopper-mcp resources", () => {
+  const uri = (root: string, rel: string) =>
+    `graphhopper://graphhopper/${encodeURIComponent(root)}/${rel}`;
+
+  test("templates 4件・state/goals/plansが読める", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    const started = await call("graphhopper_goal", { action: "start", title: "res test" });
+    const id = started.match(/\((g-[0-9a-z]+)\)/)?.[1] ?? "";
+    expect(id).not.toBe("");
+    mkdirSync(join(root, ".graphhopper", "plans"), { recursive: true });
+    writeFileSync(join(root, ".graphhopper", "plans", `${id}.md`), "# design\n");
+
+    const tpl = await client.listResourceTemplates();
+    expect(tpl.resourceTemplates.length).toBe(4);
+
+    const st = await client.readResource({ uri: uri(root, "state.json") });
+    const stText = (st.contents[0] as { text: string }).text;
+    expect(stText).toContain(id);
+
+    const doc = await client.readResource({ uri: uri(root, `plans/${id}.md`) });
+    expect((doc.contents[0] as { text: string }).text).toBe("# design\n");
+    expect((doc.contents[0] as { mimeType?: string }).mimeType).toBe("text/markdown");
+    await client.close();
+  });
+
+  test("traversal・未知名・欠番は拒否", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    await expect(client.readResource({ uri: uri(root, "../x.json") })).rejects.toThrow();
+    await expect(client.readResource({ uri: uri(root, "nope.json") })).rejects.toThrow();
+    await expect(
+      client.readResource({ uri: uri(root, "plans/unknown.md") }),
+    ).rejects.toThrow();
+    await client.close();
+  });
+});
+
+describe("graphhopper-mcp structured output / elicitation", () => {
+  test("status/goalにstructuredContentが付く", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const st0 = await client.callTool({ name: "graphhopper_status", arguments: { root } });
+    expect((st0 as { structuredContent?: unknown }).structuredContent).toEqual({
+      active: false,
+    });
+    const started = await client.callTool({
+      name: "graphhopper_goal",
+      arguments: { root, action: "start", title: "struct test", session_id: "s" },
+    });
+    const sc = (started as { structuredContent?: Record<string, unknown> }).structuredContent;
+    expect(sc?.["action"]).toBe("start");
+    expect(sc?.["ok"]).toBe(true);
+    expect(typeof sc?.["goalId"]).toBe("string");
+    expect(sc?.["phase"]).toBe("designing");
+    await client.close();
+  });
+
+  test("elicitation未対応clientではcompleteが従来error文に倒れる", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "elicit test" });
+    // in-process Client は elicitation 未対応 → server.elicitInput が失敗し fallback
+    const out = await call("graphhopper_goal", { action: "complete" });
+    expect(out).toContain("error: complete には直近の graphhopper_verifier_set");
+    await client.close();
+  });
+});

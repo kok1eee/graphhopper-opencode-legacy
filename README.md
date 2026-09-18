@@ -167,6 +167,29 @@ plugin tool は opencode ランタイム内のセッションにしか配膳さ�
 export し、helper・定数は `src/gate.ts` に置く。entry に非関数 export を足すと
 plugin が黙って消える（`~/.local/share/opencode/log/opencode.log` に ERROR）。
 
+### MCP resources（参照系）
+
+tool 呼び出しより安い読み取り用。URI 形式は
+`graphhopper://graphhopper/<encodeURIComponent(root)>/<rel>`:
+
+| rel | 内容 |
+|---|---|
+| `state.json` | 現在のループ状態 |
+| `goals.json` | 目標キュー＋active指定 |
+| `history.jsonl` | 監査ログ（末尾200行に丸め） |
+| `plans/<goalId>.md` / `plans/<goalId>.log.md` | design doc・log |
+
+`ListResources` は空（root が呼出側依存で列挙不能）、templates 4件で発見可能にする。
+rel は allowlist＋containment 検査で traversal を拒否する。
+
+### MCP 構造化出力・elicitation
+
+- 主要 8 tool（goal/status/phase/set_eval/eval/attempt/router_check/verifier_set）は
+  `outputSchema`＋`structuredContent` を返す（text 応答は不変。CI・watchdog向け）
+- `complete` の verifier ガード・`resume` の loop-stop ブロックは elicitation で
+  構造化承認を求める。client 未対応・拒否時は従来の error 文にフォールバックする
+  （`force: true` の明示指定も従来通り有効）
+
 ## state の場所
 
 ```

@@ -21,11 +21,17 @@
 import { $ } from "bun";
 import {
   CallToolRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListResourcesRequestSchema,
   ListToolsRequestSchema,
+  McpError,
+  ReadResourceRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { PHASE_ACTION } from "./gate";
 import { designDocLockedRefusal, designGateRefusal } from "./gate";
@@ -43,6 +49,62 @@ function rootOf(root?: string): string {
 
 function sessionOf(session_id?: string): string {
   return session_id ?? "";
+}
+
+/** force 系の構造化承認（elicitation）。client 未対応・拒否・失敗時は
+ * false に倒して従来の error 文運用にフォールバックする。 */
+async function confirmForce(server: Server, message: string): Promise<boolean> {
+  try {
+    const r = await server.elicitInput({
+      message,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          confirm: { type: "boolean", title: "承認", description: message },
+        },
+        required: ["confirm"],
+      },
+    });
+    return r.action === "accept" && (r.content as { confirm?: unknown } | undefined)?.confirm === true;
+  } catch {
+    return false;
+  }
+}
+
+function goalData(
+  root: string,
+  action: string,
+  text: string,
+): Record<string, unknown> {
+  if (text.startsWith("error") || text === "no active goal") {
+    return { action, ok: false };
+  }
+  const a = state.getActive(root);
+  if (!a) return { action, ok: false };
+  return {
+    action,
+    ok: true,
+    goalId: a.goal.id,
+    title: a.goal.title,
+    status: a.goal.status,
+    phase: a.state.phase,
+    bound: !!a.state.session_id,
+  };
+}
+
+function statusData(root: string): Record<string, unknown> {
+  const a = state.getActive(root);
+  if (!a) return { active: false };
+  return {
+    active: true,
+    goalId: a.goal.id,
+    title: a.goal.title,
+    status: a.goal.status,
+    phase: a.state.phase,
+    // client が outputSchema で自動検証するため null は落とす（undefined は省略される）
+    route: a.state.router.route ?? undefined,
+    failStreak: a.state.fail_streak,
+  };
 }
 
 function statusText(root: string): string {
@@ -73,13 +135,13 @@ function statusText(root: string): string {
     .join("\n");
 }
 
-function goalAction(
+async function goalAction(
   root: string,
   sessionID: string,
   action: "start" | "pause" | "resume" | "complete" | "clear",
-  title?: string,
-  force?: boolean,
-): string {
+  opts: { title?: string; force?: boolean; server?: Server },
+): Promise<string> {
+  const { title, force, server } = opts;
   switch (action) {
     case "start": {
       if (!title) return "error: title is required for start";
@@ -99,6 +161,21 @@ function goalAction(
     }
     case "resume": {
       if (state.isResumeBlocked(root) && !force) {
+        // elicitation: client が承認すれば force 扱いで続行。未対応・拒否は従来文へ
+        if (server) {
+          const s0 = state.getActive(root);
+          const max = state.readConfig(root).loop_stop_max;
+          const approved = await confirmForce(
+            server,
+            `goal "${s0?.goal.title}" はループ検知の自動停止が loop_stop_max（${max}）回に達し resume がブロック中です。原因を確認済みで明示的に続行しますか？（監査ログに loop_resume_forced が記録されます）`,
+          );
+          if (approved) {
+            const a2 = state.resumeGoal(root, sessionID, true);
+            return a2
+              ? `resumed: "${a2.goal.title}" | phase: ${a2.state.phase} (forced via elicitation)`
+              : "no active goal";
+          }
+        }
         const s = state.getActive(root);
         const max = state.readConfig(root).loop_stop_max;
         const count = s?.state.loop_stop_count ?? 0;
@@ -120,6 +197,18 @@ function goalAction(
       if (!a) return "no active goal";
       // self-graded done 禁止: 直近の verifier clean を機械要求する（drift残りの完了を防ぐ）
       if (!force && a.state.last_verifier?.level !== "clean") {
+        if (server) {
+          const approved = await confirmForce(
+            server,
+            `goal "${a.goal.title}" は直近 verifier clean がありません。このまま完了すると self-graded 完了になりますが、人間の明示判断として強制完了しますか？`,
+          );
+          if (approved) {
+            const done2 = state.completeGoal(root);
+            return done2
+              ? `completed: "${done2.goal.title}" (forced via elicitation)`
+              : "no active goal";
+          }
+        }
         return (
           "error: complete には直近の graphhopper_verifier_set（集約 clean）が必要です（self-graded 完了は禁止）。" +
           "小diffで verifier fan-out が不要なら、人間の明示的な判断がある場合のみ force: true を使ってください。"
@@ -138,11 +227,15 @@ function goalAction(
   }
 }
 
-function attemptRecord(root: string, ok: boolean, note: string): string {
+function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
   const active = state.getActive(root);
-  if (!active) return "error: no active goal";
+  if (!active) return { text: "error: no active goal" };
   const r = state.recordAttempt(root, ok, note);
-  if (ok) return "attempt recorded: ok (fail_streak reset to 0)";
+  if (ok)
+    return {
+      text: "attempt recorded: ok (fail_streak reset to 0)",
+      data: { ok: true, failStreak: 0, escalate: false, giveUp: false },
+    };
   if (r.giveUp) {
     const paused = state.pauseGoal(root);
     if (paused) {
@@ -152,27 +245,39 @@ function attemptRecord(root: string, ok: boolean, note: string): string {
         fail_streak: r.fail_streak,
       });
     }
-    return [
-      `attempt recorded: fail (fail_streak=${r.fail_streak})`,
-      `giveUp: true — 連続失敗が上限に達したため goal を pause した。修正して graphhopper_goal(action: 'resume') で再開せよ（fail_streak は 0 に戻る）。`,
-    ].join("\n");
+    return {
+      text: [
+        `attempt recorded: fail (fail_streak=${r.fail_streak})`,
+        `giveUp: true — 連続失敗が上限に達したため goal を pause した。修正して graphhopper_goal(action: 'resume') で再開せよ（fail_streak は 0 に戻る）。`,
+      ].join("\n"),
+      data: { ok: false, failStreak: r.fail_streak, escalate: false, giveUp: true },
+    };
   }
   if (r.escalate) {
-    return [
-      `attempt recorded: fail (fail_streak=${r.fail_streak})`,
-      "escalate: true",
-      "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行（何を試して何が起きたか）を渡すこと。",
-    ].join("\n");
+    return {
+      text: [
+        `attempt recorded: fail (fail_streak=${r.fail_streak})`,
+        "escalate: true",
+        "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行（何を試して何が起きたか）を渡すこと。",
+      ].join("\n"),
+      data: { ok: false, failStreak: r.fail_streak, escalate: true, giveUp: false },
+    };
   }
   const stuck = state.checkStuck(root);
   if (stuck.escalate && state.noteStuckNotified(root, stuck.reasons)) {
-    return [
-      `attempt recorded: fail (fail_streak=${r.fail_streak})`,
-      `escalate: true (stuck: ${stuck.reasons.join(", ")})`,
-      "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。",
-    ].join("\n");
+    return {
+      text: [
+        `attempt recorded: fail (fail_streak=${r.fail_streak})`,
+        `escalate: true (stuck: ${stuck.reasons.join(", ")})`,
+        "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。",
+      ].join("\n"),
+      data: { ok: false, failStreak: r.fail_streak, escalate: true, giveUp: false },
+    };
   }
-  return `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false`;
+  return {
+    text: `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false`,
+    data: { ok: false, failStreak: r.fail_streak, escalate: false, giveUp: false },
+  };
 }
 
 /** plugin の session.idle 内 eval 経路と同型の遷移（promptAsync・loop検知・
@@ -255,9 +360,9 @@ async function evalOnce(root: string): Promise<string> {
     .join("\n");
 }
 
-async function routerCheck(root: string): Promise<string> {
+async function routerCheck(root: string): Promise<ToolOut> {
   const active = state.getActive(root);
-  if (!active) return "error: no active goal";
+  if (!active) return { text: "error: no active goal" };
   const cfg = state.readConfig(root);
   const baseline =
     active.state.router.baseline_rev ??
@@ -266,22 +371,25 @@ async function routerCheck(root: string): Promise<string> {
   const route: state.RouterRoute =
     diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
   state.recordRouterCheck(root, baseline, diffLines, route);
-  return [
-    `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
-    `route: ${route}`,
-    route === "polish"
-      ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
-      : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(results: [{lens: 'general', level}])で記録する（自己レビューだけでの完了は不可）",
-  ].join("\n");
+  return {
+    text: [
+      `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
+      `route: ${route}`,
+      route === "polish"
+        ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
+        : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(results: [{lens: 'general', level}])で記録する（自己レビューだけでの完了は不可）",
+    ].join("\n"),
+    data: { diffLines, route, threshold: cfg.router_threshold_lines },
+  };
 }
 
 function verifierSet(
   root: string,
   results: state.VerifierResult[],
   reason: string,
-): string {
+): ToolOut {
   const rejected = state.checkVerifierResults(results);
-  if (rejected) return rejected;
+  if (rejected) return { text: rejected };
   const decided = state.aggregateVerdicts(results);
   const result = state.setVerifierVerdict(root, {
     level: decided.level,
@@ -289,29 +397,51 @@ function verifierSet(
     target: decided.target,
     lens: results.map((r) => r.lens),
   });
+  const data = {
+    level: decided.level,
+    target: decided.target ?? undefined,
+    lens: results.map((r) => r.lens),
+  };
   if (result.last_verifier?.level === "clean") {
-    return "verifier verdict: clean\ngraphhopper_phase(phase: 'done') で完了に進める。";
+    return {
+      text: "verifier verdict: clean\ngraphhopper_phase(phase: 'done') で完了に進める。",
+      data,
+    };
   }
-  return [
-    `verifier verdict: drift -> ${decided.target}`,
-    `reason: ${reason}`,
-    `lens: ${results.map((r) => `${r.lens}=${r.level}`).join(",")}`,
-    decided.target === "implementing"
-      ? "次: graphhopper_phase(phase: 'implementing') で巻き戻し"
-      : "次: 人間の hand-back を待つ（design/requirementsは自動で戻らない）",
-  ].join("\n");
+  return {
+    text: [
+      `verifier verdict: drift -> ${decided.target}`,
+      `reason: ${reason}`,
+      `lens: ${results.map((r) => `${r.lens}=${r.level}`).join(",")}`,
+      decided.target === "implementing"
+        ? "次: graphhopper_phase(phase: 'implementing') で巻き戻し"
+        : "次: 人間の hand-back を待つ（design/requirementsは自動で戻らない）",
+    ].join("\n"),
+    data,
+  };
 }
 
 /* MCP tool 定義表。inputSchema（JSON Schema・手書き）と検証用 zod schema、
  * 実行関数を隣接させて二重管理の漂流を抑える。
  * 高レベル McpServer.tool は overload の型推論が TS2589 で爆発するため
  * 低レベル Server + setRequestHandler を使う。 */
+interface ToolCtx {
+  server: Server;
+}
+
+interface ToolOut {
+  text: string;
+  /** structuredContent 用。付けた tool は outputSchema も宣言する */
+  data?: Record<string, unknown>;
+}
+
 interface ToolDef {
   name: string;
   description: string;
   inputSchema: Tool["inputSchema"];
+  outputSchema?: Tool["outputSchema"];
   schema: z.ZodTypeAny;
-  run: (args: any) => Promise<string> | string;
+  run: (args: any, ctx: ToolCtx) => Promise<ToolOut> | ToolOut;
 }
 
 const ROOT_PROP = { type: "string", description: ROOT_DESC } as const;
@@ -342,8 +472,28 @@ const TOOL_DEFS: ToolDef[] = [
       root: rootZ,
       session_id: sessionZ,
     }),
-    run: (a) =>
-      goalAction(rootOf(a.root), sessionOf(a.session_id), a.action, a.title, a.force),
+    outputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string" },
+        ok: { type: "boolean" },
+        goalId: { type: "string" },
+        title: { type: "string" },
+        status: { type: "string" },
+        phase: { type: "string" },
+        bound: { type: "boolean" },
+      },
+      required: ["action", "ok"],
+    },
+    run: async (a, ctx) => {
+      const root = rootOf(a.root);
+      const text = await goalAction(root, sessionOf(a.session_id), a.action, {
+        title: a.title,
+        force: a.force,
+        server: ctx.server,
+      });
+      return { text, data: goalData(root, a.action, text) };
+    },
   },
   {
     name: "graphhopper_status",
@@ -351,7 +501,23 @@ const TOOL_DEFS: ToolDef[] = [
       "graphhopper の現在状態（goal・フェーズ・router・verifier・critic_review）を表示する",
     inputSchema: { type: "object", properties: { root: ROOT_PROP } },
     schema: z.object({ root: rootZ }),
-    run: (a) => statusText(rootOf(a.root)),
+    outputSchema: {
+      type: "object",
+      properties: {
+        active: { type: "boolean" },
+        goalId: { type: "string" },
+        title: { type: "string" },
+        status: { type: "string" },
+        phase: { type: "string" },
+        route: { type: "string" },
+        failStreak: { type: "number" },
+      },
+      required: ["active"],
+    },
+    run: (a) => {
+      const root = rootOf(a.root);
+      return { text: statusText(root), data: statusData(root) };
+    },
   },
   {
     name: "graphhopper_phase",
@@ -371,10 +537,18 @@ const TOOL_DEFS: ToolDef[] = [
       notes: z.string().optional(),
       root: rootZ,
     }),
+    outputSchema: {
+      type: "object",
+      properties: { ok: { type: "boolean" }, phase: { type: "string" } },
+      required: ["ok"],
+    },
     run: (a) => {
       const r = state.setPhase(rootOf(a.root), a.phase, a.notes);
-      if (!r) return "error: no active goal or invalid phase";
-      return `phase -> ${r.state.phase}\n次: ${PHASE_ACTION[r.state.phase]}`;
+      if (!r) return { text: "error: no active goal or invalid phase" };
+      return {
+        text: `phase -> ${r.state.phase}\n次: ${PHASE_ACTION[r.state.phase]}`,
+        data: { ok: true, phase: r.state.phase },
+      };
     },
   },
   {
@@ -390,14 +564,22 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["cmd"],
     },
     schema: z.object({ cmd: z.string(), root: rootZ }),
+    outputSchema: {
+      type: "object",
+      properties: { cmd: { type: "string" }, cleared: { type: "boolean" } },
+      required: ["cmd", "cleared"],
+    },
     run: (a) => {
       const root = rootOf(a.root);
       const active = state.getActive(root);
-      if (!active) return "error: no active goal";
+      if (!active) return { text: "error: no active goal" };
       state.setEvalCmd(root, a.cmd);
-      return a.cmd
-        ? `eval_cmd set: ${a.cmd}\ngraphhopper_eval で明示実行する（MCP には idle 自動駆動が無い）。`
-        : "eval_cmd cleared. graphhopper_attemptの自己申告にフォールバックする。";
+      return {
+        text: a.cmd
+          ? `eval_cmd set: ${a.cmd}\ngraphhopper_eval で明示実行する（MCP には idle 自動駆動が無い）。`
+          : "eval_cmd cleared. graphhopper_attemptの自己申告にフォールバックする。",
+        data: { cmd: a.cmd, cleared: !a.cmd },
+      };
     },
   },
   {
@@ -406,7 +588,38 @@ const TOOL_DEFS: ToolDef[] = [
       "eval_cmd を実行し plugin の idle eval 経路と同型の遷移（pass→polish / fail→fail_streak / giveUp→pause）を適用する",
     inputSchema: { type: "object", properties: { root: ROOT_PROP } },
     schema: z.object({ root: rootZ }),
-    run: (a) => evalOnce(rootOf(a.root)),
+    outputSchema: {
+      type: "object",
+      properties: {
+        ran: { type: "boolean" },
+        ok: { type: "boolean" },
+        failStreak: { type: "number" },
+        phase: { type: "string" },
+        route: { type: "string" },
+        diffLines: { type: "number" },
+      },
+      required: ["ran"],
+    },
+    run: async (a) => {
+      const root = rootOf(a.root);
+      const text = await evalOnce(root);
+      if (text.startsWith("skip:") || text.startsWith("error:")) {
+        return { text, data: { ran: false } };
+      }
+      const s = state.getActive(root);
+      const fp = s?.state.last_eval_fingerprint ?? "";
+      return {
+        text,
+        data: {
+          ran: true,
+          ok: fp.startsWith("true:"),
+          failStreak: s?.state.fail_streak ?? 0,
+          phase: s?.state.phase,
+          route: s?.state.router.route ?? undefined,
+          diffLines: s?.state.router.diff_lines ?? undefined,
+        },
+      };
+    },
   },
   {
     name: "graphhopper_attempt",
@@ -422,6 +635,16 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["ok", "note"],
     },
     schema: z.object({ ok: z.boolean(), note: z.string(), root: rootZ }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        ok: { type: "boolean" },
+        failStreak: { type: "number" },
+        escalate: { type: "boolean" },
+        giveUp: { type: "boolean" },
+      },
+      required: ["ok", "failStreak", "escalate", "giveUp"],
+    },
     run: (a) => attemptRecord(rootOf(a.root), a.ok, a.note),
   },
   {
@@ -430,6 +653,15 @@ const TOOL_DEFS: ToolDef[] = [
       "diffサイズを機械測定してrouteを決める（advisor=小diff・verifier1回 / polish=大diff・3charter fan-out）",
     inputSchema: { type: "object", properties: { root: ROOT_PROP } },
     schema: z.object({ root: rootZ }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        diffLines: { type: "number" },
+        route: { type: "string" },
+        threshold: { type: "number" },
+      },
+      required: ["diffLines", "route", "threshold"],
+    },
     run: (a) => routerCheck(rootOf(a.root)),
   },
   {
@@ -467,6 +699,15 @@ const TOOL_DEFS: ToolDef[] = [
       reason: z.string(),
       root: rootZ,
     }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        level: { type: "string" },
+        target: { type: "string" },
+        lens: { type: "array", items: { type: "string" } },
+      },
+      required: ["level"],
+    },
     run: (a) => verifierSet(rootOf(a.root), a.results as state.VerifierResult[], a.reason),
   },
   {
@@ -492,7 +733,7 @@ const TOOL_DEFS: ToolDef[] = [
         level: a.level,
         reason: a.reason,
       });
-      return `critic review recorded: ${a.level}. phase: ${result.phase}`;
+      return { text: `critic review recorded: ${a.level}. phase: ${result.phase}` };
     },
   },
   {
@@ -511,10 +752,12 @@ const TOOL_DEFS: ToolDef[] = [
     schema: z.object({ target: z.string(), scope: z.string(), root: rootZ }),
     run: (a) => {
       const s = state.startDiscover(rootOf(a.root), a.target, a.scope);
-      return [
-        `discover started: target="${s.target}" scope="${s.scope}"`,
-        "次: 3charterで探索し、結果を graphhopper_discover_tick に渡す。stopped_reasonがnullの間、繰り返す。",
-      ].join("\n");
+      return {
+        text: [
+          `discover started: target="${s.target}" scope="${s.scope}"`,
+          "次: 3charterで探索し、結果を graphhopper_discover_tick に渡す。stopped_reasonがnullの間、繰り返す。",
+        ].join("\n"),
+      };
     },
   },
   {
@@ -555,13 +798,17 @@ const TOOL_DEFS: ToolDef[] = [
     run: (a) => {
       const s = state.tickDiscover(rootOf(a.root), a.findings);
       if (s.stopped_reason) {
-        return [
-          `stopped: ${s.stopped_reason} (round ${s.round})`,
-          `confirmed: ${s.confirmed.length}件`,
-          JSON.stringify(s.confirmed, null, 2),
-        ].join("\n");
+        return {
+          text: [
+            `stopped: ${s.stopped_reason} (round ${s.round})`,
+            `confirmed: ${s.confirmed.length}件`,
+            JSON.stringify(s.confirmed, null, 2),
+          ].join("\n"),
+        };
       }
-      return `round ${s.round} 完了。dry_streak=${s.dry_streak}, seen=${s.seen.length}件。次のラウンドへ`;
+      return {
+        text: `round ${s.round} 完了。dry_streak=${s.dry_streak}, seen=${s.seen.length}件。次のラウンドへ`,
+      };
     },
   },
   {
@@ -571,7 +818,7 @@ const TOOL_DEFS: ToolDef[] = [
     schema: z.object({ root: rootZ }),
     run: (a) => {
       state.clearDiscover(rootOf(a.root));
-      return "cleared";
+      return { text: "cleared" };
     },
   },
   {
@@ -584,7 +831,7 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["filePath"],
     },
     schema: z.object({ filePath: z.string(), root: rootZ }),
-    run: (a) => readGraphhopperHash(rootOf(a.root), a.filePath),
+    run: (a) => ({ text: readGraphhopperHash(rootOf(a.root), a.filePath) }),
   },
   {
     name: "graphhopper_edit",
@@ -624,7 +871,7 @@ const TOOL_DEFS: ToolDef[] = [
             tool: "graphhopper_edit",
             path: a.filePath,
           });
-          return `error: ${designGateRefusal("graphhopper_edit", a.filePath, cfg.design_gate_allow)}`;
+          return { text: `error: ${designGateRefusal("graphhopper_edit", a.filePath, cfg.design_gate_allow)}` };
         }
         if (
           state.isDesignDocLocked(root, gateActive.state.phase, gateActive.goal.id, a.filePath)
@@ -635,7 +882,7 @@ const TOOL_DEFS: ToolDef[] = [
             tool: "graphhopper_edit",
             path: a.filePath,
           });
-          return `error: ${designDocLockedRefusal("graphhopper_edit", a.filePath, gateActive.goal.id)}`;
+          return { text: `error: ${designDocLockedRefusal("graphhopper_edit", a.filePath, gateActive.goal.id)}` };
         }
       }
       try {
@@ -657,9 +904,9 @@ const TOOL_DEFS: ToolDef[] = [
         ) {
           state.noteEdit(root, a.filePath);
         }
-        return out;
+        return { text: out };
       } catch (e) {
-        return `error: ${e instanceof Error ? e.message : String(e)}`;
+        return { text: `error: ${e instanceof Error ? e.message : String(e)}` };
       }
     },
   },
@@ -685,14 +932,107 @@ const TOOL_DEFS: ToolDef[] = [
       timeoutMs: z.number().optional(),
       root: rootZ,
     }),
-    run: (a) =>
-      invoke({
+    run: async (a) => ({
+      text: await invoke({
         agent: a.agent,
         model: a.model,
         prompt: a.prompt,
         root: rootOf(a.root),
         timeoutMs: a.timeoutMs,
       }),
+    }),
+  },
+];
+
+/* MCP resources: state参照系。tool呼び出しより安い読み取り用。
+ * URI形式: graphhopper://graphhopper/<encodeURIComponent(root)>/<rel>
+ * rel は state.json | goals.json | history.jsonl | plans/<name>.md のみ
+ * （traversal防止のためallowlist＋解決後の containment 検査）。
+ * ListResources は空（rootが呼出側依存で列挙不能）。templates で発見可能にする。
+ * history.jsonl は末尾200行に丸める（肥大化対策。丸めた旨を先頭に明記）。 */
+const HISTORY_TAIL_LINES = 200;
+
+function parseResourceUri(uri: string): { root: string; rel: string } {
+  let u: URL;
+  try {
+    u = new URL(uri);
+  } catch {
+    throw new McpError(-32002, `invalid resource uri: ${uri}`);
+  }
+  if (u.protocol !== "graphhopper:" || u.host !== "graphhopper") {
+    throw new McpError(-32002, `unsupported resource uri: ${uri}`);
+  }
+  const segs = u.pathname.split("/").filter(Boolean);
+  if (segs.length < 2) {
+    throw new McpError(-32002, `invalid resource uri (need root + name): ${uri}`);
+  }
+  const root = decodeURIComponent(segs[0] ?? "");
+  const rel = segs.slice(1).join("/");
+  if (!root.startsWith("/") || !existsSync(root)) {
+    throw new McpError(-32002, `unknown project root: ${root}`);
+  }
+  if (!/^(state|goals)\.json$|^history\.jsonl$|^plans\/[A-Za-z0-9_.-]+\.md$/.test(rel)) {
+    throw new McpError(-32002, `unsupported resource name: ${rel}`);
+  }
+  const resolved = resolve(root, ".graphhopper", rel);
+  if (resolved !== join(root, ".graphhopper", rel) || !resolved.startsWith(root + sep)) {
+    throw new McpError(-32002, `path escape blocked: ${rel}`);
+  }
+  return { root, rel };
+}
+
+function readResourceContent(
+  root: string,
+  rel: string,
+): { text: string; mimeType: string } {
+  const p = join(root, ".graphhopper", rel);
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf8");
+  } catch {
+    throw new McpError(-32002, `not found: ${rel} (root: ${root})`);
+  }
+  if (rel.endsWith(".md")) return { text: raw, mimeType: "text/markdown" };
+  if (rel === "history.jsonl") {
+    const lines = raw.split("\n");
+    if (lines.length > HISTORY_TAIL_LINES) {
+      return {
+        text: [
+          `(note: 直近${HISTORY_TAIL_LINES}行のみ。全${lines.length}行)`,
+          ...lines.slice(-HISTORY_TAIL_LINES),
+        ].join("\n"),
+        mimeType: "application/json",
+      };
+    }
+    return { text: raw, mimeType: "application/json" };
+  }
+  return { text: raw, mimeType: "application/json" };
+}
+
+const RESOURCE_TEMPLATES = [
+  {
+    uriTemplate: "graphhopper://graphhopper/{root}/state.json",
+    name: "loop state",
+    description: "現在のループ状態（goal/phase/router/verifier）。{root} は encodeURIComponent したプロジェクトパス",
+    mimeType: "application/json",
+  },
+  {
+    uriTemplate: "graphhopper://graphhopper/{root}/goals.json",
+    name: "goal queue",
+    description: "目標キュー＋active指定",
+    mimeType: "application/json",
+  },
+  {
+    uriTemplate: "graphhopper://graphhopper/{root}/history.jsonl",
+    name: "audit log",
+    description: "監査ログ（末尾200行に丸め）",
+    mimeType: "application/json",
+  },
+  {
+    uriTemplate: "graphhopper://graphhopper/{root}/plans/{name}",
+    name: "design doc / log",
+    description: "design ドキュメント・log（{name} は <goalId>.md / <goalId>.log.md）",
+    mimeType: "text/markdown",
   },
 ];
 
@@ -700,13 +1040,24 @@ const TOOL_DEFS: ToolDef[] = [
 export function createServer(): Server {
   const server = new Server(
     { name: "graphhopper", version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {}, resources: {} } },
   );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOL_DEFS.map((d) => ({
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [],
+  }));
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    resourceTemplates: RESOURCE_TEMPLATES,
+  }));
+  server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+    const { root, rel } = parseResourceUri(req.params.uri);
+    const { text, mimeType } = readResourceContent(root, rel);
+    return { contents: [{ uri: req.params.uri, mimeType, text }] };
+  });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({    tools: TOOL_DEFS.map((d) => ({
       name: d.name,
       description: d.description,
       inputSchema: d.inputSchema,
+      ...(d.outputSchema ? { outputSchema: d.outputSchema } : {}),
     })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -725,7 +1076,13 @@ export function createServer(): Server {
       };
     }
     try {
-      return { content: [{ type: "text", text: String(await def.run(parsed.data)) }] };
+      const out = await def.run(parsed.data, { server });
+      const res: {
+        content: { type: "text"; text: string }[];
+        structuredContent?: Record<string, unknown>;
+      } = { content: [{ type: "text", text: out.text }] };
+      if (out.data !== undefined) res.structuredContent = out.data;
+      return res;
     } catch (e) {
       return {
         content: [{ type: "text", text: `error: ${e instanceof Error ? e.message : String(e)}` }],
