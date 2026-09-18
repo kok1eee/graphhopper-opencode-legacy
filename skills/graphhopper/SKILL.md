@@ -112,6 +112,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
      - requirement: 「実装がdesign.mdの意図から外れていないか（実装漏れ・解釈ズレ・スコープ逸脱）を検証せよ」
      - behavior: 「テストが実際のユーザーパスを検証しているか（モック過多・ハッピーパスのみ・エラー握り潰し）を疑え」
      - progress: 「変更がgoalに収束しているか（堂々巡り・残骸・goal無関係な混入）を見よ」
+     時間短縮のため3体は**並列**に投げてよい（MCP駆動では graphhopper_invoke を3連並列。入れ子のみ禁止）。
+     charter定型文は MCP prompts（graphhopper-verifier-requirement/behavior/progress）にもある
   2. 各verifierに `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / diff（`jj diff --from <baseline>` または `git diff <baseline>`）を渡す。behavior charterでは診断証拠（型・lint実行結果）を要求する
   3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
   4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
@@ -140,6 +142,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **tgrepはtier外の逃走経路**: 表現力は rg と同じで、利点は巨大repoでの速度のみ。通常は rg で足りる。どうしても遅い巨大repoでのみ、自分で `tgrep index .` または `tgrep serve .` を立てて `tgrep search` を使う（index/serve は状態変更のため allowlist では deny＝BYOS。stale index は取りこぼしの原因になるので更新に注意）
 - **書き換え系フラグは禁止**: `ast-grep --update-all` / `ast-grep -U`、`ruff --fix` / `ruff format`、`pyright --createstub` はsubagent read-only不変条件のためdeny。使わない
 - **診断クリーンをdriftなしの根拠にしない**: 挙動driftは診断に出ない。診断は補助証拠
+- **言語版ガード（critic/verifier共通の誤検知止め）**: 構文・APIの指摘前に requires-python / .python-version / toolchain の版を必ず確認する。Python 3.14+ では PEP 758 により括弧なし except（`except A, B:`）は有効な構文であり、版が 3.14+ なら指摘しない（警告が出る場合のみ言及）。版不明・3.13以前なら従来通り指摘してよい
 
 - **designing中に無理にEdit/Writeしようとしてエラーになったら**: 設計が先という合図。design.md を先に書いてから implementing へ遷移する
 - **designing終了後にdesign.mdを書き直そうとしてエラーになったら**: 仕様変更や見落としがあっても design.md 自体は書き換えない。`.graphhopper/plans/<goal-id>.log.md` に決定の経緯・棄却した代替案を追記する（design.mdはverifierのdrift検出アンカーなので不変を保つ）

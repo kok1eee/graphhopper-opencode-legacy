@@ -1581,3 +1581,123 @@ export function tickDiscover(
 export function clearDiscover(root: string): void {
   if (existsSync(discoverPath(root))) atomicWrite(discoverPath(root), null);
 }
+
+/* ================================================================== *
+ * lineage（作業グラフの第一歩）: goals.json + history.jsonl から
+ * goal ごとの系譜を導出する。MCP の lineage.json resource が読む。
+ * graft（コードの構造）に対する「作業の構造」側の edge 素材。
+ * ================================================================== */
+
+/** history.jsonl の1行（recordEvent が付与する ts 付き） */
+export type HistoryRecord = HistoryEvent & { ts?: string };
+
+export function readHistory(root: string): HistoryRecord[] {
+  const p = historyPath(root);
+  if (!existsSync(p)) return [];
+  try {
+    return readFileSync(p, "utf8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as HistoryRecord);
+  } catch {
+    return [];
+  }
+}
+
+export interface GoalLineage {
+  id: string;
+  title: string;
+  status: GoalStatus;
+  /** 訪れた phase（順序保持・重複なし。先頭は常に designing） */
+  phases: Phase[];
+  /** polish → implementing の巻き戻し回数（verifier drift の機械証跡） */
+  rewinds: number;
+  verifier: { level: VerdictLevel; target: DriftTarget | null; lens: VerifierLens[] }[];
+  critic: VerdictLevel | null;
+  evalRuns: { pass: number; fail: number };
+  maxFailStreak: number;
+  gateBlocks: number;
+  editedFiles: string[];
+  routerChecks: { diff_lines: number; route: RouterRoute }[];
+}
+
+export function buildLineage(root: string): { goals: GoalLineage[] } {
+  const stored = readGoals(root);
+  const byId = new Map<string, GoalLineage>();
+  for (const g of stored.goals) {
+    byId.set(g.id, {
+      id: g.id,
+      title: g.title,
+      status: g.status,
+      phases: ["designing"],
+      rewinds: 0,
+      verifier: [],
+      critic: null,
+      evalRuns: { pass: 0, fail: 0 },
+      maxFailStreak: 0,
+      gateBlocks: 0,
+      editedFiles: [],
+      routerChecks: [],
+    });
+  }
+  const get = (goalId: string): GoalLineage | null => {
+    let l = byId.get(goalId);
+    if (!l) {
+      // goals.json に無い（clear 済み等）が history に残る分は title 不明で計上
+      l = {
+        id: goalId,
+        title: "(unknown)",
+        status: "done",
+        phases: ["designing"],
+        rewinds: 0,
+        verifier: [],
+        critic: null,
+        evalRuns: { pass: 0, fail: 0 },
+        maxFailStreak: 0,
+        gateBlocks: 0,
+        editedFiles: [],
+        routerChecks: [],
+      };
+      byId.set(goalId, l);
+    }
+    return l;
+  };
+  for (const h of readHistory(root)) {
+    const goalId = (h as { goal?: unknown }).goal;
+    if (typeof goalId !== "string") continue;
+    const l = get(goalId);
+    if (!l) continue;
+    switch (h.type) {
+      case "phase":
+        if (!l.phases.includes(h.to)) l.phases.push(h.to);
+        if (h.from === "polish" && h.to === "implementing") l.rewinds += 1;
+        break;
+      case "verifier_verdict":
+        l.verifier.push({ level: h.level, target: h.target, lens: h.lens });
+        break;
+      case "critic_review_set":
+        l.critic = h.level;
+        break;
+      case "eval_run":
+        if (h.ok) l.evalRuns.pass += 1;
+        else l.evalRuns.fail += 1;
+        break;
+      case "attempt":
+        if (h.fail_streak > l.maxFailStreak) l.maxFailStreak = h.fail_streak;
+        break;
+      case "design_gate_block":
+      case "design_doc_locked_block":
+        l.gateBlocks += 1;
+        break;
+      case "hash_edit_applied":
+        if (!l.editedFiles.includes(h.path)) l.editedFiles.push(h.path);
+        break;
+      case "router_check":
+        l.routerChecks.push({ diff_lines: h.diff_lines, route: h.route });
+        break;
+      default:
+        break;
+    }
+  }
+  return { goals: [...byId.values()] };
+}

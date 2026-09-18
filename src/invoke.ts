@@ -162,22 +162,50 @@ export async function invoke(
   args: InvokeArgs,
   spawnFn: SpawnFn = defaultSpawn,
 ): Promise<string> {
+  return (await invokeStructured(args, spawnFn)).output;
+}
+
+export interface InvokeStructuredResult {
+  output: string;
+  timedOut: boolean;
+  fallbackWarning: boolean;
+}
+
+/** invoke の構造化版（MCP structuredContent 用）。判定は runChild の機械値を使う。 */
+export async function invokeStructured(
+  args: InvokeArgs,
+  spawnFn: SpawnFn = defaultSpawn,
+): Promise<InvokeStructuredResult> {
+  const fail = (output: string): InvokeStructuredResult => ({
+    output,
+    timedOut: false,
+    fallbackWarning: false,
+  });
   const depth = Number(process.env[DEPTH_ENV] ?? "0");
   if (depth >= MAX_DEPTH) {
-    return `error: nested graphhopper_invoke refused (depth=${depth}). v1 forbids recursion.`;
+    return fail(
+      `error: nested graphhopper_invoke refused (depth=${depth}). v1 forbids recursion.`,
+    );
   }
   if (!Object.hasOwn(GRAPHHOPPER_AGENTS, args.agent)) {
-    return `error: unknown agent "${args.agent}". must be one of: ${Object.keys(GRAPHHOPPER_AGENTS).join(", ")}`;
+    return fail(
+      `error: unknown agent "${args.agent}". must be one of: ${Object.keys(GRAPHHOPPER_AGENTS).join(", ")}`,
+    );
   }
   const model = resolveModel(args.root, args.agent, args.model);
   if (args.model && !validModel(args.model)) {
-    return `error: invalid model "${args.model}". must be provider/model without whitespace`;
+    return fail(
+      `error: invalid model "${args.model}". must be provider/model without whitespace`,
+    );
   }
   if (args.prompt.length > PROMPT_MAX_CHARS) {
-    return `error: prompt too long (${args.prompt.length} > ${PROMPT_MAX_CHARS}). split or use --file manually`;
+    return fail(
+      `error: prompt too long (${args.prompt.length} > ${PROMPT_MAX_CHARS}). split or use --file manually`,
+    );
   }
   const binary = resolveBinary();
-  if (!binary) return "error: opencode binary not found (PATH and known mise path)";
+  if (!binary)
+    return fail("error: opencode binary not found (PATH and known mise path)");
   const root = resolve(args.root);
   const timeoutMs = Math.min(
     MAX_TIMEOUT_MS,
@@ -186,5 +214,5 @@ export async function invoke(
   const argv = buildArgs({ agent: args.agent, model, dir: root, title: "gh-invoke", prompt: args.prompt });
   const childEnv: NodeJS.ProcessEnv = { ...process.env, [DEPTH_ENV]: String(depth + 1) };
   const r = await runChild(binary, argv, { timeoutMs, cwd: root, childEnv }, spawnFn);
-  return r.output;
+  return { output: r.output, timedOut: r.timedOut, fallbackWarning: r.fallbackWarning };
 }

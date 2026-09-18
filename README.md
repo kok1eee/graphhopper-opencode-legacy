@@ -178,9 +178,43 @@ tool 呼び出しより安い読み取り用。URI 形式は
 | `goals.json` | 目標キュー＋active指定 |
 | `history.jsonl` | 監査ログ（末尾200行に丸め） |
 | `plans/<goalId>.md` / `plans/<goalId>.log.md` | design doc・log |
+| `lineage.json` | goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル。作業グラフのedge素材。仮想resource） |
 
-`ListResources` は空（root が呼出側依存で列挙不能）、templates 4件で発見可能にする。
+`ListResources` は空（root が呼出側依存で列挙不能）、templates 5件で発見可能にする。
 rel は allowlist＋containment 検査で traversal を拒否する。
+
+### MCP prompts（charter定型文・8件）
+
+reviewer/調査役の charter を prompts として公開。TUI の `task(subagent_type: ...)` と
+文面を合わせ、MCP駆動では `graphhopper_invoke` の prompt にそのまま載せる:
+
+| prompt | 用途 |
+|---|---|
+| `graphhopper-critic` | design.md敵対レビュー（design docを埋め込み返却） |
+| `graphhopper-verifier-requirement` / `-behavior` / `-progress` | polish fan-out各lens（3連並列可） |
+| `graphhopper-verifier-general` | advisor route用統合charter |
+| `graphhopper-oracle` | 手詰まり相談（直近の失敗記録を埋め込み返却） |
+| `graphhopper-researcher` / `graphhopper-librarian` | 内外調査（query必須） |
+
+critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を同梱。
+`src/prompts.ts` が単一源泉（SKILL.md の同名ルールと一対で維持する）。
+
+### MCP 仕上げ（roots・annotations・logging）
+
+- `root` 省略時は client roots の先頭（file://）→プロセス cwd の順で解決する
+- tool annotations: `status`/`hash` は readOnly、`edit` は destructive、
+  `eval`/`invoke`/`router_check` は openWorld の hint を付与
+- 全15 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
+- tool 実行後に logging 通知を転送（state 遷移系は info、それ以外は debug）。
+  client 未対応でも tool 結果は壊さない
+
+### グラフ化の方向性（作業グラフ × コードグラフ）
+
+- 第一歩が `lineage.json`：goals＋history から goal 系譜を導出する仮想 resource。
+  graft（コードの構造）に対する「作業の構造」側の edge 素材
+- 次は `noteEdit` の file 記録と graft symbol の紐付け（どの goal がどの symbol に
+  触ったか）。stuck 検知の精度向上と「なぜその判断になったか」の遡及が目的。
+  未着手（設計メモ段階）
 
 ### MCP 構造化出力・elicitation
 
@@ -189,6 +223,15 @@ rel は allowlist＋containment 検査で traversal を拒否する。
 - `complete` の verifier ガード・`resume` の loop-stop ブロックは elicitation で
   構造化承認を求める。client 未対応・拒否時は従来の error 文にフォールバックする
   （`force: true` の明示指定も従来通り有効）
+
+### MCP駆動での reviewer 役割（invoke）
+
+API 経由セッションの `task` には opencode 側 subagent（critic/verifier/oracle 等）が
+配膳されない（harness の固定リストのため）。代わりに `graphhopper_invoke` を使う:
+`opencode run --model --agent --dir` を subprocess として spawn し、別モデルの
+一発回答を stdout で返す。入れ子禁止・prompt 12000字・timeout 既定120秒。
+MCP駆動ループでは critic/verifier/oracle の呼び出しをすべて invoke に読み替える
+（応答文中の `task(subagent_type: ...)` は TUI 用の表記）。
 
 ## state の場所
 

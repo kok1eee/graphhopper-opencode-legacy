@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "./mcp";
+import { createServer, resolveRoot } from "./mcp";
 
 async function linked() {
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
@@ -220,7 +220,7 @@ describe("graphhopper-mcp resources", () => {
     writeFileSync(join(root, ".graphhopper", "plans", `${id}.md`), "# design\n");
 
     const tpl = await client.listResourceTemplates();
-    expect(tpl.resourceTemplates.length).toBe(4);
+    expect(tpl.resourceTemplates.length).toBe(5);
 
     const st = await client.readResource({ uri: uri(root, "state.json") });
     const stText = (st.contents[0] as { text: string }).text;
@@ -276,6 +276,138 @@ describe("graphhopper-mcp structured output / elicitation", () => {
     // in-process Client は elicitation 未対応 → server.elicitInput が失敗し fallback
     const out = await call("graphhopper_goal", { action: "complete" });
     expect(out).toContain("error: complete には直近の graphhopper_verifier_set");
+    await client.close();
+  });
+});
+
+describe("graphhopper-mcp roots", () => {
+  test("明示指定が最優先・未対応serverはcwdに倒れる", async () => {
+    expect(await resolveRoot({ listRoots: async () => ({ roots: [] }) }, "/explicit")).toBe(
+      "/explicit",
+    );
+    expect(
+      await resolveRoot({
+        listRoots: async () => {
+          throw new Error("unsupported");
+        },
+      }),
+    ).toBe(process.cwd());
+  });
+
+  test("client roots の先頭 file:// を使う", async () => {
+    const dir = freshRoot();
+    const got = await resolveRoot({
+      listRoots: async () => ({
+        roots: [{ uri: `file://${dir}`, name: "t" }],
+      }),
+    });
+    expect(got).toBe(dir);
+  });
+});
+
+describe("graphhopper-mcp prompts", () => {
+  test("8 charter が列挙・取得できる", async () => {
+    const client = await linked();
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((p) => p.name).sort()).toEqual(
+      [
+        "graphhopper-critic",
+        "graphhopper-librarian",
+        "graphhopper-oracle",
+        "graphhopper-researcher",
+        "graphhopper-verifier-behavior",
+        "graphhopper-verifier-general",
+        "graphhopper-verifier-progress",
+        "graphhopper-verifier-requirement",
+      ].sort(),
+    );
+    await client.close();
+  });
+
+  test("researcher は query 必須・critic は design doc を埋め込む", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    await expect(
+      client.getPrompt({ name: "graphhopper-researcher", arguments: { root } }),
+    ).rejects.toThrow();
+    const r = await client.getPrompt({
+      name: "graphhopper-researcher",
+      arguments: { root, query: "who calls foo", scope: "src" },
+    });
+    const text = (r.messages[0]?.content as { text: string }).text;
+    expect(text).toContain("who calls foo");
+
+    const started = (
+      (await client.callTool({
+        name: "graphhopper_goal",
+        arguments: { root, action: "start", title: "prompt test" },
+      })) as { content: { type: string; text: string }[] }
+    ).content[0]?.text;
+    const id = started?.match(/\((g-[0-9a-z]+)\)/)?.[1] ?? "";
+    mkdirSync(join(root, ".graphhopper", "plans"), { recursive: true });
+    writeFileSync(join(root, ".graphhopper", "plans", `${id}.md`), "# design\n");
+    const c = await client.getPrompt({ name: "graphhopper-critic", arguments: { root } });
+    const ctext = (c.messages[0]?.content as { text: string }).text;
+    expect(ctext).toContain("# design");
+    expect(ctext).toContain("PEP 758");
+    await client.close();
+  });
+});
+
+describe("graphhopper-mcp lineage", () => {
+  const uri = (root: string, rel: string) =>
+    `graphhopper://graphhopper/${encodeURIComponent(root)}/${rel}`;
+
+  test("phase遷移・verdict・編集が系譜に載る", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "lin test", session_id: "s" });
+    await call("graphhopper_phase", { phase: "implementing" });
+    await call("graphhopper_attempt", { ok: false, note: "x" });
+    await call("graphhopper_phase", { phase: "polish" });
+    await call("graphhopper_verifier_set", {
+      results: [{ lens: "general", level: "drift", target: "implementing" }],
+      reason: "t",
+    });
+    const res = await client.readResource({ uri: uri(root, "lineage.json") });
+    const lin = JSON.parse((res.contents[0] as { text: string }).text) as {
+      goals: {
+        id: string;
+        phases: string[];
+        rewinds: number;
+        verifier: { level: string }[];
+        maxFailStreak: number;
+      }[];
+    };
+    expect(lin.goals.length).toBe(1);
+    expect(lin.goals[0]?.phases).toEqual(["designing", "implementing", "polish"]);
+    expect(lin.goals[0]?.verifier[0]?.level).toBe("drift");
+    expect(lin.goals[0]?.maxFailStreak).toBe(1);
+    await client.close();
+  });
+});
+
+describe("graphhopper-mcp 残り構造化出力", () => {
+  test("hash/edit/critic/discover に data が付く", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      return r as { content: { type: string; text: string }[]; structuredContent?: Record<string, unknown> };
+    };
+    writeFileSync(join(root, "b.txt"), "hi\n");
+    const h = await call("graphhopper_hash", { filePath: "b.txt" });
+    expect((h.structuredContent?.["sha1"] as string).length).toBe(40);
+    await call("graphhopper_goal", { action: "start", title: "struct2", session_id: "s" });
+    const c = await call("graphhopper_critic_set", { level: "clean", reason: "ok" });
+    expect(c.structuredContent?.["level"]).toBe("clean");
+    const d = await call("graphhopper_discover_start", { target: "t", scope: "s" });
+    expect(d.structuredContent?.["round"]).toBe(0);
     await client.close();
   });
 });

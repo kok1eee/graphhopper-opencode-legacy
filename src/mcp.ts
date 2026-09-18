@@ -21,6 +21,8 @@
 import { $ } from "bun";
 import {
   CallToolRequestSchema,
+  GetPromptRequestSchema,
+  ListPromptsRequestSchema,
   ListResourceTemplatesRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
@@ -37,18 +39,37 @@ import { PHASE_ACTION } from "./gate";
 import { designDocLockedRefusal, designGateRefusal } from "./gate";
 import { readGraphhopperHash, runGraphhopperEdit } from "./gate";
 import * as state from "./state";
-import { invoke } from "./invoke";
+import { invokeStructured } from "./invoke";
+import { PROMPT_DEFS } from "./prompts";
 
-const ROOT_DESC = "対象プロジェクトのディレクトリ（.graphhopper/ の親。省略時 cwd）";
+const ROOT_DESC =
+  "対象プロジェクトのディレクトリ（.graphhopper/ の親。省略時は client roots の先頭→プロセス cwd）";
 const SESSION_DESC =
   "呼び出し元セッションID（plugin の ctx.sessionID 相当。goal の bind・graphhopper_edit の判定に使う。省略可）";
 
-function rootOf(root?: string): string {
-  return root && root.length > 0 ? root : process.cwd();
-}
-
 function sessionOf(session_id?: string): string {
   return session_id ?? "";
+}
+
+/* root 解決: 明示指定 → client roots の先頭（file://）→ プロセス cwd。
+ * client 未対応・取得失敗時は黙って cwd に倒す。 */
+export async function resolveRoot(
+  server: Pick<Server, "listRoots">,
+  root?: string,
+): Promise<string> {
+  if (root && root.length > 0) return root;
+  try {
+    const r = await server.listRoots();
+    for (const entry of r.roots ?? []) {
+      if (typeof entry.uri === "string" && entry.uri.startsWith("file://")) {
+        const p = decodeURIComponent(new URL(entry.uri).pathname);
+        if (p.startsWith("/")) return p;
+      }
+    }
+  } catch {
+    // 未対応 client では cwd に倒す
+  }
+  return process.cwd();
 }
 
 /** force 系の構造化承認（elicitation）。client 未対応・拒否・失敗時は
@@ -427,6 +448,8 @@ function verifierSet(
  * 低レベル Server + setRequestHandler を使う。 */
 interface ToolCtx {
   server: Server;
+  /** CallTool ハンドラで解決済みの root（resolveRoot 済み） */
+  root: string;
 }
 
 interface ToolOut {
@@ -443,6 +466,29 @@ interface ToolDef {
   schema: z.ZodTypeAny;
   run: (args: any, ctx: ToolCtx) => Promise<ToolOut> | ToolOut;
 }
+
+/* tool annotations（hint）。client 側の確認フロー用。
+ * readOnly: status/hash。destructive: edit（利用者ファイルを変更）。
+ * openWorld: shell/spawn するもの（eval/invoke/router_check）。 */
+const ANNOTATIONS: Record<string, Tool["annotations"]> = {
+  graphhopper_status: { readOnlyHint: true },
+  graphhopper_hash: { readOnlyHint: true },
+  graphhopper_edit: { destructiveHint: true },
+  graphhopper_eval: { openWorldHint: true },
+  graphhopper_invoke: { openWorldHint: true },
+  graphhopper_router_check: { openWorldHint: true },
+};
+
+/* logging 転送で info に上げる tool（state 遷移系）。他は debug。 */
+const LOG_TOOLS = new Set([
+  "graphhopper_goal",
+  "graphhopper_phase",
+  "graphhopper_verifier_set",
+  "graphhopper_critic_set",
+  "graphhopper_eval",
+  "graphhopper_attempt",
+  "graphhopper_router_check",
+]);
 
 const ROOT_PROP = { type: "string", description: ROOT_DESC } as const;
 const SESSION_PROP = { type: "string", description: SESSION_DESC } as const;
@@ -486,7 +532,7 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["action", "ok"],
     },
     run: async (a, ctx) => {
-      const root = rootOf(a.root);
+      const root = ctx.root;
       const text = await goalAction(root, sessionOf(a.session_id), a.action, {
         title: a.title,
         force: a.force,
@@ -514,8 +560,8 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["active"],
     },
-    run: (a) => {
-      const root = rootOf(a.root);
+    run: (a, ctx) => {
+      const root = ctx.root;
       return { text: statusText(root), data: statusData(root) };
     },
   },
@@ -542,8 +588,8 @@ const TOOL_DEFS: ToolDef[] = [
       properties: { ok: { type: "boolean" }, phase: { type: "string" } },
       required: ["ok"],
     },
-    run: (a) => {
-      const r = state.setPhase(rootOf(a.root), a.phase, a.notes);
+    run: (a, ctx) => {
+      const r = state.setPhase(ctx.root, a.phase, a.notes);
       if (!r) return { text: "error: no active goal or invalid phase" };
       return {
         text: `phase -> ${r.state.phase}\n次: ${PHASE_ACTION[r.state.phase]}`,
@@ -569,8 +615,8 @@ const TOOL_DEFS: ToolDef[] = [
       properties: { cmd: { type: "string" }, cleared: { type: "boolean" } },
       required: ["cmd", "cleared"],
     },
-    run: (a) => {
-      const root = rootOf(a.root);
+    run: (a, ctx) => {
+      const root = ctx.root;
       const active = state.getActive(root);
       if (!active) return { text: "error: no active goal" };
       state.setEvalCmd(root, a.cmd);
@@ -600,8 +646,8 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["ran"],
     },
-    run: async (a) => {
-      const root = rootOf(a.root);
+    run: async (a, ctx) => {
+      const root = ctx.root;
       const text = await evalOnce(root);
       if (text.startsWith("skip:") || text.startsWith("error:")) {
         return { text, data: { ran: false } };
@@ -645,7 +691,7 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["ok", "failStreak", "escalate", "giveUp"],
     },
-    run: (a) => attemptRecord(rootOf(a.root), a.ok, a.note),
+    run: (a, ctx) => attemptRecord(ctx.root, a.ok, a.note),
   },
   {
     name: "graphhopper_router_check",
@@ -662,7 +708,7 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["diffLines", "route", "threshold"],
     },
-    run: (a) => routerCheck(rootOf(a.root)),
+    run: (a, ctx) => routerCheck(ctx.root),
   },
   {
     name: "graphhopper_verifier_set",
@@ -708,7 +754,7 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["level"],
     },
-    run: (a) => verifierSet(rootOf(a.root), a.results as state.VerifierResult[], a.reason),
+    run: (a, ctx) => verifierSet(ctx.root, a.results as state.VerifierResult[], a.reason),
   },
   {
     name: "graphhopper_critic_set",
@@ -728,12 +774,20 @@ const TOOL_DEFS: ToolDef[] = [
       reason: z.string(),
       root: rootZ,
     }),
-    run: (a) => {
-      const result = state.setCriticVerdict(rootOf(a.root), {
+    outputSchema: {
+      type: "object",
+      properties: { level: { type: "string" }, phase: { type: "string" } },
+      required: ["level", "phase"],
+    },
+    run: (a, ctx) => {
+      const result = state.setCriticVerdict(ctx.root, {
         level: a.level,
         reason: a.reason,
       });
-      return { text: `critic review recorded: ${a.level}. phase: ${result.phase}` };
+      return {
+        text: `critic review recorded: ${a.level}. phase: ${result.phase}`,
+        data: { level: a.level, phase: result.phase },
+      };
     },
   },
   {
@@ -750,13 +804,23 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["target", "scope"],
     },
     schema: z.object({ target: z.string(), scope: z.string(), root: rootZ }),
-    run: (a) => {
-      const s = state.startDiscover(rootOf(a.root), a.target, a.scope);
+    outputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string" },
+        scope: { type: "string" },
+        round: { type: "number" },
+      },
+      required: ["target", "scope", "round"],
+    },
+    run: (a, ctx) => {
+      const s = state.startDiscover(ctx.root, a.target, a.scope);
       return {
         text: [
           `discover started: target="${s.target}" scope="${s.scope}"`,
           "次: 3charterで探索し、結果を graphhopper_discover_tick に渡す。stopped_reasonがnullの間、繰り返す。",
         ].join("\n"),
+        data: { target: s.target, scope: s.scope, round: s.round },
       };
     },
   },
@@ -795,8 +859,26 @@ const TOOL_DEFS: ToolDef[] = [
       ),
       root: rootZ,
     }),
-    run: (a) => {
-      const s = state.tickDiscover(rootOf(a.root), a.findings);
+    outputSchema: {
+      type: "object",
+      properties: {
+        round: { type: "number" },
+        dryStreak: { type: "number" },
+        seen: { type: "number" },
+        stopped: { type: "string" },
+        confirmed: { type: "number" },
+      },
+      required: ["round", "dryStreak", "seen", "confirmed"],
+    },
+    run: (a, ctx) => {
+      const s = state.tickDiscover(ctx.root, a.findings);
+      const data = {
+        round: s.round,
+        dryStreak: s.dry_streak,
+        seen: s.seen.length,
+        stopped: s.stopped_reason ?? undefined,
+        confirmed: s.confirmed.length,
+      };
       if (s.stopped_reason) {
         return {
           text: [
@@ -804,10 +886,12 @@ const TOOL_DEFS: ToolDef[] = [
             `confirmed: ${s.confirmed.length}件`,
             JSON.stringify(s.confirmed, null, 2),
           ].join("\n"),
+          data,
         };
       }
       return {
         text: `round ${s.round} 完了。dry_streak=${s.dry_streak}, seen=${s.seen.length}件。次のラウンドへ`,
+        data,
       };
     },
   },
@@ -816,9 +900,14 @@ const TOOL_DEFS: ToolDef[] = [
     description: "discoverセッションをクリアする",
     inputSchema: { type: "object", properties: { root: ROOT_PROP } },
     schema: z.object({ root: rootZ }),
-    run: (a) => {
-      state.clearDiscover(rootOf(a.root));
-      return { text: "cleared" };
+    outputSchema: {
+      type: "object",
+      properties: { cleared: { type: "boolean" } },
+      required: ["cleared"],
+    },
+    run: (a, ctx) => {
+      state.clearDiscover(ctx.root);
+      return { text: "cleared", data: { cleared: true } };
     },
   },
   {
@@ -831,7 +920,23 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["filePath"],
     },
     schema: z.object({ filePath: z.string(), root: rootZ }),
-    run: (a) => ({ text: readGraphhopperHash(rootOf(a.root), a.filePath) }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        sha1: { type: "string" },
+        size: { type: "number" },
+      },
+      required: ["path", "sha1", "size"],
+    },
+    run: (a, ctx) => {
+      const text = readGraphhopperHash(ctx.root, a.filePath);
+      const parsed = JSON.parse(text) as { path: string; sha1: string; size: number };
+      return {
+        text,
+        data: { path: parsed.path, sha1: parsed.sha1, size: parsed.size },
+      };
+    },
   },
   {
     name: "graphhopper_edit",
@@ -857,8 +962,18 @@ const TOOL_DEFS: ToolDef[] = [
       root: rootZ,
       session_id: sessionZ,
     }),
-    run: (a) => {
-      const root = rootOf(a.root);
+    outputSchema: {
+      type: "object",
+      properties: {
+        ok: { type: "boolean" },
+        path: { type: "string" },
+        sha1: { type: "string" },
+        size: { type: "number" },
+      },
+      required: ["ok"],
+    },
+    run: (a, ctx) => {
+      const root = ctx.root;
       // design gate（plugin の tool.execute.before と同型。MCP には hook が無いため
       // ここで塞ぐ。塞がないと designing 中の source 編集が MCP 経由で素通りする）
       const gateActive = state.getActive(root);
@@ -871,7 +986,7 @@ const TOOL_DEFS: ToolDef[] = [
             tool: "graphhopper_edit",
             path: a.filePath,
           });
-          return { text: `error: ${designGateRefusal("graphhopper_edit", a.filePath, cfg.design_gate_allow)}` };
+          return { text: `error: ${designGateRefusal("graphhopper_edit", a.filePath, cfg.design_gate_allow)}`, data: { ok: false } };
         }
         if (
           state.isDesignDocLocked(root, gateActive.state.phase, gateActive.goal.id, a.filePath)
@@ -882,7 +997,10 @@ const TOOL_DEFS: ToolDef[] = [
             tool: "graphhopper_edit",
             path: a.filePath,
           });
-          return { text: `error: ${designDocLockedRefusal("graphhopper_edit", a.filePath, gateActive.goal.id)}` };
+          return {
+            text: `error: ${designDocLockedRefusal("graphhopper_edit", a.filePath, gateActive.goal.id)}`,
+            data: { ok: false },
+          };
         }
       }
       try {
@@ -904,9 +1022,13 @@ const TOOL_DEFS: ToolDef[] = [
         ) {
           state.noteEdit(root, a.filePath);
         }
-        return { text: out };
+        const parsed = JSON.parse(out) as { path: string; sha1: string; size: number };
+        return {
+          text: out,
+          data: { ok: true, path: parsed.path, sha1: parsed.sha1, size: parsed.size },
+        };
       } catch (e) {
-        return { text: `error: ${e instanceof Error ? e.message : String(e)}` };
+        return { text: `error: ${e instanceof Error ? e.message : String(e)}`, data: { ok: false } };
       }
     },
   },
@@ -932,15 +1054,27 @@ const TOOL_DEFS: ToolDef[] = [
       timeoutMs: z.number().optional(),
       root: rootZ,
     }),
-    run: async (a) => ({
-      text: await invoke({
+    outputSchema: {
+      type: "object",
+      properties: {
+        timedOut: { type: "boolean" },
+        fallbackWarning: { type: "boolean" },
+      },
+      required: ["timedOut", "fallbackWarning"],
+    },
+    run: async (a, ctx) => {
+      const r = await invokeStructured({
         agent: a.agent,
         model: a.model,
         prompt: a.prompt,
-        root: rootOf(a.root),
+        root: ctx.root,
         timeoutMs: a.timeoutMs,
-      }),
-    }),
+      });
+      return {
+        text: r.output,
+        data: { timedOut: r.timedOut, fallbackWarning: r.fallbackWarning },
+      };
+    },
   },
 ];
 
@@ -971,9 +1105,10 @@ function parseResourceUri(uri: string): { root: string; rel: string } {
   if (!root.startsWith("/") || !existsSync(root)) {
     throw new McpError(-32002, `unknown project root: ${root}`);
   }
-  if (!/^(state|goals)\.json$|^history\.jsonl$|^plans\/[A-Za-z0-9_.-]+\.md$/.test(rel)) {
+  if (!/^(state|goals|lineage)\.json$|^history\.jsonl$|^plans\/[A-Za-z0-9_.-]+\.md$/.test(rel)) {
     throw new McpError(-32002, `unsupported resource name: ${rel}`);
   }
+  if (rel === "lineage.json") return { root, rel };
   const resolved = resolve(root, ".graphhopper", rel);
   if (resolved !== join(root, ".graphhopper", rel) || !resolved.startsWith(root + sep)) {
     throw new McpError(-32002, `path escape blocked: ${rel}`);
@@ -985,6 +1120,13 @@ function readResourceContent(
   root: string,
   rel: string,
 ): { text: string; mimeType: string } {
+  // lineage.json は仮想 resource（goals + history から導出）
+  if (rel === "lineage.json") {
+    return {
+      text: JSON.stringify(state.buildLineage(root), null, 2),
+      mimeType: "application/json",
+    };
+  }
   const p = join(root, ".graphhopper", rel);
   let raw: string;
   try {
@@ -1034,13 +1176,19 @@ const RESOURCE_TEMPLATES = [
     description: "design ドキュメント・log（{name} は <goalId>.md / <goalId>.log.md）",
     mimeType: "text/markdown",
   },
+  {
+    uriTemplate: "graphhopper://graphhopper/{root}/lineage.json",
+    name: "goal lineage",
+    description: "goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル。作業グラフのedge素材）",
+    mimeType: "application/json",
+  },
 ];
 
 /** テストから in-process で tool 呼び出しを検証できるよう server 構築を分離する */
 export function createServer(): Server {
   const server = new Server(
     { name: "graphhopper", version: "0.1.0" },
-    { capabilities: { tools: {}, resources: {} } },
+    { capabilities: { tools: {}, resources: {}, prompts: {}, logging: {} } },
   );
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: [],
@@ -1053,11 +1201,42 @@ export function createServer(): Server {
     const { text, mimeType } = readResourceContent(root, rel);
     return { contents: [{ uri: req.params.uri, mimeType, text }] };
   });
+  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: PROMPT_DEFS.map((p) => ({
+      name: p.name,
+      description: p.description,
+      arguments: p.arguments.map((a) => ({
+        name: a.name,
+        description: a.description,
+        required: a.required ?? false,
+      })),
+    })),
+  }));
+  server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+    const def = PROMPT_DEFS.find((p) => p.name === req.params.name);
+    if (!def) throw new McpError(-32602, `unknown prompt ${req.params.name}`);
+    const args = (req.params.arguments ?? {}) as Record<string, string>;
+    for (const a of def.arguments) {
+      if (a.required && !args[a.name]) {
+        throw new McpError(-32602, `missing required argument: ${a.name}`);
+      }
+    }
+    const root = await resolveRoot(server, args["root"]);
+    try {
+      const text = def.render(args, root);
+      return {
+        messages: [{ role: "user" as const, content: { type: "text" as const, text } }],
+      };
+    } catch (e) {
+      throw new McpError(-32002, e instanceof Error ? e.message : String(e));
+    }
+  });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({    tools: TOOL_DEFS.map((d) => ({
       name: d.name,
       description: d.description,
       inputSchema: d.inputSchema,
       ...(d.outputSchema ? { outputSchema: d.outputSchema } : {}),
+      ...(ANNOTATIONS[d.name] ? { annotations: ANNOTATIONS[d.name] } : {}),
     })),
   }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -1075,13 +1254,29 @@ export function createServer(): Server {
         isError: true,
       };
     }
+    const root = await resolveRoot(server, (parsed.data as { root?: string }).root);
     try {
-      const out = await def.run(parsed.data, { server });
+      const out = await def.run(parsed.data, { server, root });
       const res: {
         content: { type: "text"; text: string }[];
         structuredContent?: Record<string, unknown>;
       } = { content: [{ type: "text", text: out.text }] };
       if (out.data !== undefined) res.structuredContent = out.data;
+      // logging 転送（watchdog 系 client が state 遷移をリアルタイムに追える）。
+      // client 未対応でも例外で tool 結果を壊さない。
+      try {
+        await server.sendLoggingMessage({
+          level: LOG_TOOLS.has(def.name) ? "info" : "debug",
+          logger: "graphhopper",
+          data: {
+            tool: def.name,
+            root,
+            summary: out.text.split("\n")[0]?.slice(0, 200) ?? "",
+          },
+        });
+      } catch {
+        // 未対応 client では黙って捨てる
+      }
       return res;
     } catch (e) {
       return {
