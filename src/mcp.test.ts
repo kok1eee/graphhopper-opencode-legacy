@@ -9,7 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer, resolveRoot } from "./mcp";
+import { createServer, lineageEnriched, parseSkeletonSymbols, resolveRoot } from "./mcp";
 
 async function linked() {
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
@@ -392,8 +392,7 @@ describe("graphhopper-mcp lineage", () => {
   });
 });
 
-describe("graphhopper-mcp 残り構造化出力", () => {
-  test("hash/edit/critic/discover に data が付く", async () => {
+describe("graphhopper-mcp 残り構造化出力", () => {  test("hash/edit/critic/discover に data が付く", async () => {
     const client = await linked();
     const root = freshRoot();
     const call = async (name: string, args: Record<string, unknown>) => {
@@ -409,5 +408,66 @@ describe("graphhopper-mcp 残り構造化出力", () => {
     const d = await call("graphhopper_discover_start", { target: "t", scope: "s" });
     expect(d.structuredContent?.["round"]).toBe(0);
     await client.close();
+  });
+});
+
+describe("graft連携（skeleton enrich）", () => {
+  test("parseSkeletonSymbols: 行形式を抽出・上限50", () => {
+    const sample = [
+      "[graft] refreshed",
+      "graft skeleton — src/a.ts",
+      "- L1-L1  type Foo  type Foo = string;",
+      "- L10-L20  function bar  function bar(x: string): void",
+      "not a symbol line",
+      "- L30-L30  interface Baz  interface Baz",
+    ].join("\n");
+    const syms = parseSkeletonSymbols(sample);
+    expect(syms).toEqual([
+      { name: "Foo", kind: "type", lines: "L1-L1" },
+      { name: "bar", kind: "function", lines: "L10-L20" },
+      { name: "Baz", kind: "interface", lines: "L30-L30" },
+    ]);
+  });
+
+  test("lineageEnriched: fake runner の symbol が goal に載る", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "sym test", session_id: "s" });
+    await call("graphhopper_phase", { phase: "implementing" });
+    writeFileSync(join(root, "c.txt"), "old\n");
+    const h = JSON.parse(await call("graphhopper_hash", { filePath: "c.txt" })) as {
+      sha1: string;
+    };
+    const out = await call("graphhopper_edit", {
+      filePath: "c.txt",
+      expectedHash: h.sha1,
+      oldString: "old\n",
+      newString: "new\n",
+      session_id: "s",
+    });
+    expect(out).not.toContain("error");
+
+    const lin = await lineageEnriched(root, async (_r, f) => [
+      { name: "fake", kind: "function", lines: "L1-L1" },
+    ]);
+    expect(lin.goals.length).toBe(1);
+    expect(lin.goals[0]?.editedFiles).toEqual(["c.txt"]);
+    expect(lin.goals[0]?.editedSymbols).toEqual([
+      { file: "c.txt", symbols: [{ name: "fake", kind: "function", lines: "L1-L1" }] },
+    ]);
+    await client.close();
+  });
+
+  test("lineageEnriched: runner 失敗時は空配列に倒れる", async () => {
+    const root = freshRoot();
+    const lin = await lineageEnriched(root, async () => {
+      throw new Error("graft missing");
+    });
+    expect(lin.goals).toEqual([]);
   });
 });

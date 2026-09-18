@@ -210,11 +210,11 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 
 ### グラフ化の方向性（作業グラフ × コードグラフ）
 
-- 第一歩が `lineage.json`：goals＋history から goal 系譜を導出する仮想 resource。
-  graft（コードの構造）に対する「作業の構造」側の edge 素材
-- 次は `noteEdit` の file 記録と graft symbol の紐付け（どの goal がどの symbol に
-  触ったか）。stuck 検知の精度向上と「なぜその判断になったか」の遡及が目的。
-  未着手（設計メモ段階）
+- `lineage.json`：goals＋history から goal 系譜を導出する仮想 resource。
+  各 goal の編集ファイルには graft skeleton の symbol 一覧（`editedSymbols`）を
+  lazy enrich する（best-effort：graft不在・timeoutでも空配列に倒す。edit 経路は
+  触らない）。「どの goal がどの symbol に触ったか」が引ける
+- 次は stuck 検知の symbol レベル化（同一 symbol 再編集の計数）。未着手
 
 ### MCP 構造化出力・elicitation
 

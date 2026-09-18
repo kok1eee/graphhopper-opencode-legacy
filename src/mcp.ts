@@ -32,8 +32,10 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { PHASE_ACTION } from "./gate";
 import { designDocLockedRefusal, designGateRefusal } from "./gate";
@@ -1119,13 +1121,13 @@ function parseResourceUri(uri: string): { root: string; rel: string } {
 function readResourceContent(
   root: string,
   rel: string,
-): { text: string; mimeType: string } {
-  // lineage.json は仮想 resource（goals + history から導出）
+): { text: string; mimeType: string } | Promise<{ text: string; mimeType: string }> {
+  // lineage.json は仮想 resource（goals + history から導出＋graft enrich）
   if (rel === "lineage.json") {
-    return {
-      text: JSON.stringify(state.buildLineage(root), null, 2),
+    return lineageEnriched(root).then((lin) => ({
+      text: JSON.stringify(lin, null, 2),
       mimeType: "application/json",
-    };
+    }));
   }
   const p = join(root, ".graphhopper", rel);
   let raw: string;
@@ -1151,6 +1153,98 @@ function readResourceContent(
   return { text: raw, mimeType: "application/json" };
 }
 
+/* graft連携（作業グラフ × コードグラフ）: lineage の editedFiles に
+ * graft skeleton の symbol 一覧を付与する。「どの goal がどの symbol に
+ * 触ったか」が引ける。edit 経路は触らない（latency・故障点を増やさない）。
+ * 読み取り時 lazy enrich・best-effort（graft不在・timeout・staleでも空配列に倒す）。
+ * state.ts は stdlib-only 維持のため graft 呼び出しは MCP 層に置く。 */
+export interface FileSymbols {
+  file: string;
+  symbols: { name: string; kind: string; lines: string }[];
+}
+
+const GRAFT_TIMEOUT_MS = 10000;
+const MAX_SYMBOL_FILES = 20;
+const MAX_SYMBOLS_PER_FILE = 50;
+
+function graftBinary(): string {
+  const shim = join(homedir(), ".local/share/mise/shims/graft");
+  return existsSync(shim) ? shim : "graft";
+}
+
+/** skeleton 出力（`- L1-L5  function foo  function foo(...)`）のパース。純粋関数 */
+export function parseSkeletonSymbols(output: string): FileSymbols["symbols"] {
+  const out: FileSymbols["symbols"] = [];
+  for (const line of output.split("\n")) {
+    const m = line.match(/^- L(\d+)-L(\d+)\s+(\S+)\s+(\S+)/);
+    if (!m) continue;
+    out.push({ name: m[4] ?? "", kind: m[3] ?? "", lines: `L${m[1]}-L${m[2]}` });
+    if (out.length >= MAX_SYMBOLS_PER_FILE) break;
+  }
+  return out;
+}
+
+export type SkeletonRunner = (root: string, file: string) => Promise<FileSymbols["symbols"]>;
+
+const realSkeletonRunner: SkeletonRunner = (root, file) =>
+  new Promise((resolvePromise) => {
+    const target = isAbsolute(file) ? file : join(root, file);
+    if (!existsSync(target)) {
+      resolvePromise([]);
+      return;
+    }
+    execFile(
+      graftBinary(),
+      ["skeleton", isAbsolute(file) ? file : file],
+      { cwd: root, timeout: GRAFT_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          resolvePromise([]);
+          return;
+        }
+        try {
+          resolvePromise(parseSkeletonSymbols(stdout.toString()));
+        } catch {
+          resolvePromise([]);
+        }
+      },
+    );
+  });
+
+/** buildLineage に editedSymbols を付与する。run 注入可（テスト用） */
+export interface EnrichedGoalLineage extends state.GoalLineage {
+  editedSymbols: FileSymbols[];
+}
+
+export async function lineageEnriched(
+  root: string,
+  run: SkeletonRunner = realSkeletonRunner,
+): Promise<{ goals: EnrichedGoalLineage[] }> {
+  const lin = state.buildLineage(root);
+  const files: string[] = [];
+  for (const g of lin.goals) {
+    for (const f of g.editedFiles) {
+      if (!files.includes(f)) files.push(f);
+    }
+  }
+  const table = new Map<string, FileSymbols["symbols"]>();
+  for (const f of files.slice(0, MAX_SYMBOL_FILES)) {
+    try {
+      table.set(f, await run(root, f));
+    } catch {
+      table.set(f, []);
+    }
+  }
+  return {
+    goals: lin.goals.map((g) => ({
+      ...g,
+      editedSymbols: g.editedFiles.map((f) => ({
+        file: f,
+        symbols: table.get(f) ?? [],
+      })),
+    })),
+  };
+}
 const RESOURCE_TEMPLATES = [
   {
     uriTemplate: "graphhopper://graphhopper/{root}/state.json",
@@ -1179,7 +1273,7 @@ const RESOURCE_TEMPLATES = [
   {
     uriTemplate: "graphhopper://graphhopper/{root}/lineage.json",
     name: "goal lineage",
-    description: "goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル。作業グラフのedge素材）",
+    description: "goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル＋graft symbol。作業グラフのedge素材）",
     mimeType: "application/json",
   },
 ];
@@ -1198,7 +1292,7 @@ export function createServer(): Server {
   }));
   server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
     const { root, rel } = parseResourceUri(req.params.uri);
-    const { text, mimeType } = readResourceContent(root, rel);
+    const { text, mimeType } = await readResourceContent(root, rel);
     return { contents: [{ uri: req.params.uri, mimeType, text }] };
   });
   server.setRequestHandler(ListPromptsRequestSchema, async () => ({
