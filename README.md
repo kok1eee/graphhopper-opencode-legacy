@@ -236,7 +236,10 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - `recordEvent` が curated種別（goal_complete / verifier_verdict / eval_gave_up /
   loop_stopped）を `.graphhopper/outbox/<時刻>-<種別>-<goal>.json` に投下（上限100・古いものから刈る）
 - `bun src/watch.ts <root> -- <command>` で監視し、イベントごとにコマンド実行
-  （`GH_EVENT` / `GH_GOAL` / `GH_FILE` / `GH_ROOT` を環境変数で渡す）。試作
+  （`GH_EVENT` / `GH_GOAL` / `GH_FILE` / `GH_ROOT` を環境変数で渡す）
+- `bun src/watch.ts <root> --notify` でmacOS通知プリセット
+  （goal_complete［score付き］/ eval_gave_up / loop_stopped。driftは正常フローのため対象外）。
+  `--notify -- <command>` で併用可
 - MCP logging は live補助線として継続（best-effort）。durable が outbox、live が logging の二層
 
 ### 評価機能（A: 成績表／B: 採点）
@@ -245,6 +248,9 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
   `graphhopper_scoreboard` でモデル別 verdict 集計（clean/drift）とgoal転帰
   （巻き戻し・eval・採点）を返す。マッピング判断の素材。
   注意：導入前のhistory分は現configで補完されるため帰属が不正確な場合がある（今後の記録から正確化）
+- scoreboardには`hints`が付く（提案のみ・自動適用なし）。
+  ガード付き：モデル別は5件未満で判断保留、drift検出率≧60%・全clean継続・score<70・
+  巻き戻し≧2を人手検討事項として挙げる。drift率の高低は厳格さと実装荒れの両義性があるため断定しない
 - **B goal出来栄えの機械採点**：complete時に機械事実のみで採点しgoalに保存。
   式v1: `100 - 15*巻き戻し - 5*最大fail - 3*gate阻止 - 5*(verifier追加round)`（下限0）。
   内訳付きで透明化。status/lineage/scoreboardに表示

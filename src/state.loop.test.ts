@@ -1267,3 +1267,35 @@ describe("評価機能（state層）", () => {
     expect(sb.goals.length).toBe(1);
   });
 });
+
+describe("scoreboard hints（提案のみ・ガード付き）", () => {
+  test("サンプル不足は判断保留・低scoreと多巻き戻しを指摘", async () => {
+    const { buildScoreboard, setVerifierVerdict, completeGoal, setPhase, startGoal } = await import("./state");
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    setVerifierVerdict(root, { level: "drift", reason: "r", target: "implementing", lens: ["general"], model: "m/a" });
+    let sb = buildScoreboard(root);
+    expect(sb.hints.some((h) => h.includes("データ不足"))).toBe(true);
+    for (let i = 0; i < 5; i++) {
+      setVerifierVerdict(root, { level: "drift", reason: "r", target: "implementing", lens: ["general"], model: "m/a" });
+    }
+    sb = buildScoreboard(root);
+    expect(sb.hints.some((h) => h.includes("drift検出率"))).toBe(true);
+    expect(sb.hints.some((h) => h.includes("データ不足"))).toBe(false);
+    // 低score goal: rewind2 + fail2でscore<70を作る（100-30-10=60）
+    setPhase(root, "implementing");
+    setPhase(root, "polish");
+    setPhase(root, "implementing");
+    setPhase(root, "polish");
+    setPhase(root, "implementing");
+    setPhase(root, "polish");
+    recordAttempt(root, false, "x");
+    recordAttempt(root, false, "x");
+    const done = completeGoal(root);
+    expect(done?.goal.score?.value).toBeLessThan(70);
+    sb = buildScoreboard(root);
+    expect(sb.hints.some((h) => h.includes("要振り返り"))).toBe(true);
+    expect(sb.hints.some((h) => h.includes("巻き戻し2回"))).toBe(true);
+    void g;
+  });
+});

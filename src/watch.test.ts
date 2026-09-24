@@ -20,3 +20,16 @@ describe("watch outbox", () => {
     expect(env["GH_GOAL"]).toBe("g-1");
   });
 });
+
+describe("watch notify", () => {
+  test("対象種別のみ通知文・score付き", async () => {
+    const { notifyMessage } = await import("./watch");
+    expect(notifyMessage("goal_complete", "g-1", { score: 95, title: "T" })).toEqual({
+      title: "graphhopper: T",
+      body: "完了: g-1 (score 95)",
+    });
+    expect(notifyMessage("eval_gave_up", "g-1", {})?.body).toContain("要修正");
+    expect(notifyMessage("verifier_verdict", "g-1", {})).toBeNull();
+    expect(notifyMessage("loop_stopped", "g-1", {})?.body).toContain("無限ループ");
+  });
+});

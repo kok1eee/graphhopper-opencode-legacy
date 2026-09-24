@@ -639,8 +639,9 @@ const TOOL_DEFS: ToolDef[] = [
             required: ["id", "title", "status", "rewinds", "evalPass", "evalFail"],
           },
         },
+        hints: { type: "array", items: { type: "string" } },
       },
-      required: ["models", "goals"],
+      required: ["models", "goals", "hints"],
     },
     run: (a, ctx) => {
       const sb = state.buildScoreboard(ctx.root);
@@ -654,12 +655,15 @@ const TOOL_DEFS: ToolDef[] = [
           (g) =>
             `- ${g.id} "${g.title}" [${g.status}] rewinds=${g.rewinds} eval=${g.evalPass}/${g.evalFail} score=${g.score ?? "-"}`,
         ),
+        "## hints",
+        ...sb.hints.map((h) => `- ${h}`),
       ];
       return {
         text: lines.join("\n"),
         data: {
           models: sb.models,
           goals: sb.goals.map((g) => ({ ...g, score: g.score ?? undefined })),
+          hints: sb.hints,
         },
       };
     },

@@ -309,7 +309,7 @@ export type HistoryEvent =
   | { type: "goal_start"; goal: string; title: string }
   | { type: "goal_pause"; goal: string }
   | { type: "goal_resume"; goal: string }
-  | { type: "goal_complete"; goal: string }
+  | { type: "goal_complete"; goal: string; score?: number | null }
   | { type: "phase"; goal: string; from: Phase; to: Phase; notes?: string }
   | {
       type: "router_check";
@@ -672,7 +672,7 @@ export function completeGoal(root: string): ActiveLoop | null {
       writeGoals(root, goals);
     }
     r.goal.score = score;
-    recordEvent(root, { type: "goal_complete", goal: r.goal.id });
+    recordEvent(root, { type: "goal_complete", goal: r.goal.id, score: score.value });
   }
   return r;
 }
@@ -1937,7 +1937,14 @@ export interface GoalOutcome {
 export interface Scoreboard {
   models: ModelRoleStats[];
   goals: GoalOutcome[];
+  /** 人間向けの検討事項（提案のみ・自動適用なし。根拠つきで書く） */
+  hints: string[];
 }
+
+/* hintsのガード値。サンプル不足での断定を防ぐ */
+const HINT_MIN_MODEL_SAMPLES = 5;
+const HINT_LOW_SCORE = 70;
+const HINT_MANY_REWINDS = 2;
 
 export function buildScoreboard(root: string): Scoreboard {
   const byModel = new Map<string, ModelRoleStats>();
@@ -1957,16 +1964,51 @@ export function buildScoreboard(root: string): Scoreboard {
     else if (h.type === "critic_review_set") bump(h.model, "critic", h.level);
   }
   const lin = buildLineage(root);
-  return {
-    models: [...byModel.values()].sort((a, b) => b.verdicts - a.verdicts),
-    goals: lin.goals.map((g) => ({
-      id: g.id,
-      title: g.title,
-      status: g.status,
-      rewinds: g.rewinds,
-      evalPass: g.evalRuns.pass,
-      evalFail: g.evalRuns.fail,
-      score: g.score?.value ?? null,
-    })),
-  };
+  const goals: GoalOutcome[] = lin.goals.map((g) => ({
+    id: g.id,
+    title: g.title,
+    status: g.status,
+    rewinds: g.rewinds,
+    evalPass: g.evalRuns.pass,
+    evalFail: g.evalRuns.fail,
+    score: g.score?.value ?? null,
+  }));
+  const models = [...byModel.values()].sort((a, b) => b.verdicts - a.verdicts);
+  return { models, goals, hints: buildHints(models, goals) };
+}
+
+/* scoreboard連動のmapping提案（B）。自動適用はしない。
+ * drift検出率の高低は「厳格さ」と「実装荒れ」の両義性があるため断定せず、
+ * 切り分け材料の提示に留める。サンプル不足は判断保留と明記する */
+function buildHints(models: ModelRoleStats[], goals: GoalOutcome[]): string[] {
+  const hints: string[] = [];
+  for (const m of models) {
+    if (m.verdicts < HINT_MIN_MODEL_SAMPLES) {
+      hints.push(
+        `${m.role} ${m.model}: データ不足（${m.verdicts}件 < ${HINT_MIN_MODEL_SAMPLES}件）。判断保留`,
+      );
+      continue;
+    }
+    if (m.role === "verifier") {
+      const driftRate = m.drift / m.verdicts;
+      if (driftRate >= 0.6) {
+        hints.push(
+          `${m.model}: drift検出率 ${Math.round(driftRate * 100)}%（${m.verdicts}件）。厳格さと実装荒れの切り分けを推奨`,
+        );
+      } else if (m.clean === m.verdicts) {
+        hints.push(
+          `${m.model}: 全clean継続（${m.verdicts}件）。甘い可能性あり。要スポット確認`,
+        );
+      }
+    }
+  }
+  for (const g of goals) {
+    if (g.status === "done" && g.score !== null && g.score < HINT_LOW_SCORE) {
+      hints.push(`${g.id} "${g.title}": score ${g.score}（<${HINT_LOW_SCORE}）。要振り返り`);
+    }
+    if (g.rewinds >= HINT_MANY_REWINDS) {
+      hints.push(`${g.id}: 巻き戻し${g.rewinds}回。設計乖離が大きい（design/critic側の要因確認）`);
+    }
+  }
+  return hints;
 }
