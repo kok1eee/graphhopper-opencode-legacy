@@ -1,6 +1,6 @@
 ---
 name: graphhopper
-description: "designing→implementing→polishのgoal駆動ループ。複数ファイルにまたがる変更・設計判断を含む実装を依頼されたら使う。designingフェーズ中はsource編集がtool.execute.beforeで物理ブロックされる。"
+description: "designing→implementing→polishのgoal駆動ループ。Use when: 複数ファイルにまたがる変更・設計判断を含む実装の依頼。単一ファイルの小修正・質問回答・一回きりのコマンド実行には使うな（直接やれ）。designing中はsource編集が物理ブロックされる。"
 ---
 
 # graphhopper — designing/implementing/polish ループ
@@ -10,6 +10,19 @@ graphhopper本体（Claude Code版）の3相グラフをopencodeに移植した�
 そのまま踏襲する。専用の designer は作らない。ただし設計段階の質チェックとして
 安価な `graphhopper-critic`（Luna 等）を designing で1回呼ぶ常設nodeを持つ
 （verifier が実装後の drift 検出、critic が実装前の計画検証という役割分担）。
+
+## どのnodeに何を振るか（typesafe流「need→手段」対応表）
+
+| Need | 手段 | 使い分け |
+|---|---|---|
+| 計画の敵対検証 | critic（designingで1回） | 要件漏れ・設計の穴・スコープ逸脱。質はここ |
+| 実装後のdrift検出 | verifier（polishでfan-out） | requirement/behavior/progressの3lens |
+| 手詰まり打開 | oracle（escalate時のみ） | 失敗文脈を渡して助言のみ受け取る |
+| repo内事実収集 | researcher（read-only） | graft-first。判断を含めない |
+| repo外公式doc | librarian（read-only） | URL・引用付き。判断を含めない |
+| 大diff整理 | simplify（route=polishのみ） | 提案のみ。適用はメイン |
+
+独立した問いなら並列に投げ、メインが統合する。判断は増やさない（council再発防止）。
 
 ## フェーズ
 
@@ -115,6 +128,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   findingsの裏付け・反証に使え。LSP照会が使える環境なら診断証拠はlsp_diagnosticsを優先してよい（速い・安い）。
   ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
   診断が実行不可なら「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
+  findingsには証拠状態を必ず付ける（typesafe流・失敗原因分離）: `裏付けあり` /
+  `証拠不足` / `診断未実行` / `実行失敗`。原因不明のままlevelだけ付けない
   結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
 - **route=polish**（大diff・閾値超）: adversarial verifier fan-out を行う
   1. `task(subagent_type: "graphhopper-verifier")` を3回呼ぶ。それぞれ以下のcharterをプロンプトに含める:
@@ -146,6 +161,9 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 ## Gotchas
 
+- **live-docs-first**: 版依存の主張（SDK API・MCP仕様・外部CLI挙動・言語仕様の版差）は
+  推測で書かず、context7 / 公式docで裏付けてから書く・直す。裏が取れない版詳細は
+  「版未確認」と明記する（typesafe SKILL.mdの作法）
 - **コード探索のtier**: graft（意味・構造の入口）→ LSP（点照会: file＋line特定済みの定義・参照・hover・診断のみ）→ ast-grep（構造パターン: `ast-grep -p '<pattern>' <path>` / `ast-grep --rule rule.yaml`）→ rg（テキスト最終手段）。plain grep・findは使わない。graftの絞り込み前にlsp_workspace_symbolsを投げない（版ズレ・ノイズの温床）
 - **`sg` は使わない**: macOSではast-grepのshimだが、Linux（Amazon Linux等）では newgrp へのsymlink＝「別グループで任意コマンド実行」。canonical名 `ast-grep` のみ使う（allowlistはsgをdeny済み）
 - **tgrepはtier外の逃走経路**: 表現力は rg と同じで、利点は巨大repoでの速度のみ。通常は rg で足りる。どうしても遅い巨大repoでのみ、自分で `tgrep index .` または `tgrep serve .` を立てて `tgrep search` を使う（index/serve は状態変更のため allowlist では deny＝BYOS。stale index は取りこぼしの原因になるので更新に注意）
