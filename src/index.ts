@@ -550,6 +550,12 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             .describe(
               "集約結果の要約（1〜3文。監査証跡のため必須）。採用基準自体は機械集約される",
             ),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "判定を実行したモデル（例: x/provider-model。省略時はconfig既定で補完。成績表の帰属に使う）",
+            ),
         },
         async execute(args) {
           const results = (args.results ?? []) as state.VerifierResult[];
@@ -561,6 +567,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             reason: args.reason,
             target: decided.target,
             lens: results.map((r) => r.lens),
+            model: args.model,
           });
           if (result.last_verifier?.level === "clean") {
             return "verifier verdict: clean\ngraphhopper_phase(phase: 'done') で完了に進める。";
@@ -593,11 +600,18 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             .describe(
               "critic reviewの結果の根拠、またはcriticを呼ばなかった判断理由を1〜3文で",
             ),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "レビューを実行したモデル（省略時はconfig既定で補完。成績表の帰属に使う）",
+            ),
         },
         async execute(args) {
           const result = state.setCriticVerdict(root, {
             level: args.level,
             reason: args.reason,
+            model: args.model,
           });
           return `critic review recorded: ${args.level}. phase: ${result.phase}`;
         },

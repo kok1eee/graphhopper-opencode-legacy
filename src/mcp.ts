@@ -154,6 +154,7 @@ function statusText(root: string): string {
       ? `critic_review: level=${a.state.critic_review.level} reason=${a.state.critic_review.reason}`
       : "critic_review: (none, opt-in)",
     `fail_streak: ${a.state.fail_streak}`,
+    a.goal.score ? `score: ${a.goal.score.value} ${JSON.stringify(a.goal.score.breakdown)}` : null,
     `loop: stop_count=${a.state.loop_stop_count}/${state.readConfig(root).loop_stop_max} resume_blocked=${state.isResumeBlocked(root)} streak=${a.state.loop_streak}`,
     a.state.notes ? `notes: ${a.state.notes}` : null,
     state.planLogExists(root, a.goal.id)
@@ -438,6 +439,7 @@ function verifierSet(
   root: string,
   results: state.VerifierResult[],
   reason: string,
+  model?: string,
 ): ToolOut {
   const rejected = state.checkVerifierResults(results);
   if (rejected) return { text: rejected };
@@ -447,11 +449,13 @@ function verifierSet(
     reason,
     target: decided.target,
     lens: results.map((r) => r.lens),
+    model,
   });
   const data = {
     level: decided.level,
     target: decided.target ?? undefined,
     lens: results.map((r) => r.lens),
+    model: result.last_verifier?.model ?? undefined,
   };
   if (result.last_verifier?.level === "clean") {
     return {
@@ -502,6 +506,7 @@ interface ToolDef {
  * openWorld: shell/spawn するもの（eval/invoke/router_check）。 */
 const ANNOTATIONS: Record<string, Tool["annotations"]> = {
   graphhopper_status: { readOnlyHint: true },
+  graphhopper_scoreboard: { readOnlyHint: true },
   graphhopper_hash: { readOnlyHint: true },
   graphhopper_edit: { destructiveHint: true },
   graphhopper_eval: { openWorldHint: true },
@@ -593,6 +598,70 @@ const TOOL_DEFS: ToolDef[] = [
     run: (a, ctx) => {
       const root = ctx.root;
       return { text: statusText(root), data: statusData(root) };
+    },
+  },
+  {
+    name: "graphhopper_scoreboard",
+    description:
+      "評価機能A: モデル×役割の成績表（verdict集計）とgoal転帰（巻き戻し・eval・採点）。マッピング判断の素材",
+    inputSchema: { type: "object", properties: { root: ROOT_PROP } },
+    schema: z.object({ root: rootZ }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        models: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              model: { type: "string" },
+              role: { type: "string" },
+              verdicts: { type: "number" },
+              clean: { type: "number" },
+              drift: { type: "number" },
+            },
+            required: ["model", "role", "verdicts", "clean", "drift"],
+          },
+        },
+        goals: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              status: { type: "string" },
+              rewinds: { type: "number" },
+              evalPass: { type: "number" },
+              evalFail: { type: "number" },
+              score: { type: "number" },
+            },
+            required: ["id", "title", "status", "rewinds", "evalPass", "evalFail"],
+          },
+        },
+      },
+      required: ["models", "goals"],
+    },
+    run: (a, ctx) => {
+      const sb = state.buildScoreboard(ctx.root);
+      const lines = [
+        "## models",
+        ...sb.models.map(
+          (m) => `- ${m.role} ${m.model}: ${m.verdicts}件 (clean ${m.clean} / drift ${m.drift})`,
+        ),
+        "## goals",
+        ...sb.goals.map(
+          (g) =>
+            `- ${g.id} "${g.title}" [${g.status}] rewinds=${g.rewinds} eval=${g.evalPass}/${g.evalFail} score=${g.score ?? "-"}`,
+        ),
+      ];
+      return {
+        text: lines.join("\n"),
+        data: {
+          models: sb.models,
+          goals: sb.goals.map((g) => ({ ...g, score: g.score ?? undefined })),
+        },
+      };
     },
   },
   {
@@ -764,6 +833,7 @@ const TOOL_DEFS: ToolDef[] = [
           },
         },
         reason: { type: "string" },
+        model: { type: "string", description: "判定を実行したモデル（省略時はconfig既定で補完）" },
         root: ROOT_PROP,
       },
       required: ["results", "reason"],
@@ -777,6 +847,7 @@ const TOOL_DEFS: ToolDef[] = [
         }),
       ),
       reason: z.string(),
+      model: z.string().optional(),
       root: rootZ,
     }),
     outputSchema: {
@@ -785,10 +856,11 @@ const TOOL_DEFS: ToolDef[] = [
         level: { type: "string" },
         target: { type: "string" },
         lens: { type: "array", items: { type: "string" } },
+        model: { type: "string" },
       },
       required: ["level"],
     },
-    run: (a, ctx) => verifierSet(ctx.root, a.results as state.VerifierResult[], a.reason),
+    run: (a, ctx) => verifierSet(ctx.root, a.results as state.VerifierResult[], a.reason, a.model),
   },
   {
     name: "graphhopper_critic_set",
@@ -799,6 +871,7 @@ const TOOL_DEFS: ToolDef[] = [
       properties: {
         level: { type: "string", enum: ["clean", "drift"] },
         reason: { type: "string" },
+        model: { type: "string", description: "レビューを実行したモデル（省略時はconfig既定で補完）" },
         root: ROOT_PROP,
       },
       required: ["level", "reason"],
@@ -806,21 +879,31 @@ const TOOL_DEFS: ToolDef[] = [
     schema: z.object({
       level: z.enum(["clean", "drift"]),
       reason: z.string(),
+      model: z.string().optional(),
       root: rootZ,
     }),
     outputSchema: {
       type: "object",
-      properties: { level: { type: "string" }, phase: { type: "string" } },
+      properties: {
+        level: { type: "string" },
+        phase: { type: "string" },
+        model: { type: "string" },
+      },
       required: ["level", "phase"],
     },
     run: (a, ctx) => {
       const result = state.setCriticVerdict(ctx.root, {
         level: a.level,
         reason: a.reason,
+        model: a.model,
       });
       return {
         text: `critic review recorded: ${a.level}. phase: ${result.phase}`,
-        data: { level: a.level, phase: result.phase },
+        data: {
+          level: a.level,
+          phase: result.phase,
+          model: result.critic_review?.model ?? undefined,
+        },
       };
     },
   },

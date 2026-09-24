@@ -130,7 +130,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   診断が実行不可なら「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
   findingsには証拠状態を必ず付ける（typesafe流・失敗原因分離）: `裏付けあり` /
   `証拠不足` / `診断未実行` / `実行失敗`。原因不明のままlevelだけ付けない
-  結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
+   結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
+   （実行モデルがconfig既定と違う場合は `model` に明示。成績表の帰属に使う）
 - **route=polish**（大diff・閾値超）: adversarial verifier fan-out を行う
   1. `task(subagent_type: "graphhopper-verifier")` を3回呼ぶ。それぞれ以下のcharterをプロンプトに含める:
      - requirement: 「実装がdesign.mdの意図から外れていないか（実装漏れ・解釈ズレ・スコープ逸脱）を検証せよ」

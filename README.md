@@ -209,7 +209,6 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
   client 未対応でも tool 結果は壊さない
 
 ### program-side flow（prose→code）
-
 会話上の規律だったものを機械に寄せたもの（taktのworkflow doctorの発想）：
 
 - **遷移合法性**：designing→implementing→polish→done のみ（polish→implementing巻き戻し可）。
@@ -239,6 +238,16 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - `bun src/watch.ts <root> -- <command>` で監視し、イベントごとにコマンド実行
   （`GH_EVENT` / `GH_GOAL` / `GH_FILE` / `GH_ROOT` を環境変数で渡す）。試作
 - MCP logging は live補助線として継続（best-effort）。durable が outbox、live が logging の二層
+
+### 評価機能（A: 成績表／B: 採点）
+
+- **A モデル×役割の成績表**：verdict/critic記録に実行モデルを記録（省略時はconfig既定で補完）。
+  `graphhopper_scoreboard` でモデル別 verdict 集計（clean/drift）とgoal転帰
+  （巻き戻し・eval・採点）を返す。マッピング判断の素材。
+  注意：導入前のhistory分は現configで補完されるため帰属が不正確な場合がある（今後の記録から正確化）
+- **B goal出来栄えの機械採点**：complete時に機械事実のみで採点しgoalに保存。
+  式v1: `100 - 15*巻き戻し - 5*最大fail - 3*gate阻止 - 5*(verifier追加round)`（下限0）。
+  内訳付きで透明化。status/lineage/scoreboardに表示
 
 ### グラフ化の方向性（作業グラフ × コードグラフ）
 

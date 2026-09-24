@@ -1218,3 +1218,52 @@ describe("タスク列抽出（progress素材）", () => {
     expect(extractTasks(tmpRoot(), "g-nope")).toEqual({ total: 0, done: 0, items: [] });
   });
 });
+
+describe("評価機能（state層）", () => {
+  test("verdict未指定modelはconfig既定で補完される", async () => {
+    const { setVerifierVerdict, setCriticVerdict } = await import("./state");
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "config.json"),
+      JSON.stringify({ agents: { "graphhopper-verifier": "m/v", "graphhopper-critic": "m/c" } }),
+    );
+    const v = setVerifierVerdict(root, { level: "clean", reason: "r", target: null, lens: ["general"] });
+    expect(v.last_verifier?.model).toBe("m/v");
+    const c = setCriticVerdict(root, { level: "drift", reason: "r" });
+    expect(c.critic_review?.model).toBe("m/c");
+    const v2 = setVerifierVerdict(root, { level: "clean", reason: "r", target: null, lens: ["general"], model: "x/y" });
+    expect(v2.last_verifier?.model).toBe("x/y");
+  });
+
+  test("computeGoalScore式: 巻き戻し・fail・gate・追加roundで減点", async () => {
+    const { computeGoalScore, setPhase, setVerifierVerdict, completeGoal } = await import("./state");
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    setPhase(root, "implementing");
+    recordAttempt(root, false, "x");
+    recordAttempt(root, false, "x");
+    setPhase(root, "polish");
+    setVerifierVerdict(root, { level: "drift", reason: "r", target: "implementing", lens: ["general"] });
+    setPhase(root, "implementing");
+    // rewinds=1, maxFail=2, gate=0, rounds=1 → 100-15-10-0-0=75
+    expect(computeGoalScore(root, g.id)).toEqual({
+      value: 75,
+      breakdown: { rewinds: 1, maxFailStreak: 2, gateBlocks: 0, verifierRounds: 1 },
+    });
+    const done = completeGoal(root);
+    expect(done?.goal.score?.value).toBe(75);
+  });
+
+  test("buildScoreboard集計", async () => {
+    const { buildScoreboard, setVerifierVerdict } = await import("./state");
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    setVerifierVerdict(root, { level: "drift", reason: "r", target: "implementing", lens: ["general"], model: "m/a" });
+    setVerifierVerdict(root, { level: "clean", reason: "r", target: null, lens: ["general"], model: "m/a" });
+    const sb = buildScoreboard(root);
+    expect(sb.models).toContainEqual({ model: "m/a", role: "verifier", verdicts: 2, clean: 1, drift: 1 });
+    expect(sb.goals.length).toBe(1);
+  });
+});

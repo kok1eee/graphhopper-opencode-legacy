@@ -25,7 +25,7 @@ function freshRoot(): string {
 }
 
 describe("graphhopper-mcp tool一覧", () => {
-  test("15 toolが登録される", async () => {
+  test("16 toolが登録される", async () => {
     const client = await linked();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
@@ -43,6 +43,7 @@ describe("graphhopper-mcp tool一覧", () => {
         "graphhopper_invoke",
         "graphhopper_phase",
         "graphhopper_router_check",
+        "graphhopper_scoreboard",
         "graphhopper_set_eval",
         "graphhopper_status",
         "graphhopper_verifier_set",
@@ -519,5 +520,56 @@ describe("graft連携（skeleton enrich）", () => {
       throw new Error("graft missing");
     });
     expect(lin.goals).toEqual([]);
+  });
+});
+
+describe("評価機能A/B", () => {
+  test("verdict/criticにmodelが記録されscoreboardに載る", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      return r as { content: { type: string; text: string }[]; structuredContent?: Record<string, unknown> };
+    };
+    await call("graphhopper_goal", { action: "start", title: "eval test" });
+    await call("graphhopper_phase", { phase: "implementing" });
+    await call("graphhopper_phase", { phase: "polish" });
+    await call("graphhopper_critic_set", { level: "clean", reason: "ok", model: "test/critic-1" });
+    await call("graphhopper_verifier_set", {
+      results: [{ lens: "general", level: "clean" }],
+      reason: "ok",
+      model: "test/verifier-1",
+    });
+    const sb = await call("graphhopper_scoreboard", {});
+    const models = sb.structuredContent?.["models"] as { model: string; role: string; verdicts: number; clean: number; drift: number }[];
+    expect(models).toContainEqual({ model: "test/critic-1", role: "critic", verdicts: 1, clean: 1, drift: 0 });
+    expect(models).toContainEqual({ model: "test/verifier-1", role: "verifier", verdicts: 1, clean: 1, drift: 0 });
+    await client.close();
+  });
+
+  test("completeで採点されstatus/lineageに載る", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "score test" });
+    await call("graphhopper_phase", { phase: "implementing" });
+    await call("graphhopper_attempt", { ok: false, note: "x" });
+    await call("graphhopper_phase", { phase: "polish" });
+    await call("graphhopper_verifier_set", {
+      results: [{ lens: "general", level: "clean" }],
+      reason: "ok",
+    });
+    // 非法遷移polish→doneは許可されている
+    await call("graphhopper_phase", { phase: "done" });
+    const done = await call("graphhopper_goal", { action: "complete" });
+    expect(done).toContain("completed");
+    // fail1・verdict1のため 100-5-0=95
+    const st = await call("graphhopper_status", {});
+    expect(st).toContain("score: 95");
+    await client.close();
   });
 });

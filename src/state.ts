@@ -40,6 +40,19 @@ export interface Goal {
   status: GoalStatus;
   created_at: string;
   done_at: string | null;
+  /** complete時の機械採点（B）。内訳付き・後方互換のためoptional */
+  score?: GoalScore | null;
+}
+
+/** goal出来栄えの機械採点。式はv1で固定し、breakdownで透明化する（調整は式ごと変える） */
+export interface GoalScore {
+  value: number;
+  breakdown: {
+    rewinds: number;
+    maxFailStreak: number;
+    gateBlocks: number;
+    verifierRounds: number;
+  };
 }
 
 export type VerdictLevel = "clean" | "drift";
@@ -53,6 +66,8 @@ export interface VerifierVerdict {
   reason: string;
   target: DriftTarget | null;
   lens: VerifierLens[];
+  /** 判定を実行したモデル（未指定時はconfig既定で補完）。評価機能の成績表素材 */
+  model?: string | null;
   at: string;
 }
 
@@ -62,6 +77,8 @@ export interface VerifierVerdict {
 export interface CriticVerdict {
   level: VerdictLevel;
   reason: string;
+  /** レビューを実行したモデル（未指定時はconfig既定で補完） */
+  model?: string | null;
   at: string;
 }
 
@@ -306,6 +323,7 @@ export type HistoryEvent =
       level: VerdictLevel;
       target: DriftTarget | null;
       lens: VerifierLens[];
+      model?: string | null;
     }
   | { type: "design_gate_block"; goal: string; tool: string; path: string }
   | {
@@ -318,6 +336,7 @@ export type HistoryEvent =
       type: "critic_review_set";
       goal: string;
       level: VerdictLevel;
+      model?: string | null;
     }
   | {
       type: "attempt";
@@ -643,8 +662,59 @@ export function completeGoal(root: string): ActiveLoop | null {
       loop_stopped: false,
     },
   }));
-  if (r) recordEvent(root, { type: "goal_complete", goal: r.goal.id });
+  if (r) {
+    // complete時の機械採点（B）。式v1: 100 - 15*巻き戻し - 5*最大fail - 3*gate阻止 - 5*(verifier追加round)。下限0
+    const score = computeGoalScore(root, r.goal.id);
+    const goals = readGoals(root);
+    const g = goals.goals.find((x) => x.id === r.goal.id);
+    if (g) {
+      g.score = score;
+      writeGoals(root, goals);
+    }
+    r.goal.score = score;
+    recordEvent(root, { type: "goal_complete", goal: r.goal.id });
+  }
   return r;
+}
+
+/** goal出来栄えの機械採点。history由来の機械事実のみで計算し、人手採点はしない（v1）。
+ * 内訳を残すため式の調整はこの関数のみ変える */
+export function computeGoalScore(root: string, goalId: string): GoalScore {
+  let rewinds = 0;
+  let maxFailStreak = 0;
+  let gateBlocks = 0;
+  let verifierRounds = 0;
+  for (const h of readHistory(root)) {
+    if ((h as { goal?: unknown }).goal !== goalId) continue;
+    switch (h.type) {
+      case "phase":
+        if (h.from === "polish" && h.to === "implementing") rewinds += 1;
+        break;
+      case "attempt":
+        if (h.fail_streak > maxFailStreak) maxFailStreak = h.fail_streak;
+        break;
+      case "design_gate_block":
+      case "design_doc_locked_block":
+        gateBlocks += 1;
+        break;
+      case "verifier_verdict":
+        verifierRounds += 1;
+        break;
+      default:
+        break;
+    }
+  }
+  const breakdown = {
+    rewinds,
+    maxFailStreak,
+    gateBlocks,
+    verifierRounds,
+  };
+  const value = Math.max(
+    0,
+    100 - 15 * rewinds - 5 * maxFailStreak - 3 * gateBlocks - 5 * Math.max(0, verifierRounds - 1),
+  );
+  return { value, breakdown };
 }
 
 /** clear 専用: goal を done 化するが `goal_complete` イベントは記録しない
@@ -935,9 +1005,11 @@ export function setVerifierVerdict(
   verdict: Omit<VerifierVerdict, "at">,
 ): LoopState {
   const state = readState(root);
+  const model =
+    verdict.model ?? readConfig(root).agents["graphhopper-verifier"] ?? null;
   const next: LoopState = {
     ...state,
-    last_verifier: { ...verdict, at: new Date().toISOString() },
+    last_verifier: { ...verdict, model, at: new Date().toISOString() },
   };
   writeState(root, next);
   if (state.goal_id) {
@@ -947,6 +1019,7 @@ export function setVerifierVerdict(
       level: verdict.level,
       target: verdict.target,
       lens: verdict.lens,
+      model,
     });
   }
   return next;
@@ -959,9 +1032,11 @@ export function setCriticVerdict(
   verdict: Omit<CriticVerdict, "at">,
 ): LoopState {
   const state = readState(root);
+  const model =
+    verdict.model ?? readConfig(root).agents["graphhopper-critic"] ?? null;
   const next: LoopState = {
     ...state,
-    critic_review: { ...verdict, at: new Date().toISOString() },
+    critic_review: { ...verdict, model, at: new Date().toISOString() },
   };
   writeState(root, next);
   if (state.goal_id) {
@@ -969,6 +1044,7 @@ export function setCriticVerdict(
       type: "critic_review_set",
       goal: state.goal_id,
       level: verdict.level,
+      model,
     });
   }
   return next;
@@ -1745,6 +1821,8 @@ export interface GoalLineage {
   gateBlocks: number;
   editedFiles: string[];
   routerChecks: { diff_lines: number; route: RouterRoute }[];
+  /** complete時の機械採点（未completeは null） */
+  score: GoalScore | null;
 }
 
 export function buildLineage(root: string): {
@@ -1767,6 +1845,7 @@ export function buildLineage(root: string): {
       gateBlocks: 0,
       editedFiles: [],
       routerChecks: [],
+      score: g.score ?? null,
     });
   }
   const get = (goalId: string): GoalLineage | null => {
@@ -1786,6 +1865,7 @@ export function buildLineage(root: string): {
         gateBlocks: 0,
         editedFiles: [],
         routerChecks: [],
+        score: null,
       };
       byId.set(goalId, l);
     }
@@ -1829,4 +1909,64 @@ export function buildLineage(root: string): {
     }
   }
   return { goals: [...byId.values()], discover: readDiscover(root) };
+}
+
+/* ================================================================== *
+ * 評価機能A: モデル×役割の成績表。verdict/criticイベントの model 欄を
+ * 集計する。帰属は記録値のみ（推測で紐付けない）。goal転帰は lineage 由来。
+ * ================================================================== */
+
+export interface ModelRoleStats {
+  model: string;
+  role: "verifier" | "critic";
+  verdicts: number;
+  clean: number;
+  drift: number;
+}
+
+export interface GoalOutcome {
+  id: string;
+  title: string;
+  status: GoalStatus;
+  rewinds: number;
+  evalPass: number;
+  evalFail: number;
+  score: number | null;
+}
+
+export interface Scoreboard {
+  models: ModelRoleStats[];
+  goals: GoalOutcome[];
+}
+
+export function buildScoreboard(root: string): Scoreboard {
+  const byModel = new Map<string, ModelRoleStats>();
+  const bump = (model: string | null | undefined, role: "verifier" | "critic", level: VerdictLevel) => {
+    const key = `${role}\0${model ?? "(unknown)"}`;
+    let s = byModel.get(key);
+    if (!s) {
+      s = { model: model ?? "(unknown)", role, verdicts: 0, clean: 0, drift: 0 };
+      byModel.set(key, s);
+    }
+    s.verdicts += 1;
+    if (level === "clean") s.clean += 1;
+    else s.drift += 1;
+  };
+  for (const h of readHistory(root)) {
+    if (h.type === "verifier_verdict") bump(h.model, "verifier", h.level);
+    else if (h.type === "critic_review_set") bump(h.model, "critic", h.level);
+  }
+  const lin = buildLineage(root);
+  return {
+    models: [...byModel.values()].sort((a, b) => b.verdicts - a.verdicts),
+    goals: lin.goals.map((g) => ({
+      id: g.id,
+      title: g.title,
+      status: g.status,
+      rewinds: g.rewinds,
+      evalPass: g.evalRuns.pass,
+      evalFail: g.evalRuns.fail,
+      score: g.score?.value ?? null,
+    })),
+  };
 }
