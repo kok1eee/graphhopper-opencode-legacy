@@ -1067,6 +1067,14 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
          * 次のuser入力にミラーされる、または同じtool callを繰り返すと session.idle が
          * 連続発火し、自動継続が延々回る。検知して loop_stop_threshold（echo無効時は
          * loop_tool_repeat_threshold）回連続したら goal を pause して自動継続を止める。
+         * NOTE（守備範囲の三分。統合しないこと）:
+         * - echo検知＝文面一致のミラー専用。言い換え待機ackはすり抜ける
+         *   （7e97eff の実空転が証拠。dedupe追加の動機）
+         * - tool反復検知＝同一tool call反復専用（tool実行のたび fingerprint が
+         *   変わるため dedupe では止まらない）
+         * - 下の dedupe＝状態同一の再注入専用（人間・tool数・phase・eval不変）。
+         *   echo/toolのいずれも fingerprint を変化させるため dedupe では止まらない。
+         *   3者は互いの死角を埋める関係であり、1つに畳むと Sep-3 の穴が再発する。
          * ================================================================ */
         {
           const cfg = state.readConfig(root);

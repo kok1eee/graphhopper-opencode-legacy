@@ -1509,16 +1509,15 @@ export interface StuckStatus {
   reasons: string[];
 }
 
-/** stuck 信号の集約判定（読み取り専用。書き込みは note 系に分離）。
- * fail_streak・同一ファイル再編集・diff 停滞の OR。
- * recordAttempt が書き込んだ fail_streak を読むだけで、再計算・二重記録はしない。 */
+/** 進捗停滞シグナルの集約判定（読み取り専用。書き込みは note 系に分離）。
+ * 同一ファイル再編集・diff 停滞の OR。fail_streak は対象外:
+ * 全 caller が r.escalate==false 時のみ参照し、その条件は fail_streak<閾値と
+ * 同値のため fail 枝は到達不能（dead につき削除。fail は recordAttempt 側が担う）。
+ * 実 history でも stuck_hint 発火は edit/diff 系のみ想定。 */
 export function checkStuck(root: string): StuckStatus {
   const cfg = readConfig(root);
   const state = readState(root);
   const reasons: string[] = [];
-  if (state.fail_streak >= cfg.stuck_threshold && cfg.stuck_threshold > 0) {
-    reasons.push(`fail_streak=${state.fail_streak}`);
-  }
   if (
     cfg.stuck_edit_repeat > 1 &&
     state.edit_streak >= cfg.stuck_edit_repeat

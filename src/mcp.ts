@@ -43,6 +43,7 @@ import {
   designDocLockedRefusal,
   designGateRefusal,
   EVAL_MANAGED_NOTE,
+  extractTasks,
   foreignBoundNote,
 } from "./gate";
 import { readGraphhopperHash, runGraphhopperEdit } from "./gate";
@@ -1246,12 +1247,14 @@ const realSkeletonRunner: SkeletonRunner = (root, file) =>
 /** buildLineage に editedSymbols を付与する。run 注入可（テスト用） */
 export interface EnrichedGoalLineage extends state.GoalLineage {
   editedSymbols: FileSymbols[];
+  /** design.md タスク列の進捗（progress lens 素材） */
+  tasks: { total: number; done: number; items: { text: string; done: boolean }[] };
 }
 
 export async function lineageEnriched(
   root: string,
   run: SkeletonRunner = realSkeletonRunner,
-): Promise<{ goals: EnrichedGoalLineage[] }> {
+): Promise<{ goals: EnrichedGoalLineage[]; discover: state.DiscoverState | null }> {
   const lin = state.buildLineage(root);
   const files: string[] = [];
   for (const g of lin.goals) {
@@ -1274,7 +1277,9 @@ export async function lineageEnriched(
         file: f,
         symbols: table.get(f) ?? [],
       })),
+      tasks: extractTasks(root, g.id),
     })),
+    discover: lin.discover,
   };
 }
 const RESOURCE_TEMPLATES = [

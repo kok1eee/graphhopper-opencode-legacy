@@ -71,10 +71,12 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   - 同一goal内の2回目以降のoracle相談は新規ではなく `task(task_id: "<前回のID>")` で同subagent継続として呼ぶ（OmOのresume=session_id相当。文脈を失わず重複説明を省く）
   - **これはrouter gate（diffサイズ）とは別軸のタイミング判断**——無条件で毎回opusを呼ぶのではなく、
     本当に詰まった時だけ上位モデルのコストを払う graph engineering の分岐点
-  - stuck 信号は3系統ある（いずれかで escalate。eval_cmd 運用では idle の eval 失敗文に自動追記される）:
-    - `fail_streak`（連続失敗。`ok`・phase 遷移・resume でリセット）
-    - 同一ファイル再編集（`stuck_edit_repeat` 既定5連。別ファイル・eval pass でリセット）
-    - diff 停滞（`stuck_diff_stall` 既定4。ワーキングコピー差分が変わらない idle eval の連続。差分変化・eval pass でリセット）
+  - stuck 信号は2系統＋fail（いずれかで escalate。eval_cmd 運用では idle の eval 失敗文に自動追記される）:
+    - `fail_streak`（連続失敗。`ok`・phase 遷移・resume でリセット。`recordAttempt` 側で判定）
+    - 同一ファイル再編集（`stuck_edit_repeat` 既定5連。別ファイル・eval pass でリセット。
+      `checkStuck` で判定＝進捗停滞系）
+    - diff 停滞（`stuck_diff_stall` 既定4。ワーキングコピー差分が変わらない idle eval の連続。
+      差分変化・eval pass でリセット。`checkStuck` で判定＝進捗停滞系）
   - 連続失敗が `max_eval_fails`（既定6）に達すると相談ではなく goal が pause する（giveUp）。修正して resume せよ
 - 全タスク実施したら `graphhopper_router_check` を呼ぶ（diffサイズを機械測定してrouteを決める）
 

@@ -224,6 +224,35 @@ const REQUIRED_SECTIONS: { key: string; match: RegExp }[] = [
 
 const TASK_LINE = /^\s*-\s*(\[[ x]\])?\s*\S/m;
 
+export interface DesignTask {
+  text: string;
+  done: boolean;
+}
+
+export interface DesignProgress {
+  total: number;
+  done: number;
+  items: DesignTask[];
+}
+
+/* design.md のタスク列抽出（progress素材）。チェックボックス行のみ。
+ * 素朴な行パースであり、ネスト・改行またぎは対象外。読取専用 */
+export function extractTasks(root: string, goalId: string): DesignProgress {
+  let raw: string;
+  try {
+    raw = decodeUtf8Strict(readFileSync(state.planPath(root, goalId)));
+  } catch {
+    return { total: 0, done: 0, items: [] };
+  }
+  const items: DesignTask[] = [];
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^\s*-\s*\[([ x])\]\s*(\S.*)$/);
+    if (!m) continue;
+    items.push({ text: (m[2] ?? "").slice(0, 200), done: m[1] === "x" });
+  }
+  return { total: items.length, done: items.filter((i) => i.done).length, items };
+}
+
 export function checkDesignDoc(root: string, goalId: string): string[] {
   let raw: string;
   try {

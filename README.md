@@ -178,7 +178,7 @@ tool 呼び出しより安い読み取り用。URI 形式は
 | `goals.json` | 目標キュー＋active指定 |
 | `history.jsonl` | 監査ログ（末尾200行に丸め） |
 | `plans/<goalId>.md` / `plans/<goalId>.log.md` | design doc・log |
-| `lineage.json` | goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル。作業グラフのedge素材。仮想resource） |
+| `lineage.json` | goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル＋graft symbol・designタスク進捗。作業グラフのedge素材。仮想resource） |
 
 `ListResources` は空（root が呼出側依存で列挙不能）、templates 5件で発見可能にする。
 rel は allowlist＋containment 検査で traversal を拒否する。
@@ -228,6 +228,7 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
   （質は見ない。質の厳格化は「薄く書いて回避する」エロージョンを再生産するため。
   質はcriticの領分）
 - 検証キーワードは既存doc実態に較正（テンプレ準拠docは通過、スタブは検出）
+- designタスク列（`- [ ]`）は抽出してlineageの`tasks`に載せる（progress lens素材）
 
 ### outbox＋watch（durable通知）
 

@@ -992,6 +992,15 @@ describe("stuck集約と通知抑止", () => {
     expect(checkStuck(root)).toEqual({ escalate: false, reasons: [] });
   });
 
+  test("fail_streak単独ではcheckStuckは発火しない（recordAttempt側の責務）", () => {
+    const root = tmpRoot();
+    startGoal(root, "test goal", "sess1");
+    recordAttempt(root, false, "x");
+    recordAttempt(root, false, "x");
+    // fail_streak=2 でも進捗停滞系が無ければ escalate しない
+    expect(checkStuck(root)).toEqual({ escalate: false, reasons: [] });
+  });
+
   test("同一理由の再通知はスキップ・変化で再通知", () => {
     const root = tmpRoot();
     startGoal(root, "test goal", "sess1");
@@ -1181,5 +1190,31 @@ describe("design scaffold＋構造ゲート", () => {
     writeFileSync(planPath(root, g.id), "# empty\n");
     const err = checkPhaseMove(root, "implementing");
     expect(err).toContain("骨格不足");
+  });
+});
+
+describe("タスク列抽出（progress素材）", () => {
+  test("チェックボックス行を抽出・完了数を数える", async () => {
+    const { extractTasks, checkDesignDoc } = await import("./gate");
+    const { planPath } = await import("./state");
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    // scaffold自体が `- [ ] T1` を1行含む
+    const sc = extractTasks(root, g.id);
+    expect(sc.total).toBe(1);
+    expect(sc.done).toBe(0);
+    writeFileSync(
+      planPath(root, g.id),
+      "# d\n\n- [x] done1\n- [ ] todo1\n- plain bullet\n",
+    );
+    const p = extractTasks(root, g.id);
+    expect(p.total).toBe(2);
+    expect(p.done).toBe(1);
+    expect(p.items[0]).toEqual({ text: "done1", done: true });
+  });
+
+  test("ファイル不在は空", async () => {
+    const { extractTasks } = await import("./gate");
+    expect(extractTasks(tmpRoot(), "g-nope")).toEqual({ total: 0, done: 0, items: [] });
   });
 });
