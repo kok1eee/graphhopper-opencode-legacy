@@ -211,6 +211,37 @@ export function foreignBoundNote(boundId: string): string {
   );
 }
 
+/* design doc構造検証（exit gate用）。骨格の有無だけ見て質は見ない。
+ * 質の厳格化は「薄く書いて回避する」自己判断エロージョンを再生産するため。
+ * 既存docの見出し実態に合わせた寛容マッチ。欠落キー一覧を返す（空=通過） */
+const REQUIRED_SECTIONS: { key: string; match: RegExp }[] = [
+  { key: "goal理解", match: /goal理解|^##\s*goal\b/i },
+  { key: "現状", match: /現状|背景/ },
+  { key: "設計判断", match: /設計判断|決定事項/ },
+  { key: "タスク列", match: /タスク/ },
+  { key: "棄却", match: /棄却|スコープ外|非対象/ },
+];
+
+const TASK_LINE = /^\s*-\s*(\[[ x]\])?\s*\S/m;
+
+export function checkDesignDoc(root: string, goalId: string): string[] {
+  let raw: string;
+  try {
+    raw = decodeUtf8Strict(readFileSync(state.planPath(root, goalId)));
+  } catch {
+    return ["design doc自体が無い"];
+  }
+  const headers = raw
+    .split("\n")
+    .filter((l) => l.startsWith("##"))
+    .join("\n");
+  const missing = REQUIRED_SECTIONS.filter((s) => !s.match.test(headers)).map(
+    (s) => s.key,
+  );
+  if (!TASK_LINE.test(raw)) missing.push("タスク行（- ...）");
+  return missing;
+}
+
 /* phase遷移前の機械チェック（plugin/MCP両callerで共有）。
  * 通れば null、ダメならそのまま返す error 文。 */
 export function checkPhaseMove(
@@ -236,6 +267,18 @@ export function checkPhaseMove(
       "error: require_critic=true のため designing→implementing には critic_review 記録が必要。" +
       "graphhopper_critic_set で記録してから遷移せよ（opt-in運用なら config で require_critic=false）。"
     );
+  }
+  // design doc構造ゲート（骨格のみ。質はcriticの領分）。
+  // scaffoldが自動生成するため、失敗するのは骨格を削った場合のみ
+  if (to === "implementing" && active.state.phase === "designing") {
+    const missing = checkDesignDoc(root, active.goal.id);
+    if (missing.length > 0) {
+      return (
+        `error: design.md の骨格不足（${missing.join("・")}）。` +
+        `scaffold（.graphhopper/plans/${active.goal.id}.md）を埋めてから遷移せよ。` +
+        `質の指摘はcriticの領分であり、このゲートは骨格の有無だけを見る。`
+      );
+    }
   }
   return null;
 }

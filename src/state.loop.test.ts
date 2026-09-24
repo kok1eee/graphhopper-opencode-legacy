@@ -1142,3 +1142,44 @@ describe("critic gate（flag両対応）", () => {
     expect(checkPhaseMove(root, "implementing")).toBeNull();
   });
 });
+
+describe("design scaffold＋構造ゲート", () => {
+  test("startGoalで骨格が自動生成され、冪等（既存を壊さない）", async () => {
+    const { scaffoldDesignDoc } = await import("./state");
+    const { planPath } = await import("./state");
+    const root = tmpRoot();
+    const g = startGoal(root, "scaffold test", "s").goal;
+    const p = planPath(root, g.id);
+    expect(existsSync(p)).toBe(true);
+    const raw = readFileSync(p, "utf8");
+    expect(raw).toContain("## 1. goal理解");
+    expect(raw).toContain("## 4. 実装タスク列");
+    writeFileSync(p, "# custom\n");
+    expect(scaffoldDesignDoc(root, g.id, "t")).toBe(false);
+    expect(readFileSync(p, "utf8")).toBe("# custom\n");
+  });
+
+  test("checkDesignDoc: テンプレ通過・欠落検出・ファイル不在", async () => {
+    const { checkDesignDoc } = await import("./gate");
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    expect(checkDesignDoc(root, g.id)).toEqual([]);
+    const { planPath } = await import("./state");
+    writeFileSync(planPath(root, g.id), "# design\n\n## 1. goal理解\n");
+    const missing = checkDesignDoc(root, g.id);
+    expect(missing).toContain("現状");
+    expect(missing).toContain("設計判断");
+    expect(checkDesignDoc(root, "g-nonexistent")).toEqual(["design doc自体が無い"]);
+  });
+
+  test("checkPhaseMove: 骨格を削るとimplementing遷移が止まる", async () => {
+    const { checkPhaseMove } = await import("./gate");
+    const { planPath } = await import("./state");
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+    writeFileSync(planPath(root, g.id), "# empty\n");
+    const err = checkPhaseMove(root, "implementing");
+    expect(err).toContain("骨格不足");
+  });
+});

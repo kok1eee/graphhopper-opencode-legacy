@@ -235,6 +235,49 @@ export function planPath(root: string, goalId: string): string {
   return join(dir(root), "plans", `${goalId}.md`);
 }
 
+/* design doc scaffold: goal開始時に骨格を自動生成する。
+ * 構造検証（gate.ts checkDesignDoc）のアンカー。既存ファイルは壊さない（冪等）。 */
+export function designTemplate(goalId: string, title: string): string {
+  return [
+    `# design: ${title} (${goalId})`,
+    ``,
+    `## 1. goal理解`,
+    ``,
+    `（何を・なぜやるか。1〜3文）`,
+    ``,
+    `## 2. 現状`,
+    ``,
+    `（調査済み事実。証拠付き）`,
+    ``,
+    `## 3. 設計判断`,
+    ``,
+    `（採用・棄却の判断と理由）`,
+    ``,
+    `## 4. 実装タスク列`,
+    ``,
+    `- [ ] T1 （タスク）`,
+    ``,
+    `## 5. 棄却した代替案`,
+    ``,
+    `| 対象 | 採用 | 棄却 |`,
+    `|---|---|---|`,
+    ``,
+  ].join("\n");
+}
+
+/** scaffoldが無ければ生成する。生成したら true、既存なら false */
+export function scaffoldDesignDoc(root: string, goalId: string, title: string): boolean {
+  try {
+    const p = planPath(root, goalId);
+    if (existsSync(p)) return false;
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, designTemplate(goalId, title), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** 決定の経緯・棄却した代替案・進捗を追記するログ（design docとは別物、追記専用・ハードゲート無し）。
  * design_gate_allow の prefix (`.graphhopper/plans/`) に含まれるため、designing中も常時書き込み可能。 */
 export function planLogPath(root: string, goalId: string): string {
@@ -521,6 +564,9 @@ export function startGoal(
   };
   writeState(root, next);
   recordEvent(root, { type: "goal_start", goal: goal.id, title: goal.title });
+  // design scaffold: 骨格を自動生成（既存があれば壊さない）。
+  // 構造検証ゲートのアンカーになる
+  scaffoldDesignDoc(root, goal.id, goal.title);
   return { goal, state: next };
 }
 

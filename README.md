@@ -220,6 +220,15 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - **単一driver警告**：bind中goalへの別session操作に警告（拒否ではなく警告。handoff正規フローのため）
 - **discover紐付け**：開始時点のactive goalを記録し、lineageに載せる
 
+### design scaffold＋構造ゲート
+
+- `goal(start)`時に`plans/<goal-id>.md`の骨格を自動生成（goal理解／現状／設計判断／
+  タスク列／棄却表＋タスク行）。既存ファイルは壊さない（冪等）
+- `designing→implementing`遷移時に骨格の有無を機械チェック。不足があれば遷移拒否
+  （質は見ない。質の厳格化は「薄く書いて回避する」エロージョンを再生産するため。
+  質はcriticの領分）
+- 検証キーワードは既存doc実態に較正（テンプレ準拠docは通過、スタブは検出）
+
 ### outbox＋watch（durable通知）
 
 会話上の「終わったよ」ではなくプログラムが受け取れる通知：

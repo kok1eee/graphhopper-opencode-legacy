@@ -22,8 +22,12 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 ### designing
 
-- `graphhopper_goal(action: "start", title: ...)` で開始
-- `.graphhopper/plans/<goal-id>.md` に要件理解・設計判断・実装タスク列を書く
+- `graphhopper_goal(action: "start", title: ...)` で開始すると
+  `.graphhopper/plans/<goal-id>.md` の骨格が自動生成される（scaffold）。
+  既存ファイルは壊さない
+- 骨格（goal理解／現状／設計判断／タスク列／棄却＋タスク行）を埋める。
+  **骨格不足だと `implementing` 遷移が機械拒否される**（構造のみ・質はcriticの領分）。
+  中身をゼロから書く必要は無い、scaffoldを埋めればよい
 - **このフェーズではsource編集（Edit/Write）が `tool.execute.before` hookで物理ブロックされる**
   （許可パスは `.graphhopper/plans/` 配下のみ、`.graphhopper/config.json` の `design_gate_allow` で変更可）
 - 書けたら `task(subagent_type: "graphhopper-critic")` で**設計を1回敵対レビュー**する
