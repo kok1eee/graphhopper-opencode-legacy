@@ -15,6 +15,10 @@ export const DEFAULT_TIMEOUT_MS = 120000;
 export const MAX_TIMEOUT_MS = 300000;
 export const MIN_TIMEOUT_MS = 10000;
 export const KILL_GRACE_MS = 5000;
+/** fan-out thundering herd回避用の起動ずらし上限。並列既定は維持しopt-inで使う */
+export const MAX_DELAY_MS = 60000;
+/** 子プロセス生存中のheartbeat間隔（MCP logging経由で「固まり」知覚を防ぐ） */
+export const HEARTBEAT_MS = 30000;
 export const DEPTH_ENV = "GH_INVOKE_DEPTH";
 export const MAX_DEPTH = 1;
 
@@ -27,6 +31,8 @@ export interface InvokeArgs {
   prompt: string;
   root: string;
   timeoutMs?: number;
+  /** 起動前の待機ms（並列fan-outの429 herd回避用。0既定・上限あり） */
+  delayMs?: number;
 }
 
 export type SpawnFn = (
@@ -88,14 +94,36 @@ export interface InvokeResult {
   fallbackWarning: boolean;
 }
 
-/** 子プロセス実行（seam付き・group kill対応）。 */
+export interface InvokeResult {
+  output: string;
+  timedOut: boolean;
+  fallbackWarning: boolean;
+  /** clientキャンセルでkillしたか（並列fan-outの取り消し漏れ防止） */
+  cancelled: boolean;
+}
+
+export interface RunChildOpts {
+  timeoutMs: number;
+  cwd: string;
+  childEnv: NodeJS.ProcessEnv;
+  /** 中断伝播: abortでgroup killしcancelledで返す（MCP CallToolのextra.signal） */
+  signal?: AbortSignal;
+  /** heartbeat間隔ms（onTick呼び出し。0以下で無効） */
+  heartbeatMs?: number;
+  onTick?: (elapsedMs: number) => void;
+  /** SIGTERM後のSIGKILLまでの猶予ms（既定KILL_GRACE_MS。テスト用に短縮可） */
+  killGraceMs?: number;
+}
+
+/** 子プロセス実行（seam付き・group kill対応・中断/heartbeat付き）。 */
 export function runChild(
   binary: string,
   args: string[],
-  opts: { timeoutMs: number; cwd: string; childEnv: NodeJS.ProcessEnv },
+  opts: RunChildOpts,
   spawnFn: SpawnFn = defaultSpawn,
 ): Promise<InvokeResult> {
   return new Promise((resolvePromise) => {
+    const started = Date.now();
     const child = spawnFn(binary, args, {
       cwd: opts.cwd,
       env: opts.childEnv,
@@ -105,14 +133,17 @@ export function runChild(
     let stdout = "";
     let stderr = "";
     let done = false;
-    const finish = (timedOut: boolean): void => {
+    const finish = (timedOut: boolean, cancelled = false): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (graceTimer) clearTimeout(graceTimer);
+      if (beat) clearInterval(beat);
+      opts.signal?.removeEventListener("abort", onAbort);
       const fallbackWarning = /Falling back to default agent/.test(stderr);
       let output = truncate(stdout, STDOUT_MAX_CHARS);
-      if (timedOut) {
+      if (cancelled) {
+        output += `\nerror: invoke cancelled by client (killed)`;
+      } else if (timedOut) {
         output += `\nerror: invoke timeout after ${opts.timeoutMs}ms (killed; orphaned child may continue billing)`;
       } else if (code !== 0) {
         const tail = stderr.split("\n").slice(-20).join("\n");
@@ -121,7 +152,7 @@ export function runChild(
       if (fallbackWarning) {
         output += `\nwarning: agent fell back to default (read-only not enforced by agent def)`;
       }
-      resolvePromise({ output, timedOut, fallbackWarning });
+      resolvePromise({ output, timedOut, fallbackWarning, cancelled });
     };
     let code: number | null = 0;
     child.stdout?.on("data", (c: Buffer) => {
@@ -147,13 +178,35 @@ export function runChild(
       }
     };
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const graceMs = opts.killGraceMs ?? KILL_GRACE_MS;
     const timer = setTimeout(() => {
       killGroup("SIGTERM");
       graceTimer = setTimeout(() => {
         killGroup("SIGKILL");
         finish(true);
-      }, KILL_GRACE_MS);
+      }, graceMs);
     }, opts.timeoutMs);
+    // 中断伝播: clientキャンセルで即kill（取り消し後も裏で回り続ける事故を防ぐ）
+    const onAbort = (): void => {
+      killGroup("SIGTERM");
+      setTimeout(() => {
+        if (!done) killGroup("SIGKILL");
+        finish(false, true);
+      }, graceMs);
+    };
+    if (opts.signal?.aborted) {
+      onAbort();
+    } else {
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+    }
+    // heartbeat: 長時間実行の「固まり」知覚を防ぐ（MCP logging等へ中継）
+    const hb = opts.heartbeatMs ?? HEARTBEAT_MS;
+    const beat =
+      hb > 0 && opts.onTick
+        ? setInterval(() => {
+            if (!done) opts.onTick?.(Date.now() - started);
+          }, hb)
+        : null;
   });
 }
 
@@ -169,17 +222,31 @@ export interface InvokeStructuredResult {
   output: string;
   timedOut: boolean;
   fallbackWarning: boolean;
+  cancelled: boolean;
+}
+
+export interface InvokeOpts {
+  spawnFn?: SpawnFn;
+  signal?: AbortSignal;
+  heartbeatMs?: number;
+  onTick?: (elapsedMs: number) => void;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /** invoke の構造化版（MCP structuredContent 用）。判定は runChild の機械値を使う。 */
 export async function invokeStructured(
   args: InvokeArgs,
   spawnFn: SpawnFn = defaultSpawn,
+  invokeOpts: InvokeOpts = {},
 ): Promise<InvokeStructuredResult> {
   const fail = (output: string): InvokeStructuredResult => ({
     output,
     timedOut: false,
     fallbackWarning: false,
+    cancelled: false,
   });
   const depth = Number(process.env[DEPTH_ENV] ?? "0");
   if (depth >= MAX_DEPTH) {
@@ -213,6 +280,37 @@ export async function invokeStructured(
   );
   const argv = buildArgs({ agent: args.agent, model, dir: root, title: "gh-invoke", prompt: args.prompt });
   const childEnv: NodeJS.ProcessEnv = { ...process.env, [DEPTH_ENV]: String(depth + 1) };
-  const r = await runChild(binary, argv, { timeoutMs, cwd: root, childEnv }, spawnFn);
-  return { output: r.output, timedOut: r.timedOut, fallbackWarning: r.fallbackWarning };
+  // 起動ずらし（herd回避・opt-in）。中断済みならspawn前に諦める
+  if (invokeOpts.signal?.aborted) {
+    return {
+      output: "error: invoke cancelled by client (before spawn)",
+      timedOut: false,
+      fallbackWarning: false,
+      cancelled: true,
+    };
+  }
+  const delayMs = Math.min(MAX_DELAY_MS, Math.max(0, args.delayMs ?? 0));
+  if (delayMs > 0) await sleep(delayMs);
+  if (invokeOpts.signal?.aborted) {
+    return {
+      output: "error: invoke cancelled by client (during delay)",
+      timedOut: false,
+      fallbackWarning: false,
+      cancelled: true,
+    };
+  }
+  const r = await runChild(
+    binary,
+    argv,
+    {
+      timeoutMs,
+      cwd: root,
+      childEnv,
+      signal: invokeOpts.signal,
+      heartbeatMs: invokeOpts.heartbeatMs,
+      onTick: invokeOpts.onTick,
+    },
+    spawnFn,
+  );
+  return { output: r.output, timedOut: r.timedOut, fallbackWarning: r.fallbackWarning, cancelled: r.cancelled };
 }

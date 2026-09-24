@@ -280,6 +280,17 @@ API 経由セッションの `task` には opencode 側 subagent（critic/verifi
 MCP駆動ループでは critic/verifier/oracle の呼び出しをすべて invoke に読み替える
 （応答文中の `task(subagent_type: ...)` は TUI 用の表記）。
 
+### invoke並列安全（中断伝播・heartbeat・ずらし）
+
+verifier fan-out等の並列投げで固まって見えた事故（2026-09-24: 同一モデル3連の
+rate limitリトライ待ち＋無出力＋キャンセル不伝播）の対策：
+
+- **中断伝播**：MCP clientのキャンセルを子プロセス群に伝播しkillする。
+  取り消し後に裏で回り続ける事故を塞ぐ（`cancelled` で報告）
+- **heartbeat**：実行中30秒ごとにMCP loggingへ生存通知。「固まり」知覚を防ぐ
+- **delayMs**：起動ずらし（herd回避・opt-in、既定0で完全並列維持）
+- grace期間（SIGTERM→SIGKILL）は設定化（既定5秒）
+
 ## state の場所
 
 ```

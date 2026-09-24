@@ -161,3 +161,92 @@ describe("runChild", () => {
     expect(killed).toBe("SIGKILL");
   }, 15000);
 });
+
+describe("invoke 並列安全（中断・heartbeat・ずらし）", () => {
+  function hangProc(onKill?: (s: string) => void): SpawnFn {
+    return ((_cmd: string, _args: string[], _opts: unknown) => {
+      const p = new EventEmitter() as FakeProc;
+      p.pid = 999998;
+      p.stdout = new EventEmitter();
+      p.stderr = new EventEmitter();
+      (p as unknown as { kill: (s: string) => boolean }).kill = (s: string) => {
+        onKill?.(s);
+        return true;
+      };
+      return p as unknown as ChildProcess;
+    }) as SpawnFn;
+  }
+
+  test("abortでkillしcancelledで返す", async () => {
+    const kills: string[] = [];
+    const ac = new AbortController();
+    const p = runChild(
+      "opencode",
+      ["run"],
+      { timeoutMs: 5000, cwd: "/tmp", childEnv: {}, signal: ac.signal, killGraceMs: 20 },
+      hangProc((s) => kills.push(s)),
+    );
+    setTimeout(() => ac.abort(), 30);
+    const r = await p;
+    expect(r.cancelled).toBe(true);
+    expect(r.timedOut).toBe(false);
+    expect(r.output).toMatch("cancelled");
+    expect(kills).toContain("SIGTERM");
+  });
+
+  test("heartbeat tickが呼ばれる", async () => {
+    const ticks: number[] = [];
+    const ac = new AbortController();
+    const p = runChild(
+      "opencode",
+      ["run"],
+      {
+        timeoutMs: 5000,
+        cwd: "/tmp",
+        childEnv: {},
+        signal: ac.signal,
+        killGraceMs: 20,
+        heartbeatMs: 20,
+        onTick: (ms) => ticks.push(ms),
+      },
+      hangProc(),
+    );
+    setTimeout(() => ac.abort(), 70);
+    await p;
+    expect(ticks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("delayMsで起動がずれる", async () => {
+    const { invokeStructured } = await import("./invoke");
+    const t0 = Date.now();
+    const r = await invokeStructured(
+      { agent: "graphhopper-critic", prompt: "hi", root: "/tmp", delayMs: 80 },
+      okSpawn,
+    );
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(60);
+    expect(r.cancelled).toBe(false);
+    expect(r.output).toMatch("hello");
+  });
+
+  test("spawn前abortはspawnせずcancelled", async () => {
+    const { invokeStructured } = await import("./invoke");
+    const ac = new AbortController();
+    ac.abort();
+    let spawned = false;
+    const spy: SpawnFn = ((_c: string, _a: string[], _o: unknown) => {
+      spawned = true;
+      const p = new EventEmitter() as FakeProc;
+      p.pid = 1;
+      p.stdout = new EventEmitter();
+      p.stderr = new EventEmitter();
+      return p as unknown as ChildProcess;
+    }) as SpawnFn;
+    const r = await invokeStructured(
+      { agent: "graphhopper-critic", prompt: "hi", root: "/tmp" },
+      spy,
+      { signal: ac.signal },
+    );
+    expect(spawned).toBe(false);
+    expect(r.cancelled).toBe(true);
+  });
+});

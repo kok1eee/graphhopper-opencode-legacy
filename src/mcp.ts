@@ -484,6 +484,8 @@ interface ToolCtx {
   server: Server;
   /** CallTool ハンドラで解決済みの root（resolveRoot 済み） */
   root: string;
+  /** client中断（MCP extra.signal）。invoke等に伝播させる */
+  signal?: AbortSignal;
 }
 
 interface ToolOut {
@@ -1157,7 +1159,7 @@ const TOOL_DEFS: ToolDef[] = [
   {
     name: "graphhopper_invoke",
     description:
-      "別モデルでsubagent相当を実行する（design g-mu5d6avj）。opencode run をspawnし stdout を返す。入れ子禁止・prompt上限12000文字・timeout既定120s",
+      "別モデルでsubagent相当を実行する（design g-mu5d6avj）。opencode run をspawnし stdout を返す。入れ子禁止・prompt上限12000文字・timeout既定120s。並列fan-out可（中断伝播・heartbeat付き）。delayMsで起動ずらし可",
     inputSchema: {
       type: "object",
       properties: {
@@ -1165,6 +1167,7 @@ const TOOL_DEFS: ToolDef[] = [
         model: { type: "string", description: "provider/model形式。省略時はconfig既定" },
         prompt: { type: "string", description: "charter＋渡し物全文（12000文字まで）" },
         timeoutMs: { type: "number", description: "タイムアウトms（既定120000・上限300000）" },
+        delayMs: { type: "number", description: "起動前の待機ms（並列herd回避用。既定0・上限60000）" },
         root: ROOT_PROP,
       },
       required: ["agent", "prompt"],
@@ -1174,6 +1177,7 @@ const TOOL_DEFS: ToolDef[] = [
       model: z.string().optional(),
       prompt: z.string(),
       timeoutMs: z.number().optional(),
+      delayMs: z.number().optional(),
       root: rootZ,
     }),
     outputSchema: {
@@ -1181,20 +1185,44 @@ const TOOL_DEFS: ToolDef[] = [
       properties: {
         timedOut: { type: "boolean" },
         fallbackWarning: { type: "boolean" },
+        cancelled: { type: "boolean" },
       },
-      required: ["timedOut", "fallbackWarning"],
+      required: ["timedOut", "fallbackWarning", "cancelled"],
     },
     run: async (a, ctx) => {
-      const r = await invokeStructured({
-        agent: a.agent,
-        model: a.model,
-        prompt: a.prompt,
-        root: ctx.root,
-        timeoutMs: a.timeoutMs,
-      });
+      const r = await invokeStructured(
+        {
+          agent: a.agent,
+          model: a.model,
+          prompt: a.prompt,
+          root: ctx.root,
+          timeoutMs: a.timeoutMs,
+          delayMs: a.delayMs,
+        },
+        undefined,
+        {
+          signal: ctx.signal,
+          onTick: (elapsed) => {
+            // heartbeat: 長時間実行の固まり知覚を防ぐ（best-effort）
+            try {
+              void ctx.server.sendLoggingMessage({
+                level: "info",
+                logger: "graphhopper",
+                data: {
+                  tool: "graphhopper_invoke",
+                  agent: a.agent,
+                  runningSec: Math.round(elapsed / 1000),
+                },
+              });
+            } catch {
+              // 未対応 client では黙って捨てる
+            }
+          },
+        },
+      );
       return {
         text: r.output,
-        data: { timedOut: r.timedOut, fallbackWarning: r.fallbackWarning },
+        data: { timedOut: r.timedOut, fallbackWarning: r.fallbackWarning, cancelled: r.cancelled },
       };
     },
   },
@@ -1457,7 +1485,7 @@ export function createServer(): Server {
       ...(ANNOTATIONS[d.name] ? { annotations: ANNOTATIONS[d.name] } : {}),
     })),
   }));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const def = TOOL_DEFS.find((d) => d.name === req.params.name);
     if (!def) {
       return {
@@ -1473,8 +1501,9 @@ export function createServer(): Server {
       };
     }
     const root = await resolveRoot(server, (parsed.data as { root?: string }).root);
+    const ctx: ToolCtx = { server, root, signal: extra?.signal };
     try {
-      const out = await def.run(parsed.data, { server, root });
+      const out = await def.run(parsed.data, ctx);
       const res: {
         content: { type: "text"; text: string }[];
         structuredContent?: Record<string, unknown>;

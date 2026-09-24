@@ -138,7 +138,11 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
      - behavior: 「テストが実際のユーザーパスを検証しているか（モック過多・ハッピーパスのみ・エラー握り潰し）を疑え」
      - progress: 「変更がgoalに収束しているか（堂々巡り・残骸・goal無関係な混入）を見よ」
      時間短縮のため3体は**並列**に投げてよい（MCP駆動では graphhopper_invoke を3連並列。入れ子のみ禁止）。
-     charter定型文は MCP prompts（graphhopper-verifier-requirement/behavior/progress）にもある
+     charter定型文は MCP prompts（graphhopper-verifier-requirement/behavior/progress）にもある。
+     並列時の注意: 各invokeは独立 `opencode run`（自前server＋MCP付きの重い処理）のため、
+     同一モデル3連はprovider側rate limitのリトライ待ちになり得る。気になる場合は
+     `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
+     伝播してkillされる（取り消し後の裏回りなし）
   2. 各verifierに `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / diff（`jj diff --from <baseline>` または `git diff <baseline>`）を渡す。behavior charterでは診断証拠（型・lint実行結果）を要求する
   3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
   4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
