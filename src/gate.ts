@@ -196,3 +196,46 @@ export function designDocLockedRefusal(
     `Record decisions/rejected alternatives/progress in .graphhopper/plans/${goalId}.log.md instead (no gate on that path).`
   );
 }
+
+/* eval_cmd運用中のattempt二重計数への注意文（prose→codeの一歩目。
+ * 拒否ではなく注意に留める: attempt(ok:true)のリセットには意味があるため） */
+export const EVAL_MANAGED_NOTE =
+  "（note: eval_cmd設定中のためfail系はeval側でも計数される。evalかattemptのどちらかに寄せ、二重計上に注意せよ）";
+
+/* 単一driver警告（TUI bind中のgoalへの別session操作）。
+ * 拒否ではなく警告に留める: handoff等の正規フローがあるため */
+export function foreignBoundNote(boundId: string): string {
+  return (
+    `（note: goal は別session（${boundId}）にbind中。二重駆動に注意。` +
+    `意図的な引き継ぎなら session_id を指定して resume で bind し直せ）`
+  );
+}
+
+/* phase遷移前の機械チェック（plugin/MCP両callerで共有）。
+ * 通れば null、ダメならそのまま返す error 文。 */
+export function checkPhaseMove(
+  root: string,
+  to: state.Phase,
+): string | null {
+  const active = state.getActive(root);
+  if (!active) return "error: no active goal";
+  if (!state.isLegalPhaseTransition(active.state.phase, to)) {
+    return (
+      `error: 非法遷移 ${active.state.phase} -> ${to}。` +
+      `合法遷移: ${state.LEGAL_TRANSITIONS[active.state.phase].join(", ")}。` +
+      `doneへは graphhopper_goal(complete) のみ（verifier cleanガード付き）。`
+    );
+  }
+  if (
+    to === "implementing" &&
+    active.state.phase === "designing" &&
+    state.readConfig(root).require_critic &&
+    !active.state.critic_review
+  ) {
+    return (
+      "error: require_critic=true のため designing→implementing には critic_review 記録が必要。" +
+      "graphhopper_critic_set で記録してから遷移せよ（opt-in運用なら config で require_critic=false）。"
+    );
+  }
+  return null;
+}

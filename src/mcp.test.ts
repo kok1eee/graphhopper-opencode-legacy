@@ -98,6 +98,56 @@ describe("graphhopper-mcp goal往復", () => {
     await client.close();
   });
 
+  test("非法遷移は拒否（designing→done直指定）", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "legal test" });
+    const out = await call("graphhopper_phase", { phase: "done" });
+    expect(out).toContain("非法遷移");
+    await client.close();
+  });
+
+  test("別bind sessionの操作にはdriver警告", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "drv test", session_id: "sess-a" });
+    const out = await call("graphhopper_phase", { phase: "implementing", session_id: "sess-b" });
+    expect(out).toContain("phase -> implementing");
+    expect(out).toContain("別session");
+    // 同一sessionなら警告なし
+    const out2 = await call("graphhopper_phase", { phase: "polish", session_id: "sess-a" });
+    expect(out2).not.toContain("別session");
+    await client.close();
+  });
+
+  test("eval_cmd設定中のattempt(fail)には二重計数注意", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "managed test" });
+    await call("graphhopper_phase", { phase: "implementing" });
+    const plain = await call("graphhopper_attempt", { ok: false, note: "x" });
+    expect(plain).not.toContain("二重計上");
+    await call("graphhopper_set_eval", { cmd: "false" });
+    const managed = await call("graphhopper_attempt", { ok: false, note: "x" });
+    expect(managed).toContain("二重計上");
+    await client.close();
+  });
+
   test("discover start→tick", async () => {
     const client = await linked();
     const root = freshRoot();

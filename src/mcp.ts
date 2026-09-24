@@ -38,7 +38,13 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { PHASE_ACTION } from "./gate";
-import { designDocLockedRefusal, designGateRefusal } from "./gate";
+import {
+  checkPhaseMove,
+  designDocLockedRefusal,
+  designGateRefusal,
+  EVAL_MANAGED_NOTE,
+  foreignBoundNote,
+} from "./gate";
 import { readGraphhopperHash, runGraphhopperEdit } from "./gate";
 import * as state from "./state";
 import { invokeStructured } from "./invoke";
@@ -165,6 +171,8 @@ async function goalAction(
   opts: { title?: string; force?: boolean; server?: Server },
 ): Promise<string> {
   const { title, force, server } = opts;
+  // 単一driver警告は操作前に判定する（pause等でbindが変わる前の値を読む）
+  const drv = driverNote(root, sessionID);
   switch (action) {
     case "start": {
       if (!title) return "error: title is required for start";
@@ -180,7 +188,7 @@ async function goalAction(
     }
     case "pause": {
       const a = state.pauseGoal(root);
-      return a ? `paused: "${a.goal.title}"` : "no active goal";
+      return a ? `paused: "${a.goal.title}"${drv}` : "no active goal";
     }
     case "resume": {
       if (state.isResumeBlocked(root) && !force) {
@@ -239,21 +247,31 @@ async function goalAction(
       }
       const done = state.completeGoal(root);
       return done
-        ? `completed: "${done.goal.title}"${force ? " (forced)" : ""}`
+        ? `completed: "${done.goal.title}"${force ? " (forced)" : ""}${drv}`
         : "no active goal";
     }
     case "clear": {
       state.clearActiveGoal(root);
       state.unbindSession(root, sessionID);
-      return "cleared";
+      return `cleared${drv}`;
     }
   }
+}
+
+/* 単一driver警告: bind済みgoalへの別session操作。拒否ではなく警告に留める
+ * （handoff等の正規フローがあるため）。変異系toolの応答に付与する */
+function driverNote(root: string, sessionID: string): string {
+  const a = state.getActive(root);
+  const bound = a?.state.session_id;
+  if (bound && sessionID && sessionID !== bound) return `\n${foreignBoundNote(bound)}`;
+  return "";
 }
 
 function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
   const active = state.getActive(root);
   if (!active) return { text: "error: no active goal" };
   const r = state.recordAttempt(root, ok, note);
+  const managed = !ok && active.state.eval_cmd ? `\n${EVAL_MANAGED_NOTE}` : "";
   if (ok)
     return {
       text: "attempt recorded: ok (fail_streak reset to 0)",
@@ -272,7 +290,10 @@ function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
       text: [
         `attempt recorded: fail (fail_streak=${r.fail_streak})`,
         `giveUp: true — 連続失敗が上限に達したため goal を pause した。修正して graphhopper_goal(action: 'resume') で再開せよ（fail_streak は 0 に戻る）。`,
-      ].join("\n"),
+        managed,
+      ]
+        .filter(Boolean)
+        .join("\n"),
       data: { ok: false, failStreak: r.fail_streak, escalate: false, giveUp: true },
     };
   }
@@ -282,7 +303,10 @@ function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
         `attempt recorded: fail (fail_streak=${r.fail_streak})`,
         "escalate: true",
         "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行（何を試して何が起きたか）を渡すこと。",
-      ].join("\n"),
+        managed,
+      ]
+        .filter(Boolean)
+        .join("\n"),
       data: { ok: false, failStreak: r.fail_streak, escalate: true, giveUp: false },
     };
   }
@@ -293,12 +317,15 @@ function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
         `attempt recorded: fail (fail_streak=${r.fail_streak})`,
         `escalate: true (stuck: ${stuck.reasons.join(", ")})`,
         "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。",
-      ].join("\n"),
+        managed,
+      ]
+        .filter(Boolean)
+        .join("\n"),
       data: { ok: false, failStreak: r.fail_streak, escalate: true, giveUp: false },
     };
   }
   return {
-    text: `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false`,
+    text: `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false${managed}`,
     data: { ok: false, failStreak: r.fail_streak, escalate: false, giveUp: false },
   };
 }
@@ -577,6 +604,7 @@ const TOOL_DEFS: ToolDef[] = [
         phase: { type: "string", enum: [...state.PHASES] },
         notes: { type: "string", description: "中断・再開用メモ（どこまでやったか）" },
         root: ROOT_PROP,
+        session_id: SESSION_PROP,
       },
       required: ["phase"],
     },
@@ -584,6 +612,7 @@ const TOOL_DEFS: ToolDef[] = [
       phase: z.enum(state.PHASES),
       notes: z.string().optional(),
       root: rootZ,
+      session_id: sessionZ,
     }),
     outputSchema: {
       type: "object",
@@ -591,10 +620,12 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["ok"],
     },
     run: (a, ctx) => {
+      const rejected = checkPhaseMove(ctx.root, a.phase);
+      if (rejected) return { text: rejected };
       const r = state.setPhase(ctx.root, a.phase, a.notes);
       if (!r) return { text: "error: no active goal or invalid phase" };
       return {
-        text: `phase -> ${r.state.phase}\n次: ${PHASE_ACTION[r.state.phase]}`,
+        text: `phase -> ${r.state.phase}\n次: ${PHASE_ACTION[r.state.phase]}${driverNote(ctx.root, sessionOf(a.session_id))}`,
         data: { ok: true, phase: r.state.phase },
       };
     },
@@ -816,7 +847,8 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["target", "scope", "round"],
     },
     run: (a, ctx) => {
-      const s = state.startDiscover(ctx.root, a.target, a.scope);
+      const active = state.getActive(ctx.root);
+      const s = state.startDiscover(ctx.root, a.target, a.scope, active?.goal.id ?? null);
       return {
         text: [
           `discover started: target="${s.target}" scope="${s.scope}"`,
@@ -1026,7 +1058,7 @@ const TOOL_DEFS: ToolDef[] = [
         }
         const parsed = JSON.parse(out) as { path: string; sha1: string; size: number };
         return {
-          text: out,
+          text: `${out}${driverNote(root, sessionOf(a.session_id))}`,
           data: { ok: true, path: parsed.path, sha1: parsed.sha1, size: parsed.size },
         };
       } catch (e) {

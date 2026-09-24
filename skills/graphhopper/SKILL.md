@@ -27,7 +27,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **このフェーズではsource編集（Edit/Write）が `tool.execute.before` hookで物理ブロックされる**
   （許可パスは `.graphhopper/plans/` 配下のみ、`.graphhopper/config.json` の `design_gate_allow` で変更可）
 - 書けたら `task(subagent_type: "graphhopper-critic")` で**設計を1回敵対レビュー**する
-  （要件漏れ・設計の穴・スコープ逸脱を検出。安価モデル = 常設nodeなので毎goal必ず呼ぶ）
+  （要件漏れ・設計の穴・スコープ逸脱を検出。安価モデル = 常設nodeなので毎goal必ず呼ぶ。
+  `require_critic: true` のプロジェクトでは機械ゲート化され、未記録だと implementing 遷移が拒否される）
 - critic の指摘を design.md に反映してから `graphhopper_phase(phase: "implementing")`
 - 要件の公式doc裏付けが必要なら `task(subagent_type: "graphhopper-librarian")` を使う
   （researcherはコードベース事実収集に専念し、外部調査はlibrarianに委ねる）
@@ -57,7 +58,9 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   - 外部問いが内部findingsに依存するなら**直列**にする（researcherで対象ライブラリ・版を
     特定してからlibrarianにdocを引かせる。逆順・同時投げは版ズレの温床）
   - researcherは外部調査を自分でやらずlibrarian委譲を提案し、librarianは判断を含めない（境界の二重化）
-- **実装試行のたびに `graphhopper_attempt(ok, note)` を呼ぶ**（成否をコード側で機械カウントする）
+- **実装試行のたびに `graphhopper_attempt(ok, note)` を呼ぶ**（成否をコード側で機械カウントする）。
+  ただし **eval_cmd設定中はattemptを呼ばない**（idle/MCP-evalが自動記録するため二重計数になる。
+  手動の進捗メモが必要ならnoteに残す）。eval未設定時のみ自己申告フォールバックとして使う
   - `ok: false` が続き `fail_streak` が `stuck_threshold`（既定3）に達すると `escalate: true` が返る
   - `escalate: true` が返ったら `task(subagent_type: "graphhopper-oracle")` に相談する。これまでの
     失敗試行（何を試して何が起きたか）を渡し、助言を受けて別のアプローチで再試行する
@@ -150,6 +153,10 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **route=polishなのに「念のため」でverifier fan-outを省略しない**: router_checkの判定はコード側の機械測定。無条件発火だったcouncilの再発防止はここで担保されている
 - **simplify の diff を inline で subagent に渡さない**: main context を汚す。`/tmp/gh-simplify-diff.txt` に退避して path で渡す（agent は bash deny なので自分で diff は取れない）
 - **route=advisor なのに simplify を実行しない**: simplify は route=polish（大diff）のときだけの条件分岐 node。advisor（小diff）ではスキップが正しい。逆に polish で飛ばすのも禁止
+- **1 goal 1 driver**: TUI bind中のgoalをMCP等別sessionから操作すると警告が出る（二重駆動防止）。
+  意図的な引き継ぎなら session_id を指定して resume で bind し直す
+- **非法遷移は拒否される**: designing→implementing→polish→done のみ（polish→implementing巻き戻し可）。
+  特に `setPhase(done)` の直指定は不可（doneはverifier clean後のcompleteのみ）
 - **simplify で critical を自動適用して設計を変えない**: interface / signature / 公開 API の振る舞いを変える提案は high 扱いで人間に提示。勝手に直すと design レベルの変更になる
 - **simplify 適用後に eval_cmd を再実行しないで verifier に進まない**: critical 適用でコードが再変更されている。機械確認してから verifier を呼ぶ
 - **route=advisorだからverifier呼び出し自体を省略しない**: 「小diffだから自分で見れば十分」は禁止。`graphhopper_verifier_set`はresultsが空だと機械的にエラーを返す（self-graded完了防止のゲート）ので、必ず`task(graphhopper-verifier, charter: 'general')`を1回呼んでから記録する

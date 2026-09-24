@@ -208,6 +208,28 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - tool 実行後に logging 通知を転送（state 遷移系は info、それ以外は debug）。
   client 未対応でも tool 結果は壊さない
 
+### program-side flow（prose→code）
+
+会話上の規律だったものを機械に寄せたもの（taktのworkflow doctorの発想）：
+
+- **遷移合法性**：designing→implementing→polish→done のみ（polish→implementing巻き戻し可）。
+  `setPhase(done)` 直指定は拒否（doneはverifier clean後のcompleteのみ。self-graded doneの穴塞ぎ）
+- **critic gate**：`require_critic: true` で designing→implementing に critic 記録を要求。
+  既定 false（opt-in維持。ゲート化の是非未決のためflag両対応）
+- **attempt一本化**：eval_cmd設定中のattempt(fail)には二重計数の注意を付与（拒否ではなく注意）
+- **単一driver警告**：bind中goalへの別session操作に警告（拒否ではなく警告。handoff正規フローのため）
+- **discover紐付け**：開始時点のactive goalを記録し、lineageに載せる
+
+### outbox＋watch（durable通知）
+
+会話上の「終わったよ」ではなくプログラムが受け取れる通知：
+
+- `recordEvent` が curated種別（goal_complete / verifier_verdict / eval_gave_up /
+  loop_stopped）を `.graphhopper/outbox/<時刻>-<種別>-<goal>.json` に投下（上限100・古いものから刈る）
+- `bun src/watch.ts <root> -- <command>` で監視し、イベントごとにコマンド実行
+  （`GH_EVENT` / `GH_GOAL` / `GH_FILE` / `GH_ROOT` を環境変数で渡す）。試作
+- MCP logging は live補助線として継続（best-effort）。durable が outbox、live が logging の二層
+
 ### グラフ化の方向性（作業グラフ × コードグラフ）
 
 - `lineage.json`：goals＋history から goal 系譜を導出する仮想 resource。

@@ -29,8 +29,10 @@
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import { injectAgents } from "./agents";
 import {
+  checkPhaseMove,
   designDocLockedRefusal,
   designGateRefusal,
+  EVAL_MANAGED_NOTE,
   isGateTargetTool,
   PHASE_ACTION,
   PHASE_ACTION_SHORT,
@@ -385,6 +387,8 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             .describe("中断・再開用メモ（どこまでやったか）"),
         },
         async execute(args) {
+          const rejected = checkPhaseMove(root, args.phase);
+          if (rejected) return rejected;
           const a = state.setPhase(root, args.phase, args.notes);
           if (!a) return "error: no active goal or invalid phase";
           return `phase -> ${a.state.phase}\n次: ${PHASE_ACTION[a.state.phase]}`;
@@ -438,6 +442,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           const active = state.getActive(root);
           if (!active) return "error: no active goal";
           const r = state.recordAttempt(root, args.ok, args.note);
+          // eval_cmd運用中の二重計数への注意（prose→codeの一歩目。拒否ではなく注意）
+          const managed =
+            !args.ok && active.state.eval_cmd ? `\n${EVAL_MANAGED_NOTE}` : "";
           if (args.ok) return "attempt recorded: ok (fail_streak reset to 0)";
           // attempt 経路の giveUp も eval 経路と同型に pause + イベントまで
           // 配線する（通知 promptAsync は不要＝戻り値テキストで伝わる）。
@@ -453,14 +460,20 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             return [
               `attempt recorded: fail (fail_streak=${r.fail_streak})`,
               `giveUp: true — 連続失敗が上限に達したため goal を pause した。修正して graphhopper_goal(action: 'resume') で再開せよ（fail_streak は 0 に戻る）。`,
-            ].join("\n");
+              managed,
+            ]
+              .filter(Boolean)
+              .join("\n");
           }
           if (r.escalate) {
             return [
               `attempt recorded: fail (fail_streak=${r.fail_streak})`,
               "escalate: true",
               "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行（何を試して何が起きたか）を渡すこと。",
-            ].join("\n");
+              managed,
+            ]
+              .filter(Boolean)
+              .join("\n");
           }
           // 新信号でも同じ提案を出す（r.escalate 優先の else-if で重複回避）。
           // fail 時のみ。pause 等はしない提案文だけ。
@@ -470,9 +483,12 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               `attempt recorded: fail (fail_streak=${r.fail_streak})`,
               `escalate: true (stuck: ${stuck.reasons.join(", ")})`,
               "次: task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。",
-            ].join("\n");
+              managed,
+            ]
+              .filter(Boolean)
+              .join("\n");
           }
-          return `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false`;
+          return `attempt recorded: fail (fail_streak=${r.fail_streak})\nescalate: false${managed}`;
         },
       }),
 
@@ -637,7 +653,13 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             .describe("どこを探すか（パスglob、モジュール名）"),
         },
         async execute(args) {
-          const s = state.startDiscover(root, args.target, args.scope);
+          const active = state.getActive(root);
+          const s = state.startDiscover(
+            root,
+            args.target,
+            args.scope,
+            active?.goal.id ?? null,
+          );
           return [
             `discover started: target="${s.target}" scope="${s.scope}"`,
             "次: task(subagent_type: 'graphhopper-researcher') を broad-scan/semantic-read/edge-case の3charterで並列に呼び、",

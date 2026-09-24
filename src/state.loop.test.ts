@@ -3,7 +3,7 @@
  * bun test で実行する: `bun test src/state.loop.test.ts`
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,6 +21,7 @@ import {
   isDesignGateBlocked,
   isEchoMessage,
   isHumanTextPart,
+  isLegalPhaseTransition,
   isResumeBlocked,
   isToolRepeatLoop,
   isValidBaselineRev,
@@ -37,11 +38,17 @@ import {
   parseDiffShortstat,
   pauseGoal,
   readConfig,
+  readDiscover,
   readGoals,
+  readHistory,
   readState,
   recordAttempt,
+  recordEvent,
   resetLoopForClear,
   resumeGoal,
+  setCriticVerdict,
+  setPhase,
+  startDiscover,
   startGoal,
   stopLoopByPause,
   toolCallHash,
@@ -60,6 +67,7 @@ const CFG: GraphhopperConfig = {
   stuck_edit_repeat: 5,
   stuck_diff_stall: 4,
   lsp_servers: [],
+  require_critic: false,
 };
 
 function tmpRoot(): string {
@@ -1049,5 +1057,88 @@ describe("stuck集約と通知抑止", () => {
       lines: 10,
       stall: 0,
     });
+  });
+});
+
+describe("遷移合法性（program-side flow gate）", () => {
+  test("合法遷移表", () => {
+    expect(isLegalPhaseTransition("designing", "implementing")).toBe(true);
+    expect(isLegalPhaseTransition("implementing", "polish")).toBe(true);
+    expect(isLegalPhaseTransition("polish", "implementing")).toBe(true);
+    expect(isLegalPhaseTransition("polish", "done")).toBe(true);
+    expect(isLegalPhaseTransition("designing", "designing")).toBe(true);
+  });
+
+  test("非法遷移（*→done直指定・逆行）は拒否", () => {
+    expect(isLegalPhaseTransition("designing", "done")).toBe(false);
+    expect(isLegalPhaseTransition("implementing", "done")).toBe(false);
+    expect(isLegalPhaseTransition("implementing", "designing")).toBe(false);
+    expect(isLegalPhaseTransition("done", "implementing")).toBe(false);
+    expect(isLegalPhaseTransition("polish", "designing")).toBe(false);
+  });
+
+  test("setPhaseは非法遷移を拒否する（done抜け穴封じ）", () => {
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    expect(setPhase(root, "done")).toBeNull();
+    expect(setPhase(root, "polish")).toBeNull();
+    expect(setPhase(root, "implementing")?.state.phase).toBe("implementing");
+    expect(setPhase(root, "designing")).toBeNull();
+    expect(setPhase(root, "polish")?.state.phase).toBe("polish");
+    expect(setPhase(root, "implementing")?.state.phase).toBe("implementing");
+  });
+});
+
+describe("outbox（durable通知）", () => {
+  test("curated種別のみ投下・高頻度は対象外", () => {
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    recordEvent(root, { type: "attempt", goal: g.id, ok: false, fail_streak: 1, note: "x" });
+    recordEvent(root, { type: "goal_complete", goal: g.id });
+    const files = readdirSync(join(root, ".graphhopper", "outbox"));
+    expect(files.length).toBe(1);
+    expect(files[0]).toContain("goal_complete");
+  });
+
+  test("readHistoryで読める", () => {
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    recordEvent(root, { type: "goal_complete", goal: g.id });
+    const h = readHistory(root);
+    expect(h.some((e) => e.type === "goal_complete")).toBe(true);
+  });
+});
+
+describe("discover goal紐付け", () => {
+  test("開始時点のactive goalが載る・lineageに載る", async () => {
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    const d = startDiscover(root, "t", "s");
+    expect(d.goal_id).toBeNull();
+    const d2 = startDiscover(root, "t2", "s2", g.id);
+    expect(d2.goal_id).toBe(g.id);
+    expect(readDiscover(root)?.goal_id).toBe(g.id);
+    const { buildLineage } = await import("./state");
+    expect(buildLineage(root).discover?.goal_id).toBe(g.id);
+  });
+});
+
+describe("critic gate（flag両対応）", () => {
+  test("既定falseでは素通り・trueではcritic必須", async () => {
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    // 既定configはrequire_critic=false（このrepoのconfig.jsonもfalseのはずだが
+    // テストrootにはconfigが無い→DEFAULT false）
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+    // trueに倒す
+    writeFileSync(
+      join(root, ".graphhopper", "config.json"),
+      JSON.stringify({ require_critic: true }),
+    );
+    const err = checkPhaseMove(root, "implementing");
+    expect(err).toContain("require_critic");
+    setCriticVerdict(root, { level: "clean", reason: "ok" });
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
   });
 });

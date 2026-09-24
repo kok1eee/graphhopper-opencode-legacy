@@ -19,8 +19,10 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -180,6 +182,9 @@ export interface GraphhopperConfig {
   stuck_diff_stall: number;
   /** 追加LSP server定義（design g-mu5atclj D4）。同extensionsはbuiltinを上書き、未知は追記 */
   lsp_servers: { command: string; args: string[]; extensions: string[] }[];
+  /** trueで designing→implementing 遷移に critic_review 記録を要求する。
+   * 既定 false（opt-in維持。ゲート化の是非は未決のためflagで両対応） */
+  require_critic: boolean;
 }
 
 export const DEFAULT_CONFIG: GraphhopperConfig = {
@@ -195,6 +200,7 @@ export const DEFAULT_CONFIG: GraphhopperConfig = {
   stuck_edit_repeat: 5,
   stuck_diff_stall: 4,
   lsp_servers: [],
+  require_critic: false,
 };
 
 function dir(root: string): string {
@@ -303,11 +309,61 @@ export type HistoryEvent =
 export function recordEvent(root: string, event: HistoryEvent): void {
   try {
     mkdirSync(dir(root), { recursive: true });
-    const line =
-      JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n";
+    const record = { ts: new Date().toISOString(), ...event };
+    const line = JSON.stringify(record) + "\n";
     appendFileSync(historyPath(root), line, "utf8");
+    writeOutbox(root, record);
   } catch {
     // 履歴書き込み失敗でループを止めない
+  }
+}
+
+/* ================================================================== *
+ * outbox（durable通知）: プログラムが受け取れる完了・異常通知。
+ * 会話上の「終わったよ」ではなくファイルで受け取る。watcher試作が読む。
+ * curated種別のみ投下し、上限超は古いものから刈る。失敗しても本線を壊さない。
+ * ================================================================== */
+
+const OUTBOX_KEEP = 100;
+
+/** outboxに投下する種別（完了・drift・諦め・停止のみ。attempt等の高頻度は対象外） */
+const OUTBOX_EVENTS: ReadonlySet<string> = new Set([
+  "goal_complete",
+  "verifier_verdict",
+  "eval_gave_up",
+  "loop_stopped",
+]);
+
+function outboxPath(root: string): string {
+  return join(dir(root), "outbox");
+}
+
+function writeOutbox(
+  root: string,
+  record: { ts: string; type: string; goal?: unknown },
+): void {
+  try {
+    if (!OUTBOX_EVENTS.has(record.type)) return;
+    mkdirSync(outboxPath(root), { recursive: true });
+    const stamp = record.ts.replace(/[:.]/g, "-");
+    const goal = typeof record.goal === "string" ? record.goal : "nogoal";
+    writeFileSync(
+      join(outboxPath(root), `${stamp}-${record.type}-${goal}.json`),
+      JSON.stringify(record, null, 2) + "\n",
+      "utf8",
+    );
+    const files = readdirSync(outboxPath(root))
+      .filter((f) => f.endsWith(".json"))
+      .sort();
+    for (const f of files.slice(0, Math.max(0, files.length - OUTBOX_KEEP))) {
+      try {
+        unlinkSync(join(outboxPath(root), f));
+      } catch {
+        // 刈り取り失敗は無視
+      }
+    }
+  } catch {
+    // outbox失敗で本線を壊さない
   }
 }
 
@@ -362,6 +418,7 @@ export function readConfig(root: string): GraphhopperConfig {
     stuck_diff_stall:
       raw.stuck_diff_stall ?? DEFAULT_CONFIG.stuck_diff_stall,
     lsp_servers: raw.lsp_servers ?? DEFAULT_CONFIG.lsp_servers,
+    require_critic: raw.require_critic ?? DEFAULT_CONFIG.require_critic,
   };
 }
 
@@ -581,6 +638,22 @@ export function resetLoopForClear(root: string): void {
   });
 }
 
+/* 遷移合法性表（takt workflow doctorの発想の機械版）。
+ * - 同一phaseは許可（notes更新等の無遷移呼び出しのため）
+ * - polish→implementingのみ巻き戻し可（verifier driftの行き先）
+ * - *→doneは不可: doneはcompleteGoal（verifier cleanガード付き）のみ。
+ *   clearActiveGoalはstate直書きのためこの表の対象外 */
+export const LEGAL_TRANSITIONS: Record<Phase, Phase[]> = {
+  designing: ["designing", "implementing"],
+  implementing: ["implementing", "polish"],
+  polish: ["polish", "implementing", "done"],
+  done: ["done"],
+};
+
+export function isLegalPhaseTransition(from: Phase, to: Phase): boolean {
+  return (LEGAL_TRANSITIONS[from] ?? []).includes(to);
+}
+
 export function setPhase(
   root: string,
   phase: Phase,
@@ -588,6 +661,10 @@ export function setPhase(
 ): ActiveLoop | null {
   if (!PHASES.includes(phase)) return null;
   const before = getActive(root);
+  // 遷移合法性（takt workflow doctorの発想の機械版）。
+  // 特に *→done の直指定を塞ぐ: doneはcomplete（verifier cleanガード付き）のみ。
+  // setPhase(done)で抜けるとgoalがactiveのままloopだけ止まるself-graded doneの穴になる。
+  if (before && !isLegalPhaseTransition(before.state.phase, phase)) return null;
   const r = mutateActive(root, () => ({
     // phaseが変わるたびfail系・stuck系カウンタをリセット
     // （implementingに戻ってきた時も0から数え直す。巻き戻し直後のインフレ防止）
@@ -1503,6 +1580,8 @@ export interface DiscoverState {
   }[];
   stopped_reason: "dry" | "max_rounds" | null;
   started_at: string;
+  /** 紐付く goal（開始時点の active。無ければ null）。lineage が載せる */
+  goal_id: string | null;
 }
 
 function discoverPath(root: string): string {
@@ -1513,6 +1592,7 @@ export function startDiscover(
   root: string,
   target: string,
   scope: string,
+  goalId: string | null = null,
 ): DiscoverState {
   const s: DiscoverState = {
     target,
@@ -1523,6 +1603,7 @@ export function startDiscover(
     confirmed: [],
     stopped_reason: null,
     started_at: new Date().toISOString(),
+    goal_id: goalId,
   };
   atomicWrite(discoverPath(root), s);
   return s;
@@ -1621,7 +1702,10 @@ export interface GoalLineage {
   routerChecks: { diff_lines: number; route: RouterRoute }[];
 }
 
-export function buildLineage(root: string): { goals: GoalLineage[] } {
+export function buildLineage(root: string): {
+  goals: GoalLineage[];
+  discover: DiscoverState | null;
+} {
   const stored = readGoals(root);
   const byId = new Map<string, GoalLineage>();
   for (const g of stored.goals) {
@@ -1699,5 +1783,5 @@ export function buildLineage(root: string): { goals: GoalLineage[] } {
         break;
     }
   }
-  return { goals: [...byId.values()] };
+  return { goals: [...byId.values()], discover: readDiscover(root) };
 }

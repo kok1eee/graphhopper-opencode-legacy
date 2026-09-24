@@ -40,6 +40,7 @@ const CFG: GraphhopperConfig = {
   stuck_edit_repeat: 5,
   stuck_diff_stall: 4,
   lsp_servers: [],
+  require_critic: false,
 };
 
 describe("hashedit", () => {
