@@ -36,7 +36,9 @@ import {
   EVAL_MANAGED_NOTE,
   isGateTargetTool,
   PHASE_ACTION,
+  PHASE_ACTION_BRIEF,
   PHASE_ACTION_SHORT,
+  PONYTAIL_BRIEF,
   readGraphhopperHash,
   runGraphhopperEdit,
 } from "./gate";
@@ -93,6 +95,10 @@ const MAX_FETCH_CHARS = 2_000_000;
 const SAMPLING_EVERY = 10;
 let oversizeSticky = false;
 let idleTick = 0;
+/* system注入節約用の記憶スロット（phase指示・ponytail各1）。
+ * state汚染回避のためモジュール変数。再起動・compact後は消失しfull再送（安全側） */
+let lastPhaseGuideKey: string | null = null;
+let lastPonytailKey: string | null = null;
 
 /** メッセージの生成時刻（欠損時は 0）。取得順の正規化用 */
 function msgTime(m: state.SessionMessageLike): number {
@@ -159,6 +165,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       // continuation（user向け表示）はSHORT要約のみ。LLM向けの詳細指示は
       // ここで system prompt に注入する（design g-mtwhdb4t）。PONYTAILゲートと
       // 同型の4条件 + phase!=="done"（done後はcontinuation自体が発火しないため不要）。
+      // 節約: 同一(session, goal, phase)の2回目以降は短縮版。fullはentry初回のみ。
+      // hard制約はコード側ゲートが担うため文面短縮は安全性を下げない。
+      // 再起動・compact後はマーカー消失でfullに戻る（安全側）。
       if (
         active &&
         active.goal.status === "active" &&
@@ -166,9 +175,17 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         input.sessionID &&
         input.sessionID === active.state.session_id
       ) {
-        output.system.push(
-          `## graphhopper 次のアクション（詳細）\n\n${PHASE_ACTION[active.state.phase]}`,
-        );
+        const key = `${input.sessionID}:${active.goal.id}:${active.state.phase}`;
+        if (lastPhaseGuideKey === key) {
+          output.system.push(
+            `## graphhopper 次のアクション\n\n${PHASE_ACTION_BRIEF[active.state.phase]}`,
+          );
+        } else {
+          lastPhaseGuideKey = key;
+          output.system.push(
+            `## graphhopper 次のアクション（詳細）\n\n${PHASE_ACTION[active.state.phase]}`,
+          );
+        }
       }
 
       if (
@@ -178,7 +195,15 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         input.sessionID &&
         input.sessionID === active.state.session_id
       ) {
-        output.system.push(PONYTAIL_RULES);
+        // ponytail も同型の節約（初回full→以降1行。毎ターン約950 tokens削減）。
+        // phase指示とは別スロットで記憶する（共有すると交互にfull再送になる）
+        const pkey = `${input.sessionID}:${active.goal.id}`;
+        if (lastPonytailKey === pkey) {
+          output.system.push(PONYTAIL_BRIEF);
+        } else {
+          lastPonytailKey = pkey;
+          output.system.push(PONYTAIL_RULES);
+        }
       }
     },
 

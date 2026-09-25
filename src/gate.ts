@@ -37,6 +37,20 @@ export const PHASE_ACTION_SHORT: Record<state.Phase, string> = {
   done: "goalをcompleteする",
 };
 
+/* system注入の短縮版（2回目以降のターン用）。hard制約のみ残す。
+ * 強制力はコード側ゲートが担うため、文面短縮は安全性を下げない。
+ * ponytail短縮行と対で使う */
+export const PHASE_ACTION_BRIEF: Record<state.Phase, string> = {
+  designing: "design.mdを書け。source編集不可（plans/のみ）。詳細は初回指示参照",
+  implementing: "実装続行。eval設定済みなら自動判定。詰まったらoracle",
+  polish: "router→verifier必須（verifier_set記録）。自己レビュー完結不可",
+  done: "goalをcompleteする",
+};
+
+/** ponytail短縮行（implementing 2ターン目以降用） */
+export const PONYTAIL_BRIEF =
+  "ponytail継続適用: YAGNI・怠惰原則（詳細は初回注入参照）。interface変更はhigh扱いで人間に提示";
+
 /* design gate・信号A計数の対象tool（D2a/D2b）。before/after両hookで共有する
  * 単一の真実源。3名のいずれかが漏れると新tool経由でgate/stuck検知が
  * バイパスされるため、hashedit.test.tsで機械検証する。 */
