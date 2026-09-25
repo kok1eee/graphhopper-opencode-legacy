@@ -369,3 +369,59 @@ describe("runGraphhopperEdit統合経路（分岐→アクション対応）", (
     expect(readFileSync(bin)).toEqual(before);
   });
 });
+
+describe("continuationText 3段階文面", () => {
+  const base = {
+    goal_id: "g-1",
+    session_id: "s",
+    phase: "polish",
+    notes: "",
+    router: { baseline_rev: null, diff_lines: null, route: null, checked_at: null },
+    last_verifier: null,
+    critic_review: null,
+    fail_streak: 0,
+    eval_cmd: null,
+    last_continuation_marker: null,
+    last_eval_fingerprint: null,
+    loop_streak: 0,
+    loop_stopped: false,
+    loop_stop_count: 0,
+    edit_file: null,
+    edit_streak: 0,
+    last_diff_lines: null,
+    diff_stall: 0,
+    last_stuck_reasons: [],
+    updated_at: "",
+  } as const;
+  const goal = { id: "g-1", title: "t", status: "active", created_at: "", done_at: null } as const;
+
+  test("hand-back待ちは短い", async () => {
+    const { continuationText } = await import("./gate");
+    const out = continuationText(goal, {
+      ...base,
+      last_verifier: { level: "drift", reason: "r".repeat(500), target: "design", lens: [], at: "" },
+    } as never);
+    expect(out).toContain("hand-back");
+    expect(out.split("\n").length).toBeLessThanOrEqual(4);
+    expect(out).toContain("…");
+  });
+
+  test("静穏時は最小", async () => {
+    const { continuationText } = await import("./gate");
+    const out = continuationText(goal, { ...base } as never);
+    expect(out.split("\n").length).toBeLessThanOrEqual(3);
+    expect(out).not.toContain("eval_cmd");
+  });
+
+  test("通常時は丸めあり", async () => {
+    const { continuationText } = await import("./gate");
+    const out = continuationText(goal, {
+      ...base,
+      eval_cmd: "x".repeat(300),
+      fail_streak: 2,
+    } as never);
+    expect(out).toContain("fail_streak: 2");
+    expect(out).toContain("…");
+    expect(out.length).toBeLessThan(900);
+  });
+});

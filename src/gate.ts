@@ -311,3 +311,58 @@ export function checkPhaseMove(
   }
   return null;
 }
+
+/* continuation文面の単一源泉（plugin idle注入用）。長いという指摘に応え、
+ * 状態で3段階に変える（hand-back待ち/静穏時/通常）。長いフィールドは丸める。
+ * 詳細は graphhopper_status / resources で引けるため、注入文は喚起に徹する */
+const TRUNC_EVAL_CMD = 120;
+const TRUNC_REASON = 200;
+
+function trunc(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+export function continuationText(goal: state.Goal, s: state.LoopState): string {
+  const head = `[graphhopper] Goal: "${goal.title}" | phase: ${s.phase}`;
+  const notes = s.notes ? `notes: ${s.notes}` : null;
+  const v = s.last_verifier;
+  // hand-back待ち（drift→design/requirements）: 要旨のみ。詳細はstatusで
+  if (v && v.level === "drift" && v.target && v.target !== "implementing") {
+    return [
+      head,
+      `→ 人間の hand-back 待ち (drift -> ${v.target})`,
+      trunc(v.reason, TRUNC_REASON),
+      notes,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  const busy = s.fail_streak > 0 || v || s.router.route || s.eval_cmd;
+  // 静穏時（進捗も異常もなし）: 最小表示
+  if (!busy) {
+    return [
+      head,
+      notes,
+      `Next: ${PHASE_ACTION_SHORT[s.phase]}`,
+      "フェーズのexit条件を満たしたら graphhopper_phase で遷移する。",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  // 通常: 現行項目＋長いフィールドは丸める
+  return [
+    head,
+    notes,
+    s.eval_cmd ? `eval_cmd: ${trunc(s.eval_cmd, TRUNC_EVAL_CMD)}` : null,
+    s.router.route
+      ? `router: route=${s.router.route} diff_lines=${s.router.diff_lines}`
+      : null,
+    v ? `last_verifier: ${v.level} (${trunc(v.reason, TRUNC_REASON)})` : null,
+    s.fail_streak > 0 ? `fail_streak: ${s.fail_streak}` : null,
+    `Next: ${PHASE_ACTION_SHORT[s.phase]}`,
+    "フェーズのexit条件を満たしたら graphhopper_phase で遷移する。",
+    "ブロックしたら回らずに理由を述べて停止。完了したら graphhopper_goal(complete)。無駄な空転は禁止。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}

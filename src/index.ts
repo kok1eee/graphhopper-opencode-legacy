@@ -30,6 +30,7 @@ import { tool, type Plugin } from "@opencode-ai/plugin";
 import { injectAgents } from "./agents";
 import {
   checkPhaseMove,
+  continuationText,
   designDocLockedRefusal,
   designGateRefusal,
   EVAL_MANAGED_NOTE,
@@ -100,25 +101,7 @@ function msgTime(m: state.SessionMessageLike): number {
   return typeof t === "number" ? t : 0;
 }
 
-function continuationText(goal: state.Goal, s: state.LoopState): string {
-  return [
-    `[graphhopper] Goal: "${goal.title}" | phase: ${s.phase}`,
-    s.notes ? `notes: ${s.notes}` : null,
-    s.eval_cmd ? `eval_cmd: ${s.eval_cmd}` : null,
-    s.router.route
-      ? `router: route=${s.router.route} diff_lines=${s.router.diff_lines}`
-      : null,
-    s.last_verifier
-      ? `last_verifier: ${s.last_verifier.level} (${s.last_verifier.reason})`
-      : null,
-    s.fail_streak > 0 ? `fail_streak: ${s.fail_streak}` : null,
-    `Next: ${PHASE_ACTION_SHORT[s.phase]}`,
-    "フェーズのexit条件を満たしたら graphhopper_phase で遷移する。",
-    "ブロックしたら回らずに理由を述べて停止。完了したら graphhopper_goal(complete)。無駄な空転は禁止。",
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
+/* NOTE: continuationText は ./gate.ts が単一源泉（3段階文面） */
 
 function resolveFilePath(args: unknown): string | undefined {
   if (!args || typeof args !== "object" || Array.isArray(args))
