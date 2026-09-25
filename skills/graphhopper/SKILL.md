@@ -144,6 +144,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
      `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
      伝播してkillされる（取り消し後の裏回りなし）。
      推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
+- **二予算逐次使い切り**: verifier/criticはxiaomi枠を使い切るまでmimo-flash。
+  枯渇・rate limit時は `model: "claude-oauth/claude-sonnet-5"` で再投（Max共有枠のため常時sonnetにはしない）
 - **diff肥大は検証コスト3倍**: polish routeは3lensが全差分を読む。748行級は1回で3×748行の
   コンテキスト消費。goalを小さく切ってadvisor（verifier×1）に収めるのが最大の節約。
   巻き戻しはさらに3倍するので、criticで初回品質を上げることも節約になる
