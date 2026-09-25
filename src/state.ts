@@ -42,6 +42,18 @@ export interface Goal {
   done_at: string | null;
   /** complete時の機械採点（B）。内訳付き・後方互換のためoptional */
   score?: GoalScore | null;
+  /** pause時の文脈スナップショット。別goal走行後のresumeで自文脈に復帰するため */
+  paused_snapshot?: GoalSnapshot | null;
+}
+
+/** pause時に退避するgoal固有文脈（単一LoopStateの使い回しによる漏れ対策） */
+export interface GoalSnapshot {
+  phase: Phase;
+  router: RouterState;
+  last_verifier: VerifierVerdict | null;
+  critic_review: CriticVerdict | null;
+  eval_cmd: string | null;
+  notes: string;
 }
 
 /** goal出来栄えの機械採点。式はv1で固定し、breakdownで透明化する（調整は式ごと変える） */
@@ -610,8 +622,20 @@ function mutateActive(
 }
 
 export function pauseGoal(root: string): ActiveLoop | null {
-  const r = mutateActive(root, () => ({
-    goal: { status: "paused" },
+  const r = mutateActive(root, (goal, state) => ({
+    // pause時にgoal固有文脈をスナップショットする。単一LoopStateを使い回すため、
+    // 別goalが走った後のresumeでphase/router/verifierが漏れる事故を防ぐ
+    goal: {
+      status: "paused",
+      paused_snapshot: {
+        phase: state.phase,
+        router: state.router,
+        last_verifier: state.last_verifier,
+        critic_review: state.critic_review,
+        eval_cmd: state.eval_cmd,
+        notes: state.notes,
+      },
+    },
     // 人間による明示的な操作なのでloop停止フラグも解除（pause自体が駆動を止める）
     state: { loop_streak: 0, loop_stopped: false },
   }));
@@ -626,23 +650,38 @@ export function resumeGoal(
 ): ActiveLoop | null {
   // 恒久ブロック: loop_stop_max に達したら通常resumeを拒否（forceで明示解除のみ）
   if (isResumeBlocked(root) && !force) return null;
-  const r = mutateActive(root, () => ({
-    goal: { status: "active" },
-    // pause→人間修正→resume の運用で eval リトライ・stuck 信号を数え直すため
-    // fail_streak・stuck系も戻す（loop 停止からの resume でも escalate は再カウント）。
-    // loop_stop_count（恒久ブロック予算）は維持する
-    state: {
-      session_id: sessionID,
-      loop_streak: 0,
-      loop_stopped: false,
-      fail_streak: 0,
-      edit_file: null,
-      edit_streak: 0,
-      last_diff_lines: null,
-      diff_stall: 0,
-      last_stuck_reasons: [],
-    },
-  }));
+  const r = mutateActive(root, (goal) => {
+    const snap = goal.paused_snapshot;
+    return {
+      goal: { status: "active" },
+      // pause→人間修正→resume の運用で eval リトライ・stuck 信号を数え直すため
+      // fail_streak・stuck系も戻す（loop 停止からの resume でも escalate は再カウント）。
+      // loop_stop_count（恒久ブロック予算）は維持する
+      state: {
+        goal_id: goal.id,
+        session_id: sessionID,
+        loop_streak: 0,
+        loop_stopped: false,
+        fail_streak: 0,
+        edit_file: null,
+        edit_streak: 0,
+        last_diff_lines: null,
+        diff_stall: 0,
+        last_stuck_reasons: [],
+        // 別goalが走った後のresumeでも自goalの文脈に戻す（snapshotが無ければ現状維持）
+        ...(snap
+          ? {
+              phase: snap.phase,
+              router: snap.router,
+              last_verifier: snap.last_verifier,
+              critic_review: snap.critic_review,
+              eval_cmd: snap.eval_cmd,
+              notes: snap.notes,
+            }
+          : {}),
+      },
+    };
+  });
   if (r) {
     recordEvent(root, { type: "goal_resume", goal: r.goal.id });
     if (force) {

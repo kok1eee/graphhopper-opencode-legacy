@@ -1299,3 +1299,40 @@ describe("scoreboard hints（提案のみ・ガード付き）", () => {
     void g;
   });
 });
+
+describe("pause/resumeスナップショット（goal切替の文脈漏れ対策）", () => {
+  test("pauseで文脈保存→別goal走行→resumeで復帰", async () => {
+    const { pauseGoal, resumeGoal, startGoal, setPhase, setEvalCmd, getActive } = await import("./state");
+    const root = tmpRoot();
+    const g1 = startGoal(root, "first", "s1").goal;
+    setPhase(root, "implementing");
+    setEvalCmd(root, "make test");
+    pauseGoal(root);
+    // 別goalが走る（stateは上書きされる）
+    startGoal(root, "second", "s2");
+    setPhase(root, "polish");
+    // g1に戻す
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const p = join(root, ".graphhopper", "goals.json");
+    const gj = JSON.parse(readFileSync(p, "utf8"));
+    gj.active = g1.id;
+    writeFileSync(p, JSON.stringify(gj));
+    const r = resumeGoal(root, "s1");
+    expect(r?.goal.id).toBe(g1.id);
+    const a = getActive(root)!;
+    expect(a.state.goal_id).toBe(g1.id);
+    expect(a.state.phase).toBe("implementing");
+    expect(a.state.eval_cmd).toBe("make test");
+    expect(a.state.session_id).toBe("s1");
+  });
+
+  test("snapshot無しのresumeは現状維持（後方互換）", async () => {
+    const { resumeGoal, startGoal, getActive } = await import("./state");
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    const r = resumeGoal(root, "s2");
+    expect(r?.state.phase).toBe("designing");
+    expect(getActive(root)?.state.session_id).toBe("s2");
+  });
+});
