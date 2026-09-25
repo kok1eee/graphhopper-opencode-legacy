@@ -142,7 +142,11 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
      並列時の注意: 各invokeは独立 `opencode run`（自前server＋MCP付きの重い処理）のため、
      同一モデル3連はprovider側rate limitのリトライ待ちになり得る。気になる場合は
      `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
-     伝播してkillされる（取り消し後の裏回りなし）
+     伝播してkillされる（取り消し後の裏回りなし）。
+     推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
+- **diff肥大は検証コスト3倍**: polish routeは3lensが全差分を読む。748行級は1回で3×748行の
+  コンテキスト消費。goalを小さく切ってadvisor（verifier×1）に収めるのが最大の節約。
+  巻き戻しはさらに3倍するので、criticで初回品質を上げることも節約になる
   2. 各verifierに `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / diff（`jj diff --from <baseline>` または `git diff <baseline>`）を渡す。behavior charterでは診断証拠（型・lint実行結果）を要求する
   3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
   4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
