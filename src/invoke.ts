@@ -92,12 +92,6 @@ export interface InvokeResult {
   output: string;
   timedOut: boolean;
   fallbackWarning: boolean;
-}
-
-export interface InvokeResult {
-  output: string;
-  timedOut: boolean;
-  fallbackWarning: boolean;
   /** clientキャンセルでkillしたか（並列fan-outの取り消し漏れ防止） */
   cancelled: boolean;
 }

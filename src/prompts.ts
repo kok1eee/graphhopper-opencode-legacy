@@ -22,13 +22,15 @@ export const VERSION_GUARD_RULE = [
 export const PARALLEL_NOTE =
   "3 lens は graphhopper_invoke で並列に投げてよい（invoke は多重起動可・入れ子のみ禁止）。結果を集めて graphhopper_verifier_set に記録する。";
 
-export interface PromptArgDef {
+/* PromptArgDef/PromptDef は prompts.ts 内のみで使用（公開面は PROMPT_DEFS）。
+ * 将来の外部利用に備え型自体は残すが export はしない */
+interface PromptArgDef {
   name: string;
   description: string;
   required?: boolean;
 }
 
-export interface PromptDef {
+interface PromptDef {
   name: string;
   description: string;
   arguments: PromptArgDef[];

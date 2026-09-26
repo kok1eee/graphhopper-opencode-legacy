@@ -32,9 +32,17 @@ Claude Codeのshell hook（PreToolUse/Stop）に相当する仕組みが無い�
 ```
 graphhopper-opencode/
 ├── src/
-│   ├── index.ts   — プラグイン本体（tool.execute.before + event + 8 tool）
+│   ├── index.ts   — プラグイン本体（tool.execute.before + event + 15 tool）
 │   ├── state.ts   — .graphhopper/ 配下の state 管理（atomic write）
-│   └── agents.ts  — 2 subagent 定義（config hook で注入）
+│   ├── gate.ts    — helper・定数の単一源泉（entryは関数exportのみの制約対応）
+│   ├── mcp.ts     — MCPブリッジ（17 tool＋resources/prompts。API経由セッション用）
+│   ├── agents.ts  — 6 subagent 定義（config hook で注入）
+│   ├── prompts.ts — MCP prompts charter定型文の単一源泉（8件）
+│   ├── invoke.ts  — graphhopper_invoke（opencode run spawn・中断伝播・heartbeat）
+│   ├── watch.ts   — outbox監視（--notifyでmacOS通知）
+│   ├── hashedit.ts — hash検証付きeditの純粋関数
+│   ├── ponytail-rules.ts — ponytailルール本文（vendored）
+│   └── lsp/       — LSP transplant（diagnostics/hover/definition等の照会）
 ├── skills/
 │   ├── graphhopper/ — メインのdesigning/implementing/polishループ
 │   └── discover/    — loop-until-dry 探索（phase graphの外、オンデマンド）
@@ -58,6 +66,10 @@ graphhopper-opencode/
 | `graphhopper_diff_stash` | verifier fan-out用にdiffを/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
 | `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート） |
 | `graphhopper_set_eval` | implementingの合否判定コマンド（本体のeval_cmd相当）を設定。設定後はターン終了ごと自動実行され、pass=polish自動遷移／fail=fail_streak機械カウント |
+| `graphhopper_attempt` | 実装試行の成否を記録（eval_cmd未設定時の自己申告フォールバック。連続失敗でescalate→oracle相談） |
+| `graphhopper_eval` | eval_cmdを明示実行（MCPのみ。pluginはsession.idleで自動実行） |
+| `graphhopper_hash` / `graphhopper_edit` | hash検証付きedit（goal中のsource編集用。read→sha1検証→単一箇所exact-match） |
+| `graphhopper_scoreboard` | モデル別verdict集計＋goal転帰＋hints（評価機能A） |
 | `graphhopper_discover_start` / `_tick` / `_clear` | loop-until-dry 探索（round cap/dedupeをtool側で強制） |
 | `graphhopper_critic_set` | designing終了前のdesign.md質レビュー結果（clean/drift）を記録する。opt-in・ハードゲート無し（`graphhopper_phase`の前提条件にはしない） |
 | `graphhopper_handoff` | 現在の goal 状態を要約して別の opencode セッションへ引き継ぎ送信。送信後は送信側が goal から解放（pause + unbind）。`session_id` 未指定なら候補セッションを列挙（送信しない）。受け手は `graphhopper_resume` で引き継ぐ |
@@ -125,6 +137,8 @@ lens空を拒否するため、diffサイズに関わらず最低1回のverifier
 - 注意: `graphhopper_phase(implementing)` を呼ぶターン自体には注入されず、次ターンから有効。
   逆も同様で、`graphhopper_phase(polish)` を呼ぶターンは phase がまだ implementing のため注入されたまま
   （prompt-time ゲートの構造的必然。影響は遷移ターンの1回のみ）。
+- 節約: 同一(session, goal)の2回目以降は短縮1行のみ注入（初回full→以降brief。hard制約は
+  コード側ゲートのため安全性不変。再起動・compact後はfull再送）。
 
 ## handoff（別セッションへの引き継ぎ）
 
@@ -143,8 +157,8 @@ plugin tool は opencode ランタイム内のセッションにしか配膳さ�
 セッション（`default.*` toolset）には届かない。MCP だけが両方に届く実証済みの道のため、
 `src/mcp.ts` が state 操作を MCP tool（stdio）として公開する:
 
-- plugin と同名・同-semantics の 13 tool（`graphhopper_goal`〜`graphhopper_edit`。
-  `graphhopper_handoff` は opencode SDK client が必要なため対象外）
+- plugin と同名・同-semantics の 17 tool（`graphhopper_handoff` は opencode SDK client が必要なため対象外。
+  代わりにMCPのみの `graphhopper_eval`・`graphhopper_invoke`・`graphhopper_scoreboard` を含む）
 - `root`（対象プロジェクト）・`session_id`（bind 先）を明示指定する。
   MCP には `session.idle` 駆動が無いため、`graphhopper_set_eval` 後に
   `graphhopper_eval` で明示実行する（遷移ルールは plugin の idle eval 経路と同型）
@@ -205,7 +219,7 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - `root` 省略時は client roots の先頭（file://）→プロセス cwd の順で解決する
 - tool annotations: `status`/`hash` は readOnly、`edit` は destructive、
   `eval`/`invoke`/`router_check` は openWorld の hint を付与
-- 全15 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
+- 全17 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
 - tool 実行後に logging 通知を転送（state 遷移系は info、それ以外は debug）。
   client 未対応でも tool 結果は壊さない
 
@@ -312,11 +326,12 @@ rate limitリトライ待ち＋無出力＋キャンセル不伝播）の対策�
 ## インストール
 
 ```bash
-ln -s ~/masayoshi/graphhopper-opencode/src/index.ts ~/.config/opencode/plugins/graphhopper.ts
-ln -s ~/masayoshi/graphhopper-opencode/skills/graphhopper ~/.config/opencode/skills/graphhopper
-ln -s ~/masayoshi/graphhopper-opencode/skills/discover ~/.config/opencode/skills/graphhopper-discover
+# <repo> はこのリポジトリの checkout 先（例: ~/work/graphhopper-opencode）
+ln -s <repo>/src/index.ts ~/.config/opencode/plugins/graphhopper.ts
+ln -s <repo>/skills/graphhopper ~/.config/opencode/skills/graphhopper
+ln -s <repo>/skills/discover ~/.config/opencode/skills/graphhopper-discover
 mkdir -p ~/.config/opencode/commands
-for f in ~/masayoshi/graphhopper-opencode/commands/*.md; do
+for f in <repo>/commands/*.md; do
   ln -sf "$f" ~/.config/opencode/commands/$(basename "$f")
 done
 ```

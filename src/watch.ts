@@ -33,9 +33,7 @@ export function parseOutboxFileName(name: string): Omit<OutboxEvent, "file"> | n
   if (parts.length < 3) return null;
   const goal = parts[parts.length - 1] ?? "";
   const type = parts[parts.length - 2] ?? "";
-  const ts = parts.slice(0, -2).join("-");
   if (!type || !goal) return null;
-  void ts;
   return { event: type, goal };
 }
 
