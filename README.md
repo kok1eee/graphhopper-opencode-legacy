@@ -266,7 +266,7 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 
 ### MCP 構造化出力・elicitation
 
-- 主要 8 tool（goal/status/phase/set_eval/eval/attempt/router_check/verifier_set）は
+- 主要 tool（goal/status/phase/set_eval/eval/attempt/router_check/diff_stash/verifier_set等）は
   `outputSchema`＋`structuredContent` を返す（text 応答は不変。CI・watchdog向け）
 - `complete` の verifier ガード・`resume` の loop-stop ブロックは elicitation で
   構造化承認を求める。client 未対応・拒否時は従来の error 文にフォールバックする

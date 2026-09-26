@@ -74,4 +74,16 @@ describe("system注入節約", () => {
     expect(active.some((s) => s.includes("ループを開始せよ"))).toBe(false);
     expect(active.some((s) => s.includes("常駐・goal進行中"))).toBe(true);
   });
+
+  test("複数goal往復でも節約が剥がれない（Map記憶）", async () => {
+    const rootA = tmpRoot();
+    const rootB = tmpRoot();
+    startGoal(rootA, "t", "sA");
+    startGoal(rootB, "t", "sB");
+    await transform(rootA, "sA"); // full
+    await transform(rootB, "sB"); // full（別キー）
+    // Aに戻ってもbriefのまま（単一スロットならfull再送になる）
+    const back = await transform(rootA, "sA");
+    expect(back.some((s) => s.includes("（詳細）"))).toBe(false);
+  });
 });

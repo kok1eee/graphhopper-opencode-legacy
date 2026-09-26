@@ -712,6 +712,8 @@ export function completeGoal(root: string): ActiveLoop | null {
     }
     r.goal.score = score;
     recordEvent(root, { type: "goal_complete", goal: r.goal.id, score: score.value });
+    // /tmpのdiff退避を掃除（verifier用 gh-verify-<goal>.txt。蓄積＋古いpath誤読の防止）
+    removeStashedDiff(r.goal.id);
   }
   return r;
 }
@@ -769,6 +771,8 @@ export function clearActiveGoal(root: string): Goal | null {
   goal.done_at = new Date().toISOString();
   goals.active = null;
   writeGoals(root, goals);
+  // /tmpのdiff退避を掃除（completeGoalと同型）
+  removeStashedDiff(goal.id);
   const s = readState(root);
   writeState(root, {
     ...s,
@@ -948,6 +952,21 @@ export interface StashedDiff {
   baseline: string;
 }
 
+/** 退避diffのpath（stashDiffと単一源泉。complete/clear時の掃除と共有） */
+export function stashedDiffPath(goalId: string): string {
+  return join(tmpdir(), `gh-verify-${goalId}.txt`);
+}
+
+/** 退避diffの掃除。存在しなくても成功（best-effort。complete/clear時） */
+export function removeStashedDiff(goalId: string): void {
+  if (!/^g-[0-9a-z]+$/.test(goalId)) return;
+  try {
+    unlinkSync(stashedDiffPath(goalId));
+  } catch {
+    // 存在しない・権限なし等は無視
+  }
+}
+
 /* verifier fan-out用のdiff退避: baselineからの全文diffを1回だけ取得し、
  * /tmp に置いてpathで渡す（3 lensへのinline 3重展開を防ぐ。simplify退避と同型。
  * ファイル名にgoalを含め並列goalの衝突を避ける）。失敗時は null */
@@ -959,7 +978,7 @@ export async function stashDiff(
 ): Promise<StashedDiff | null> {
   if (!baseline || !isValidBaselineRev(baseline)) return null;
   if (!/^g-[0-9a-z]+$/.test(goalId)) return null;
-  const path = join(tmpdir(), `gh-verify-${goalId}.txt`);
+  const path = stashedDiffPath(goalId);
   const write = (out: string): StashedDiff => {
     writeFileSync(path, out, "utf8");
     return {

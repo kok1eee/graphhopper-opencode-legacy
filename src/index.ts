@@ -100,10 +100,11 @@ const MAX_FETCH_CHARS = 2_000_000;
 const SAMPLING_EVERY = 10;
 let oversizeSticky = false;
 let idleTick = 0;
-/* system注入節約用の記憶スロット（phase指示・ponytail各1）。
- * state汚染回避のためモジュール変数。再起動・compact後は消失しfull再送（安全側） */
-let lastPhaseGuideKey: string | null = null;
-let lastPonytailKey: string | null = null;
+/* system注入節約用の記憶（phase指示・ponytail各1Map）。
+ * state汚染回避のためモジュール変数。再起動・compact後は消失しfull再送（安全側）。
+ * 単一スロットではなくMapで持つ: 複数goal/session往復時の交互full再送（節約剥がれ）を防ぐ */
+const seenPhaseGuides = new Set<string>();
+const seenPonytails = new Set<string>();
 
 /** メッセージの生成時刻（欠損時は 0）。取得順の正規化用 */
 function msgTime(m: state.SessionMessageLike): number {
@@ -187,12 +188,12 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         input.sessionID === active.state.session_id
       ) {
         const key = `${input.sessionID}:${active.goal.id}:${active.state.phase}`;
-        if (lastPhaseGuideKey === key) {
+        if (seenPhaseGuides.has(key)) {
           output.system.push(
             `## graphhopper 次のアクション\n\n${PHASE_ACTION_BRIEF[active.state.phase]}`,
           );
         } else {
-          lastPhaseGuideKey = key;
+          seenPhaseGuides.add(key);
           output.system.push(
             `## graphhopper 次のアクション（詳細）\n\n${PHASE_ACTION[active.state.phase]}`,
           );
@@ -207,12 +208,12 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         input.sessionID === active.state.session_id
       ) {
         // ponytail も同型の節約（初回full→以降1行。毎ターン約950 tokens削減）。
-        // phase指示とは別スロットで記憶する（共有すると交互にfull再送になる）
+        // phase指示とは別Setで記憶する（共有すると交互にfull再送になる）
         const pkey = `${input.sessionID}:${active.goal.id}`;
-        if (lastPonytailKey === pkey) {
+        if (seenPonytails.has(pkey)) {
           output.system.push(PONYTAIL_BRIEF);
         } else {
-          lastPonytailKey = pkey;
+          seenPonytails.add(pkey);
           output.system.push(PONYTAIL_RULES);
         }
       }
