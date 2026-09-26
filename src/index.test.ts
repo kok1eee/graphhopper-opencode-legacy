@@ -64,4 +64,14 @@ describe("system注入節約", () => {
     const done = await transform(root, "sC");
     expect(done.some((s) => s.includes("次のアクション"))).toBe(false);
   });
+
+  test("active無しはFULL guide・active有りは短縮", async () => {
+    const root = tmpRoot();
+    const none = await transform(root, "sX");
+    expect(none.some((s) => s.includes("ループを開始せよ"))).toBe(true);
+    startGoal(root, "t", "sX");
+    const active = await transform(root, "sX");
+    expect(active.some((s) => s.includes("ループを開始せよ"))).toBe(false);
+    expect(active.some((s) => s.includes("常駐・goal進行中"))).toBe(true);
+  });
 });

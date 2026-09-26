@@ -820,6 +820,38 @@ const TOOL_DEFS: ToolDef[] = [
     run: (a, ctx) => routerCheck(ctx.root),
   },
   {
+    name: "graphhopper_diff_stash",
+    description:
+      "verifier fan-out用のdiff退避。baselineからの全文diffを/tmpに1回だけ置きpathを返す（3 lensへのinline 3重展開防止）",
+    inputSchema: { type: "object", properties: { root: ROOT_PROP } },
+    schema: z.object({ root: rootZ }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        lines: { type: "number" },
+        baseline: { type: "string" },
+      },
+      required: ["path", "lines", "baseline"],
+    },
+    run: async (a, ctx) => {
+      const active = state.getActive(ctx.root);
+      if (!active) return { text: "error: no active goal" };
+      const baseline =
+        active.state.router.baseline_rev ??
+        (await state.captureBaselineRev($, ctx.root));
+      const stashed = await state.stashDiff($, ctx.root, baseline, active.goal.id);
+      if (!stashed) return { text: "error: diff取得失敗（VCS不在またはbaseline不正）" };
+      return {
+        text: [
+          `diff stashed: ${stashed.path} (${stashed.lines} lines)`,
+          "各lensにはpathを渡し、inline展開禁止。読むのは差分範囲＋疑義点のみに留めよ。",
+        ].join("\n"),
+        data: { path: stashed.path, lines: stashed.lines, baseline: stashed.baseline },
+      };
+    },
+  },
+  {
     name: "graphhopper_verifier_set",
     description:
       "polish/advisorのverifier結果を記録する。results空（verifier未実行）はエラー",

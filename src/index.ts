@@ -74,6 +74,11 @@ designing フェーズでは source ファイルの edit/write は物理的に�
 
 active な goal が既にあるなら graphhopper_status で状態を確認し、ループの継続として振る舞え。`;
 
+/* SYSTEM_GUIDE短縮版（active goal存在時用）。振り分けは済んでいるため、
+ * 存在通知＋goal外小用件の直接対応可のみ残す。stateless判定（getActiveのみ）で
+ * マーカー不要・再起動安全。詳細はphase指示・status・resources参照 */
+const SYSTEM_GUIDE_IDLE = `## graphhopper（常駐・goal進行中はphase指示に従え。goal外の小用件は直接対応可）`;
+
 /* NOTE: PHASE_ACTION / PHASE_ACTION_SHORT は ./gate.ts が単一源泉
  * （plugin entryに非関数値を置くとloaderがload失敗するため）。
  * continuationのuser向け表示はSHORT要約のみ、LLM向け詳細は
@@ -153,14 +158,20 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
     },
 
     "experimental.chat.system.transform": async (input, output) => {
-      output.system.push(SYSTEM_GUIDE);
+      const active0 = state.getActive(root);
+      // active goal存在時は振り分け済みのため短縮版（毎ターン約250 tokens節約）。
+      // stateless（getActiveのみ）でマーカー不要
+      output.system.push(
+        active0?.goal.status === "active" ? SYSTEM_GUIDE_IDLE : SYSTEM_GUIDE,
+      );
 
       // ponytail ルールは implementing 中のみ・メインセッションのみに注入する。
       // 全ターン常時注入（ponytail のグローバルプラグイン挙動）は graphhopper の
       // 「必要な時だけ最小注入」思想と衝突するため、フェーズ + sessionID でゲートする。
       // 注記: graphhopper_phase(implementing) を呼ぶターン自体はプロンプト組み立て済みで
       // 注入されない。注入は次ターンから（session.idle → continuation → 新ターン）。
-      const active = state.getActive(root);
+      // （active0 を再利用。transform内の二重取得を避ける）
+      const active = active0;
 
       // continuation（user向け表示）はSHORT要約のみ。LLM向けの詳細指示は
       // ここで system prompt に注入する（design g-mtwhdb4t）。PONYTAILゲートと
@@ -524,6 +535,25 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             route === "polish"
               ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
               : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(results: [{lens: 'general', level}])で記録する（自己レビューだけでの完了は不可）",
+          ].join("\n");
+        },
+      }),
+
+      graphhopper_diff_stash: tool({
+        description:
+          "verifier fan-out用のdiff退避。baselineからの全文diffを/tmpに1回だけ置きpathを返す（3 lensへのinline 3重展開防止。simplify退避と同型）。router_check後に呼ぶ",
+        args: {},
+        async execute() {
+          const active = state.getActive(root);
+          if (!active) return "error: no active goal";
+          const baseline =
+            active.state.router.baseline_rev ??
+            (await state.captureBaselineRev($, root));
+          const stashed = await state.stashDiff($, root, baseline, active.goal.id);
+          if (!stashed) return "error: diff取得失敗（VCS不在またはbaseline不正）";
+          return [
+            `diff stashed: ${stashed.path} (${stashed.lines} lines)`,
+            "各lensにはpathを渡し、inline展開禁止。読むのは差分範囲＋疑義点のみに留めよ。",
           ].join("\n");
         },
       }),

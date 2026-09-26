@@ -25,7 +25,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 /** graphhopper 本体（Claude Code版）の3相グラフに合わせる。flywheelの8フェーズより薄い */
@@ -940,6 +940,53 @@ export async function measureDiffLines(
   } catch {
     return 0;
   }
+}
+
+export interface StashedDiff {
+  path: string;
+  lines: number;
+  baseline: string;
+}
+
+/* verifier fan-out用のdiff退避: baselineからの全文diffを1回だけ取得し、
+ * /tmp に置いてpathで渡す（3 lensへのinline 3重展開を防ぐ。simplify退避と同型。
+ * ファイル名にgoalを含め並列goalの衝突を避ける）。失敗時は null */
+export async function stashDiff(
+  shell: Shell,
+  root: string,
+  baseline: string | null,
+  goalId: string,
+): Promise<StashedDiff | null> {
+  if (!baseline || !isValidBaselineRev(baseline)) return null;
+  if (!/^g-[0-9a-z]+$/.test(goalId)) return null;
+  const path = join(tmpdir(), `gh-verify-${goalId}.txt`);
+  const write = (out: string): StashedDiff => {
+    writeFileSync(path, out, "utf8");
+    return {
+      path,
+      lines: out.length === 0 ? 0 : out.split("\n").length,
+      baseline,
+    };
+  };
+  try {
+    const r = await shell`jj diff --from ${baseline}`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) return write(r.stdout.toString());
+  } catch {
+    // git にフォールバック
+  }
+  try {
+    const r = await shell`git diff ${baseline}`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) return write(r.stdout.toString());
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 export function recordRouterCheck(

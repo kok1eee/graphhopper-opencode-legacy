@@ -1336,3 +1336,35 @@ describe("pause/resumeスナップショット（goal切替の文脈漏れ対策
     expect(getActive(root)?.state.session_id).toBe("s2");
   });
 });
+
+describe("stashDiff（verifier用diff退避）", () => {
+  test("不正baselineはshellを呼ばずnull", async () => {
+    const noShell = undefined as unknown as Parameters<
+      typeof import("./state").stashDiff
+    >[0];
+    const { stashDiff } = await import("./state");
+    await expect(stashDiff(noShell, tmpRoot(), "x; rm", "g-abc")).resolves.toBeNull();
+    await expect(stashDiff(noShell, tmpRoot(), null, "g-abc")).resolves.toBeNull();
+    await expect(stashDiff(noShell, tmpRoot(), "abc123", "bad id")).resolves.toBeNull();
+  });
+
+  test("実git repoで退避できる", async () => {
+    const { stashDiff } = await import("./state");
+    const { $ } = await import("bun");
+    const root = tmpRoot();
+    await $`git init -q ${root}`.quiet();
+    await $`git -C ${root} config user.email t@t`.quiet();
+    await $`git -C ${root} config user.name t`.quiet();
+    await Bun.write(`${root}/a.txt`, "one\n");
+    await $`git -C ${root} add -A`.quiet();
+    await $`git -C ${root} commit -qm init`.quiet();
+    const rev = (await $`git -C ${root} rev-parse HEAD`.text()).trim();
+    await Bun.write(`${root}/a.txt`, "one\ntwo\n");
+    const stashed = await stashDiff($, root, rev, "g-abc123");
+    expect(stashed).not.toBeNull();
+    expect(stashed!.lines).toBeGreaterThan(0);
+    expect(stashed!.path).toContain("g-abc123");
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(stashed!.path)).toBe(true);
+  });
+});
