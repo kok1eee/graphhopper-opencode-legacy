@@ -22,6 +22,15 @@ export const VERSION_GUARD_RULE = [
 export const PARALLEL_NOTE =
   "3 lens は graphhopper_invoke で並列に投げてよい（invoke は多重起動可・入れ子のみ禁止）。結果を集めて graphhopper_verifier_set に記録する。";
 
+/* verifier調査効率則（graft-first＋診断添付）。4 charter共通。
+ * SKILL.md polish節・agents.ts verifier promptと一対で維持すること */
+export const VERIFIER_EFFICIENCY_RULE = [
+  "調査効率則: 周辺コード探索は graft MCP / ast-grep / rg を優先し、ファイル横断の漁り読みをしない。",
+  "Readはdiff本体＋graft/diffが指した関数・テスト単位のみ。graft未構築時は従来Readへフォールバックする。",
+  "型・lint診断は自分で実行しない（診断系コマンドはbash deny）。main添付の診断ファイル（.graphhopper/tmp/diag-<goal>.txt）をReadして証拠に使え。添付が無ければ「診断未実行（理由）」を明記し、診断不在を clean の根拠にしない。",
+  "ただし診断クリーン≠driftなし（挙動 drift は診断に出ない）。",
+].join("\n");
+
 /* PromptArgDef/PromptDef は prompts.ts 内のみで使用（公開面は PROMPT_DEFS）。
  * 将来の外部利用に備え型自体は残すが export はしない */
 interface PromptArgDef {
@@ -121,8 +130,7 @@ export const PROMPT_DEFS: PromptDef[] = [
       return [
         "あなたは graphhopper の verifier（requirement lens）である。",
         "実装が design.md の意図（done の定義）から外れていないかを検証せよ。",
-        "変更ファイルに型・lint 診断を実行して裏付けに使え。LSP照会が使える環境なら診断証拠は lsp_diagnostics を優先してよい（速い・安い）。",
-        "ただし診断クリーン≠driftなし（挙動 drift は診断に出ない）。診断が実行不可なら「診断未実行（理由）」を明記し、診断不在を clean の根拠にしない。",
+        VERIFIER_EFFICIENCY_RULE,
         "findingsには証拠状態を必ず付ける: 裏付けあり / 証拠不足 / 診断未実行 / 実行失敗。原因不明のまま level だけ付けない。",
         "",
         VERSION_GUARD_RULE,
@@ -145,7 +153,8 @@ export const PROMPT_DEFS: PromptDef[] = [
       return [
         "あなたは graphhopper の verifier（behavior lens）である。",
         "変更の挙動が正しいか、テストが実際のユーザーパスを検証しているかを検証せよ。",
-        "エッジケース・境界値・失敗時の振る舞いを見ろ。診断クリーン≠driftなし。",
+        "エッジケース・境界値・失敗時の振る舞いを見ろ。",
+        VERIFIER_EFFICIENCY_RULE,
         "",
         VERSION_GUARD_RULE,
         "",
@@ -168,6 +177,7 @@ export const PROMPT_DEFS: PromptDef[] = [
         "あなたは graphhopper の verifier（progress lens）である。",
         "変更が goal に収束しているか、スコープ外の膨張・未完の残骸が無いかを検証せよ。",
         "決定の経緯・棄却した代替案が .log.md に追記されているかも見ろ。",
+        VERIFIER_EFFICIENCY_RULE,
         "",
         PARALLEL_NOTE,
         "",
@@ -187,7 +197,7 @@ export const PROMPT_DEFS: PromptDef[] = [
       return [
         "あなたは graphhopper の verifier（general charter）である。",
         "「実装が design.md の意図から外れていないか・テストが実際のユーザーパスを検証しているか・変更が goal に収束しているか、3観点をまとめてレビューせよ」。",
-        "変更ファイルに型・lint 診断を実行し裏付けに使え（診断クリーン≠driftなし）。",
+        VERIFIER_EFFICIENCY_RULE,
         "findingsには証拠状態を必ず付ける: 裏付けあり / 証拠不足 / 診断未実行 / 実行失敗。",
         "",
         VERSION_GUARD_RULE,

@@ -467,3 +467,32 @@ describe("jev判定parse・thin gate（gate.ts）", () => {
     expect(g.effectivePhaseAction("polish", "B")).toContain("general×1");
   });
 });
+
+describe("verifier重複排除（graft-first＋診断deny）", () => {
+  test("VERIFIER_BASHは診断系deny・検索系allow（順序維持）", async () => {
+    const { VERIFIER_BASH } = await import("./agents");
+    for (const k of ["npx tsc --noEmit", "tsc --noEmit", "npx pyright", "npx ruff check"]) {
+      expect(VERIFIER_BASH[k]).toBe("deny");
+    }
+    expect(VERIFIER_BASH["rg"]).toBe("allow");
+    expect(VERIFIER_BASH["cat"]).toBe("allow");
+    // findLast評価のためdeny群がallow群より後方にあること
+    const keys = Object.keys(VERIFIER_BASH);
+    const lastAllow = Math.max(keys.indexOf("rg"), keys.indexOf("cat"));
+    const firstDiagDeny = Math.min(
+      keys.indexOf("npx tsc --noEmit"),
+      keys.indexOf("npx pyright"),
+    );
+    expect(firstDiagDeny).toBeGreaterThan(lastAllow);
+  });
+
+  test("verifier charter/agent文面に効率則", async () => {
+    const { VERIFIER_EFFICIENCY_RULE } = await import("./prompts");
+    expect(VERIFIER_EFFICIENCY_RULE).toContain("graft");
+    expect(VERIFIER_EFFICIENCY_RULE).toContain("diag-");
+    const ag = (await import("./agents")).GRAPHHOPPER_AGENTS["graphhopper-verifier"];
+    const prompt = Array.isArray(ag?.prompt) ? ag.prompt.join("\n") : String(ag?.prompt ?? "");
+    expect(prompt).toContain("graft");
+    expect(prompt).toContain("diag-");
+  });
+});

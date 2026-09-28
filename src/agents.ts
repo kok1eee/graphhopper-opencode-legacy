@@ -136,6 +136,29 @@ export const SEARCH_ONLY_BASH: Record<string, "allow" | "deny" | "ask"> = {
   "sg *": "deny",
 };
 
+/* verifier専用bash権限: SEARCH_ONLY_BASH＋診断系deny。
+ * 診断はmainが1回実行して添付するためverifierの個別実行は禁止（重複排除）。
+ * spread順序維持でdeny群を末尾追加し、findLastでdeny勝ちさせる。
+ * opencodeのマッチ方式（exact優先/glob）不定のため、exact keyとwildcardの両方をdenyする */
+export const VERIFIER_BASH: Record<string, "allow" | "deny" | "ask"> = {
+  ...SEARCH_ONLY_BASH,
+  "tsc --noEmit": "deny",
+  "tsc --noEmit *": "deny",
+  "npx tsc --noEmit": "deny",
+  "npx tsc --noEmit *": "deny",
+  "npx tsc*": "deny",
+  pyright: "deny",
+  "pyright *": "deny",
+  "npx pyright": "deny",
+  "npx pyright *": "deny",
+  "npx pyright*": "deny",
+  "ruff check": "deny",
+  "ruff check *": "deny",
+  "npx ruff check": "deny",
+  "npx ruff check *": "deny",
+  "npx ruff*": "deny",
+};
+
 export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
   /* modeは "all"（design g-mu5d6avj A1）。
    * `opencode run --agent` はsubagent modeを拒否してdefault agentにフォールバックするため、
@@ -260,7 +283,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "polish/advisorのverifier用。route=polishではrequirement/behavior/progressの3レンズfan-out、route=advisorでは'general'（3観点統合）charterで単発呼び出しされる。判断nodeなので上位品質モデルで使う（モデルは .graphhopper/config.json の agents で設定）。実装者本人（メインエージェント）とは独立した第三者チェックであることが呼び出しの目的そのもの",
     mode: "all",
     temperature: 0.2,
-    permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
+    permission: { edit: "deny", bash: VERIFIER_BASH },
     prompt: [
       "あなたは敵対的レビューアー。実装者ではなく第三者の立場でdiffのdrift（乖離）を検証する。",
       "",
@@ -268,13 +291,16 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "- requirement/behavior/progress のいずれか: そのレンズだけに集中する（polishの3-way fan-out）",
       "- general: 3観点（要件逸脱・挙動の妥当性・進捗の収束）を1回のレビューでまとめて見る（advisorの単発呼び出し）",
       "",
+      "調査効率則: 周辺探索は graft MCP / ast-grep / rg を優先し漁り読み禁止。",
+      "Readはdiff本体＋graft/diffが指した関数・テスト単位のみ。graft未構築時は従来Readへフォールバック。",
+      "",
       "drift（乖離）を検出したら全件報告する（confidence/severity付き、閾値カットしない）。",
       "無ければfindings: []とsummaryに「driftなし」と明記する。",
       "",
       "診断証拠:",
-      "- 変更ファイルに型・lint診断を実行し、findingsの裏付け・反証に使え（例: `npx tsc --noEmit` / `npx pyright` / `npx ruff check`、構造確認は `ast-grep`）",
+      "- 型・lint診断は自分で実行しない（bash deny）。呼び出し側添付の診断ファイル（.graphhopper/tmp/diag-<goal>.txt）をReadして裏付け・反証に使え",
+      "- 添付が無ければ「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない",
       "- 診断クリーンはdriftなしの根拠にならない（挙動driftは診断に出ない）。診断結果は補助証拠として扱う",
-      "- 診断が実行不可（tool未install等）の場合はfindingsに「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない",
       "",
       "ルール:",
       "- 指摘は具体的に（ファイル:行を特定、該当行を引用）",

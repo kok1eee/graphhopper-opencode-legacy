@@ -144,10 +144,12 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **route=advisor**（小diff）: `task(subagent_type: "graphhopper-verifier")` を**1回だけ**、
   `general`charterで呼ぶ。「実装がdesign.mdの意図から外れていないか・テストが実際のユーザーパスを
   検証しているか・変更がgoalに収束しているか、3観点をまとめてレビューせよ」と渡す。
-  verifierは変更ファイルに型・lint診断（`npx tsc --noEmit` / `npx pyright` / `npx ruff check`）を実行し、
-  findingsの裏付け・反証に使え。LSP照会が使える環境なら診断証拠はlsp_diagnosticsを優先してよい（速い・安い）。
+  診断はメインが事前に1回実行し `.graphhopper/tmp/diag-<goal>.txt` に保存してpathを渡す
+  （verifierの個別実行はbash denyで禁止。inline添付は3重トークン再発のため禁止）。
+  verifierは添付診断を裏付け・反証に使え。LSPは補助線に留める（単一証拠源にしない）。
   ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
-  診断が実行不可なら「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
+  添付が無ければ「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
+  周辺探索はgraft-first（漁り読み禁止。graft/diffが指した関数・テスト単位のReadは可）。
   findingsには証拠状態を必ず付ける（typesafe流・失敗原因分離）: `裏付けあり` /
   `証拠不足` / `診断未実行` / `実行失敗`。原因不明のままlevelだけ付けない
    結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
@@ -178,7 +180,9 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
       手動コピーは不要・禁止）し、各verifierには**返却pathを渡す**
       （inline 3重展開は禁止。3lensが全文を各々読むと3倍燃費になる）。
       読むのは `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / 退避diffの差分範囲＋疑義点のみ。
-      behavior charterでは診断証拠（型・lint実行結果）を要求する
+      周辺探索はgraft-first（漁り読み禁止）。診断はメインが事前に1回実行し
+      `.graphhopper/tmp/diag-<goal>.txt` に保存してpathを渡す（verifier個別実行は禁止）。
+      behavior charterでは添付診断を証拠に使う
   3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
   4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
      `graphhopper_verifier_set(results: [...], reason: ...)` で1回記録する。
