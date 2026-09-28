@@ -1369,6 +1369,12 @@ const TOOL_DEFS: ToolDef[] = [
           oldString: a.oldString,
           newString: a.newString,
         });
+        // 軟質return（"error: no active goal ..."）はそのまま返却する。
+        // そのままJSON.parseするとJSCが "JSON Parse error: Unexpected identifier"
+        // を投げ真因がマスクされる（g-mulmgje9で実証済み）
+        if (out.startsWith("error:")) {
+          return { text: out, data: { ok: false } };
+        }
         // 信号A（plugin の tool.execute.after と同型。成功 edit のみ数える。
         // MCP には after hook が無いためここで数える）
         const counted = state.getActive(root);

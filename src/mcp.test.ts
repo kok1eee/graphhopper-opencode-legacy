@@ -599,6 +599,17 @@ describe("graphhopper-mcp route系tool（統合）", () => {
       expect(sel).toContain("lens");
       expect(sel).toContain("doneの定義");
     }
+    // graphhopper_editの軟質returnはマスクせずそのまま返す（goal無しroot）
+    {
+      const noGoal = await call("graphhopper_edit", {
+        filePath: "src/gate.ts",
+        expectedHash: "deadbeef",
+        oldString: "x",
+        newString: "y",
+      });
+      expect(noGoal).toContain("no active goal");
+      expect(noGoal).not.toContain("JSON Parse error");
+    }
     // 不正値はAに倒す（別rootで。pendingはgoalが消費するため）
     {
       const client2 = await linked();
