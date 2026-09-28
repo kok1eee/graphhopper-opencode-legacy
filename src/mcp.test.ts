@@ -115,6 +115,14 @@ describe("graphhopper-mcp goal往復", () => {
     await call("graphhopper_goal", { action: "start", title: "legal test" });
     const out = await call("graphhopper_phase", { phase: "done" });
     expect(out).toContain("非法遷移");
+    // 拒否時もstructured dataを返す（欠くとMCP -32600で真因マスク）
+    const raw = await client.callTool({
+      name: "graphhopper_phase",
+      arguments: { root, phase: "done" },
+    });
+    expect(
+      (raw as { structuredContent?: { ok?: boolean } }).structuredContent?.ok,
+    ).toBe(false);
     await client.close();
   });
 

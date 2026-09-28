@@ -767,9 +767,11 @@ const TOOL_DEFS: ToolDef[] = [
     },
     run: (a, ctx) => {
       const rejected = checkPhaseMove(ctx.root, a.phase);
-      if (rejected) return { text: rejected };
+      // 拒否時もdataを返す（欠くとMCP -32600で真因がマスクされる）
+      if (rejected) return { text: rejected, data: { ok: false } };
       const r = state.setPhase(ctx.root, a.phase, a.notes);
-      if (!r) return { text: "error: no active goal or invalid phase" };
+      if (!r)
+        return { text: "error: no active goal or invalid phase", data: { ok: false } };
       return {
         text: `phase -> ${r.state.phase}\n次: ${effectivePhaseAction(r.state.phase, r.state.entry_route)}${driverNote(ctx.root, sessionOf(a.session_id))}`,
         data: { ok: true, phase: r.state.phase },
