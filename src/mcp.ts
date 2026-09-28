@@ -152,6 +152,10 @@ function statusText(root: string): string {
     a.state.router.route
       ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}`
       : "router: (not checked)",
+    a.state.initial_diff_lines !== null &&
+    a.state.initial_diff_lines !== undefined
+      ? `initial_dirt: ${a.state.initial_diff_lines} lines（goal start時の未コミット分。実効diffから除外）`
+      : null,
     a.state.last_verifier
       ? `last_verifier: level=${a.state.last_verifier.level} target=${a.state.last_verifier.target ?? "-"} lens=${a.state.last_verifier.lens.join(",") || "-"} reason=${a.state.last_verifier.reason}`
       : "last_verifier: (none)",
@@ -188,10 +192,22 @@ async function goalAction(
         return `error: goal "${active.goal.title}" is already active. complete or pause it first.`;
       }
       const a = state.startGoal(root, title, sessionID);
+      try {
+        const rev = await state.captureBaselineRev($, root);
+        if (rev) {
+          state.snapshotInitialDirt(
+            root,
+            await state.measureDiffLines($, root, rev),
+          );
+        }
+      } catch {
+        // 測定不能は無視（initial null＝旧挙動）
+      }
+      const started = state.getActive(root) ?? a;
       const unbound =
         !sessionID &&
         "\n(note: session_id 未指定のため未バインド。継続注入・stuck計数を有効にするには session_id を指定して resume で bind せよ)";
-      return `goal started: "${a.goal.title}" (${a.goal.id})\nphase: designing\n次: ${effectivePhaseAction("designing", a.state.entry_route)}${unbound ?? ""}`;
+      return `goal started: "${started.goal.title}" (${started.goal.id})\nphase: designing\n次: ${effectivePhaseAction("designing", started.state.entry_route)}${unbound ?? ""}`;
     }
     case "pause": {
       const a = state.pauseGoal(root);
@@ -381,7 +397,11 @@ async function evalOnce(root: string): Promise<string> {
     const baseline =
       active.state.router.baseline_rev ??
       (await state.captureBaselineRev($, root));
-    const diffLines = await state.measureDiffLines($, root, baseline);
+    const measured = await state.measureDiffLines($, root, baseline);
+    const diffLines = state.effectiveDiffLines(
+      measured,
+      state.getActive(root)?.state.initial_diff_lines,
+    );
     if (baseline === null) {
       state.recordRouterCheck(root, baseline, 0, "advisor");
       state.setPhase(root, "polish");
@@ -395,7 +415,7 @@ async function evalOnce(root: string): Promise<string> {
       return `eval_cmd passed (diff ${diffLines} lines since baseline): ${cmd}\n${tail}`;
     } else {
       state.recordRouterCheck(root, baseline, 0, "advisor");
-      return `eval_cmd passed but diff_lines=0 since baseline — まだ何も実装していない。polishへは進めない。実装を進めよ: ${cmd}\n${tail}`;
+      return `eval_cmd passed but effective diff_lines=0 since baseline — 実装なしか前goal残骸との相殺のいずれか。実装を進めるか、router_check で手動確認せよ: ${cmd}\n${tail}`;
     }
   }
   if (r.giveUp) {
@@ -441,7 +461,11 @@ async function routerCheck(root: string): Promise<ToolOut> {
   const baseline =
     active.state.router.baseline_rev ??
     (await state.captureBaselineRev($, root));
-  const diffLines = await state.measureDiffLines($, root, baseline);
+  const measured = await state.measureDiffLines($, root, baseline);
+  const diffLines = state.effectiveDiffLines(
+    measured,
+    active.state.initial_diff_lines,
+  );
   const route: state.RouterRoute =
     diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
   state.recordRouterCheck(root, baseline, diffLines, route);

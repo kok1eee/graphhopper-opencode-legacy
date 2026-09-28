@@ -110,6 +110,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
       差分変化・eval pass でリセット。`checkStuck` で判定＝進捗停滞系）
   - 連続失敗が `max_eval_fails`（既定6）に達すると相談ではなく goal が pause する（giveUp）。修正して resume せよ
 - 全タスク実施したら `graphhopper_router_check` を呼ぶ（diffサイズを機械測定してrouteを決める）
+- goal start時に初期脏れ（前goal未コミット分）を自動snapshotし、遷移判定は実効diff（測定－初期値）で行う。
+  statusの `initial_dirt` で確認可。実効0時は「未実装」と断定せず `router_check` 手動確認も可
 
 ### polish
 

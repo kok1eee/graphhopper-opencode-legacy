@@ -644,7 +644,6 @@ describe("graphhopper-mcp route系tool（統合）", () => {
     execSync(`git init -q "${root}" && git -C "${root}" config user.email t@t && git -C "${root}" config user.name t`);
     writeFileSync(join(root, "a.txt"), "x\n");
     execSync(`git -C "${root}" add -A && git -C "${root}" commit -qm init`);
-    writeFileSync(join(root, "a.txt"), Array(450).fill("y").join("\n") + "\n");
     const call = async (name: string, args: Record<string, unknown>) => {
       const r = await client.callTool({ name, arguments: { ...args, root } });
       const c = r.content as { type: string; text: string }[];
@@ -653,10 +652,45 @@ describe("graphhopper-mcp route系tool（統合）", () => {
     await call("graphhopper_goal", { action: "start", title: "auto esc" });
     st.bindEntryRoute(root, "B");
     await call("graphhopper_phase", { phase: "implementing" });
+    // goal開始後の実装分だけが実効diffになる（start前脏れは除外される）
+    writeFileSync(join(root, "a.txt"), Array(450).fill("y").join("\n") + "\n");
     const out = await call("graphhopper_router_check", {});
     expect(out).toContain("自動昇格");
     expect(st.getActive(root)!.state.phase).toBe("designing");
     expect(st.getActive(root)!.state.entry_route).toBe("A");
+    await client.close();
+  });
+
+  test("start前脏れは実効diffから除外（誤遷移防止）", async () => {
+    const { execSync } = await import("node:child_process");
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const st = await import("./state");
+    const client = await linked();
+    const root = freshRoot();
+    execSync(`git init -q "${root}" && git -C "${root}" config user.email t@t && git -C "${root}" config user.name t`);
+    writeFileSync(join(root, "a.txt"), "x\n");
+    execSync(`git -C "${root}" add -A && git -C "${root}" commit -qm init`);
+    // 前goalの残骸（start前にtrackedファイルを脏す。untrackedはgit diff不可視のため対象外）
+    writeFileSync(join(root, "a.txt"), "x\n" + Array(100).fill("z").join("\n") + "\n");
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "dirt test" });
+    const initial = st.getActive(root)!.state.initial_diff_lines!;
+    expect(initial).toBeGreaterThan(50);
+    // 自goalの実装は脏れに5行追加→実効diffは5行前後（未減算なら100超になる）
+    const { readFileSync } = await import("node:fs");
+    writeFileSync(join(root, "a.txt"), readFileSync(join(root, "a.txt"), "utf8") + Array(5).fill("w").join("\n") + "\n");
+    const out = await call("graphhopper_router_check", {});
+    const m = out.match(/diff_lines: (\d+)/);
+    expect(m).not.toBeNull();
+    const effective = Number(m![1]);
+    expect(effective).toBeLessThan(50);
+    expect(effective).toBeGreaterThanOrEqual(0);
+    expect(out).toContain("route: advisor");
     await client.close();
   });
 });

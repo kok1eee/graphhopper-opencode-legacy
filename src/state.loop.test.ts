@@ -1533,3 +1533,47 @@ describe("昇格後critic必須＋stuck自動昇格", () => {
     expect(g.autoEscalateOnStuck(root)).toBeNull();
   });
 });
+
+describe("初期脏れsnapshot（baseline誤認防止）", () => {
+  test("effectiveDiffLines: 減算・floor・legacy", async () => {
+    const s = await import("./state");
+    expect(s.effectiveDiffLines(10, 3)).toBe(7);
+    expect(s.effectiveDiffLines(2, 5)).toBe(0);
+    expect(s.effectiveDiffLines(10, null)).toBe(10);
+    expect(s.effectiveDiffLines(10, undefined)).toBe(10);
+  });
+
+  test("snapshotInitialDirt: 設定・不正値無視", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    expect(s.getActive(root)!.state.initial_diff_lines).toBeNull();
+    s.snapshotInitialDirt(root, 1349);
+    expect(s.getActive(root)!.state.initial_diff_lines).toBe(1349);
+    s.snapshotInitialDirt(root, null);
+    s.snapshotInitialDirt(root, -1);
+    expect(s.getActive(root)!.state.initial_diff_lines).toBe(1349);
+  });
+
+  test("pause/resumeで初期脏れが維持される", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.snapshotInitialDirt(root, 100);
+    s.pauseGoal(root);
+    s.startGoal(root, "other", "s2");
+    s.pauseGoal(root);
+    const goals = s.readGoals(root);
+    const first = goals.goals.find((g) => g.title === "t")!;
+    goals.active = first.id;
+    first.status = "active";
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    writeFileSync(
+      join(root, ".graphhopper", "goals.json"),
+      JSON.stringify(goals),
+    );
+    s.resumeGoal(root, "s1");
+    expect(s.getActive(root)!.state.initial_diff_lines).toBe(100);
+  });
+});

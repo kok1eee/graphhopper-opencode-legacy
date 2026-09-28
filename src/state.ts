@@ -54,6 +54,8 @@ export interface GoalSnapshot {
   critic_review: CriticVerdict | null;
   eval_cmd: string | null;
   notes: string;
+  /** goal start時の脏れ。resume後も自goal基準を維持するため退避する */
+  initial_diff_lines: number | null;
 }
 
 /** goal出来栄えの機械採点。式はv1で固定し、breakdownで透明化する（調整は式ごと変える） */
@@ -172,6 +174,9 @@ export interface LoopState {
   /** 直近に stuck 通知した理由集合。同一理由の再通知を抑止する。
    * resume でクリアする */
   last_stuck_reasons: string[];
+  /** goal start時の未コミット脏れ行数（baseline rev基準）。実効diff＝測定－初期値。
+   * null＝legacy/未測定→0扱い。designing中はsource編集不可のためstart時測定で安定 */
+  initial_diff_lines: number | null;
   /** jev入口判定のroute。null＝A（未呼び出し・legacy）。B→A昇格のみ可 */
   entry_route: EntryRoute | null;
   /** B→A昇格の実施時刻。null＝未昇格 */
@@ -545,6 +550,7 @@ function emptyState(): LoopState {
     last_stuck_reasons: [],
     entry_route: null,
     escalated_at: null,
+    initial_diff_lines: null,
     updated_at: new Date().toISOString(),
   };
 }
@@ -667,6 +673,7 @@ export function pauseGoal(root: string): ActiveLoop | null {
         critic_review: state.critic_review,
         eval_cmd: state.eval_cmd,
         notes: state.notes,
+        initial_diff_lines: state.initial_diff_lines,
       },
     },
     // 人間による明示的な操作なのでloop停止フラグも解除（pause自体が駆動を止める）
@@ -710,6 +717,8 @@ export function resumeGoal(
               critic_review: snap.critic_review,
               eval_cmd: snap.eval_cmd,
               notes: snap.notes,
+              // 旧snapshot（field無し）→null＝legacy扱い
+              initial_diff_lines: snap.initial_diff_lines ?? null,
             }
           : {}),
       },
@@ -1085,6 +1094,25 @@ export interface StashedDiff {
   path: string;
   lines: number;
   baseline: string;
+}
+
+/* 実効diff＝測定－初期脏れ（floor 0）。前goalの未コミット分を自goalの実装と
+ * 誤認しないための減算。legacy（null）→0扱いで旧挙動維持 */
+export function effectiveDiffLines(
+  measured: number,
+  initial: number | null | undefined,
+): number {
+  return Math.max(0, measured - (initial ?? 0));
+}
+
+/* goal start直後の初期脏れsnapshot（tool層・asyncから呼ぶ。startGoalはsyncのため
+ * 測定できない）。designing中はsource編集不可のためstart時測定で安定。
+ * rev取得失敗時は書かない（null＝legacy扱い）。mid-designingの手動commitによる
+ * ずれは許容（稀・方向は安全側に倒れないが監査可） */
+export function snapshotInitialDirt(root: string, lines: number | null): void {
+  if (lines === null || lines < 0) return;
+  const state = readState(root);
+  writeState(root, { ...state, initial_diff_lines: lines });
 }
 
 /** 退避diffのpath（stashDiffと単一源泉。complete/clear時の掃除と共有） */
