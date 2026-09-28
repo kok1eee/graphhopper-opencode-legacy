@@ -63,7 +63,7 @@ graphhopper-opencode/
 | `graphhopper_status` | 現在 goal + フェーズ + router + verifier 表示 |
 | `graphhopper_phase` | フェーズ遷移（designing → implementing → polish → done） |
 | `graphhopper_router_check` | diffサイズを機械測定し advisor(verifier×1)/polish(verifier×3) に分岐（loop-driver.sh相当） |
-| `graphhopper_diff_stash` | verifier fan-out用にdiffを/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
+| `graphhopper_diff_stash` | verifier fan-out用にdiffを.graphhopper/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
 | `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（A/B/C。不正値はAに倒す。Cはhistory 1行のみ） |
 | `graphhopper_escalate` | B→A昇格（designing巻き戻し＋critic1回＋fan-out×3。A→B禁止のラチェット） |
 | `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート） |

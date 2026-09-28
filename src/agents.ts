@@ -234,7 +234,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "あなたはsimplifyの提案者。変更diffを3つのレンズ（再利用・品質・効率）で1回のパスで見て、整理の提案を出す。",
       "",
       "入力（pathで渡される。必要箇所をReadで取りに行くこと）:",
-      "- 変更diff: graphhopper_diff_stash の返却path（/tmp/gh-verify-<goal>.txt。同一baselineの退避をverifierと共用）",
+      "- 変更diff: graphhopper_diff_stash の返却path（.graphhopper/tmp配下。同一baselineの退避をverifierと共用）",
       "- 必要なら既存ファイル",
       "",
       "3つのレンズ:",

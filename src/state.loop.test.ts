@@ -1373,31 +1373,39 @@ describe("stashDiff（verifier用diff退避）", () => {
 describe("退避diff掃除（complete/clear）", () => {
   test("completeGoal/clearActiveGoalでgh-verifyファイルが消える", async () => {
     const { removeStashedDiff, stashedDiffPath } = await import("./state");
-    const { existsSync, writeFileSync } = await import("node:fs");
-    const gid = `g-${Date.now().toString(36)}test`;
-    // 不正idは無視（例外なし）
-    expect(() => removeStashedDiff("bad id")).not.toThrow();
-    // 存在しないgoalの掃除も成功扱い
-    expect(() => removeStashedDiff(gid)).not.toThrow();
-    // 実ファイルが消えること
+    const { existsSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { dirname, join } = await import("node:path");
     const { mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
+    const place = (root: string, gid: string): string => {
+      const p = stashedDiffPath(root, gid);
+      // .graphhopper/tmp配下に配置されること（子権限で読めるrepo内）
+      expect(p).toContain(join(".graphhopper", "tmp"));
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, "diff\n", "utf8");
+      return p;
+    };
+    const gid = `g-${Date.now().toString(36)}test`;
+    // 不正idは無視（例外なし）
+    expect(() => removeStashedDiff(tmpRoot(), "bad id")).not.toThrow();
+    // 存在しないgoalの掃除も成功扱い
+    expect(() => removeStashedDiff(tmpRoot(), gid)).not.toThrow();
+    // 実ファイルが消えること
     const root = mkdtempSync(join(tmpdir(), "gh-clean-"));
     const { startGoal, completeGoal, clearActiveGoal } = await import("./state");
     startGoal(root, "t", "sClean");
     const { getActive } = await import("./state");
     const activeId = getActive(root)!.goal.id;
-    writeFileSync(stashedDiffPath(activeId), "diff\n", "utf8");
-    expect(existsSync(stashedDiffPath(activeId))).toBe(true);
+    const p1 = place(root, activeId);
+    expect(existsSync(p1)).toBe(true);
     completeGoal(root);
-    expect(existsSync(stashedDiffPath(activeId))).toBe(false);
+    expect(existsSync(p1)).toBe(false);
     // clear側
     startGoal(root, "t2", "sClean2");
     const activeId2 = getActive(root)!.goal.id;
-    writeFileSync(stashedDiffPath(activeId2), "diff\n", "utf8");
+    const p2 = place(root, activeId2);
     clearActiveGoal(root);
-    expect(existsSync(stashedDiffPath(activeId2))).toBe(false);
+    expect(existsSync(p2)).toBe(false);
   });
 });
 

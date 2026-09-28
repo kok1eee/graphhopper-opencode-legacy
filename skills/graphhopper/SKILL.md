@@ -174,7 +174,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **diff肥大は検証コスト3倍**: polish routeは3lensが全差分を読む。748行級は1回で3×748行の
   コンテキスト消費。goalを小さく切ってadvisor（verifier×1）に収めるのが最大の節約。
   巻き戻しはさらに3倍するので、criticで初回品質を上げることも節約になる
-   2. `graphhopper_diff_stash` でdiffを/tmpに1回だけ退避し、各verifierには**pathを渡す**
+   2. `graphhopper_diff_stash` でdiffを退避（`.graphhopper/tmp`配下。子権限で読めるため
+      手動コピーは不要・禁止）し、各verifierには**返却pathを渡す**
       （inline 3重展開は禁止。3lensが全文を各々読むと3倍燃費になる）。
       読むのは `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / 退避diffの差分範囲＋疑義点のみ。
       behavior charterでは診断証拠（型・lint実行結果）を要求する

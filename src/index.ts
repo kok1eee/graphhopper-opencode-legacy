@@ -392,6 +392,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             `goal: "${a.goal.title}" (${a.goal.id}) [${a.goal.status}]`,
             `phase: ${a.state.phase}`,
             `session: ${a.state.session_id ?? "unbound"}`,
+            `entry_route: ${a.state.entry_route ?? "A（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にB→A昇格）` : ""}`,
             a.state.router.route
               ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}`
               : "router: (not checked)",
@@ -662,7 +663,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
 
       graphhopper_diff_stash: tool({
         description:
-          "verifier fan-out用のdiff退避。baselineからの全文diffを/tmpに1回だけ置きpathを返す（3 lensへのinline 3重展開防止。simplify退避と同型）。router_check後に呼ぶ",
+          "verifier fan-out用のdiff退避。baselineからの全文diffを.graphhopper/tmpに1回だけ置きpathを返す（3 lensへのinline 3重展開防止。子権限で読めるようrepo内配置）。router_check後に呼ぶ",
         args: {},
         async execute() {
           const active = state.getActive(root);

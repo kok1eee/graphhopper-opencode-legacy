@@ -25,7 +25,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 /** graphhopper 本体（Claude Code版）の3相グラフに合わせる。flywheelの8フェーズより薄い */
@@ -754,8 +754,8 @@ export function completeGoal(root: string): ActiveLoop | null {
     }
     r.goal.score = score;
     recordEvent(root, { type: "goal_complete", goal: r.goal.id, score: score.value });
-    // /tmpのdiff退避を掃除（verifier用 gh-verify-<goal>.txt。蓄積＋古いpath誤読の防止）
-    removeStashedDiff(r.goal.id);
+    // diff退避を掃除（.graphhopper/tmp。蓄積＋古いpath誤読の防止）
+    removeStashedDiff(root, r.goal.id);
   }
   return r;
 }
@@ -813,8 +813,8 @@ export function clearActiveGoal(root: string): Goal | null {
   goal.done_at = new Date().toISOString();
   goals.active = null;
   writeGoals(root, goals);
-  // /tmpのdiff退避を掃除（completeGoalと同型）
-  removeStashedDiff(goal.id);
+  // diff退避を掃除（completeGoalと同型）
+  removeStashedDiff(root, goal.id);
   const s = readState(root);
   writeState(root, {
     ...s,
@@ -1115,24 +1115,27 @@ export function snapshotInitialDirt(root: string, lines: number | null): void {
   writeState(root, { ...state, initial_diff_lines: lines });
 }
 
-/** 退避diffのpath（stashDiffと単一源泉。complete/clear時の掃除と共有） */
-export function stashedDiffPath(goalId: string): string {
-  return join(tmpdir(), `gh-verify-${goalId}.txt`);
+/** 退避diffのpath（stashDiffと単一源泉。complete/clear時の掃除と共有）。
+ * 子セッションのexternal_directory権限で読めるようrepo内（gitignore済み）に置く。
+ * /tmpは子から読めない実証済みのため使わない */
+export function stashedDiffPath(root: string, goalId: string): string {
+  return join(dir(root), "tmp", `gh-verify-${goalId}.txt`);
 }
 
 /** 退避diffの掃除。存在しなくても成功（best-effort。complete/clear時） */
-export function removeStashedDiff(goalId: string): void {
+export function removeStashedDiff(root: string, goalId: string): void {
   if (!/^g-[0-9a-z]+$/.test(goalId)) return;
   try {
-    unlinkSync(stashedDiffPath(goalId));
+    unlinkSync(stashedDiffPath(root, goalId));
   } catch {
     // 存在しない・権限なし等は無視
   }
 }
 
 /* verifier fan-out用のdiff退避: baselineからの全文diffを1回だけ取得し、
- * /tmp に置いてpathで渡す（3 lensへのinline 3重展開を防ぐ。simplify退避と同型。
- * ファイル名にgoalを含め並列goalの衝突を避ける）。失敗時は null */
+ * repo内（.graphhopper/tmp）に置いてpathで渡す（3 lensへのinline 3重展開を防ぐ。
+ * /tmpは子権限で読めないため使わない。ファイル名にgoalを含め並列goalの衝突を避ける）。
+ * 失敗時は null */
 export async function stashDiff(
   shell: Shell,
   root: string,
@@ -1141,8 +1144,9 @@ export async function stashDiff(
 ): Promise<StashedDiff | null> {
   if (!baseline || !isValidBaselineRev(baseline)) return null;
   if (!/^g-[0-9a-z]+$/.test(goalId)) return null;
-  const path = stashedDiffPath(goalId);
+  const path = stashedDiffPath(root, goalId);
   const write = (out: string): StashedDiff => {
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, out, "utf8");
     return {
       path,
