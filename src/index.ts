@@ -37,6 +37,7 @@ import {
   ESCALATE_NEXT,
   autoEscalateOnStuck,
   buildJevPrompt,
+  buildSelectorPrompt,
   effectivePhaseAction,
   isGateTargetTool,
   parseEntryRoute,
@@ -492,6 +493,30 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             bound
               ? `active goal（${bound.goal.id}）にもbindした（pendingは消去）。`
               : "次: graphhopper_goal(start) で消費される。",
+          ].join("\n");
+        },
+      }),
+
+      graphhopper_selector: tool({
+        description:
+          "verifier編成selectorの判定promptを発行する（advisory-only。現行routerは維持）。design抜粋とdiff統計を渡すとlens選択の判定手順を返す（LLM呼び出しはtool外。出力不正時は従来routerを継続）",
+        args: {
+          design_excerpt: tool.schema
+            .string()
+            .describe("design.mdの抜粋（goal理解＋受け入れ条件）"),
+          diff_stat: tool.schema
+            .string()
+            .describe("diff統計（ファイル数・行数・対象領域）"),
+        },
+        async execute(args) {
+          return [
+            "## selector判定手順（advisory-only）",
+            "1. 安価な判定者に以下を渡す:",
+            "",
+            buildSelectorPrompt(args.design_excerpt, args.diff_stat),
+            "",
+            "2. 返却JSONのlenses（1-3件・既知IDのみ）を参考にverifier編成を決める。",
+            "3. 不正・空の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）。",
           ].join("\n");
         },
       }),

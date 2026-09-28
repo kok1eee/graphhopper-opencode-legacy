@@ -135,6 +135,15 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - 適用後は `eval_cmd` を**再実行**して機械確認してから verifier に進む（simplify 後の未検証コードで done を出さない）
 - route は simplify 前の記録値に固定。simplify 後に diff を再測定して route を変えない
 
+#### selector（任意・advisory-only）
+
+polish前にlens編成の助言が欲しい場合のみ使う（現行routerは維持。省略可）:
+
+1. `graphhopper_selector(design_excerpt, diff_stat)` で判定promptを発行する
+   （design抜粋＋diff統計のみ。blast radiusは渡さない）
+2. 安価な判定者に渡し、返却JSONのlenses（1-3件・既知IDのみ採用）を参考にする
+3. 不正・空の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）
+
 #### verifier（drift 検出）
 
 `graphhopper_router_check` の `route` に従う。**いずれのrouteでも `graphhopper-verifier` への

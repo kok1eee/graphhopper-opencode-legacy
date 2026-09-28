@@ -119,6 +119,68 @@ export function buildJevPrompt(request: string): string {
   return [JEV_ROUTE_PROMPT, "", "やる内容:", request].join("\n");
 }
 
+/* selector判定のprompt定数（jev同型。指示文の単一源泉則でgate.tsに置く。
+ * design.mdにはprompts.tsと書いたが、判定promptはJEV_ROUTE_PROMPTに倣い
+ * gate.tsが正しい置き場所。経緯は .log.md）。出力は1行JSONのみ。
+ * advisory-only: 結果の利用はmainのprose判断。現行routerは維持 */
+export const SELECTOR_PROMPT = `あなたはverifier編成セレクタ。design抜粋とdiff統計から検証に使うlensを1〜3件選べ。
+出力は1行のJSONのみ: {"lenses":["requirement","behavior"],"reason":"..."}
+- requirement=設計意図・done定義との一致
+- behavior=振る舞い・テスト・副作用
+- progress=進捗・残件・タスク列との対応
+- general=上記を統合した単発（小規模・単一関心向け）
+契約変更・migration・互換性が絡む場合はrequirementを含めよ。
+reasonは1行まで。JSON以外の文字を出すな`;
+
+/* selector prompt組立（plugin/MCPのselector toolの単一源泉）。
+ * (1)入力はdesign抜粋＋diff statのみ（blast radiusは(3)の領分） */
+export function buildSelectorPrompt(
+  designExcerpt: string,
+  diffStat: string,
+): string {
+  return [
+    SELECTOR_PROMPT,
+    "",
+    "design抜粋:",
+    designExcerpt,
+    "",
+    "diff統計:",
+    diffStat,
+  ].join("\n");
+}
+
+/* selector出力の厳密parse。既知lens 1-3件（重複除去）のみ採用。
+ * 不正・空・0件はfallback=true（呼び出し側は従来routerを継続せよ。
+ * general倒しはしない＝軽い側に倒さない。jevと同極性） */
+export function parseSelectorOutput(text: string | null | undefined): {
+  lenses: state.VerifierLens[];
+  reason: string;
+  fallback: boolean;
+} {
+  const known: state.VerifierLens[] = [
+    "requirement",
+    "behavior",
+    "progress",
+    "general",
+  ];
+  const fail = (reason: string) => ({ lenses: [], reason, fallback: true });
+  if (typeof text !== "string" || text.trim().length === 0) {
+    return fail("selector未呼び出し→従来router");
+  }
+  const m = text.match(/\{[^{}]*"lenses"\s*:\s*\[([^\]]*)\][^{}]*\}/);
+  if (!m) return fail("parse失敗→従来router");
+  const ids = [...m[1].matchAll(/"([A-Za-z]+)"/g)]
+    .map((g) => g[1].toLowerCase())
+    .filter((id): id is state.VerifierLens =>
+      (known as string[]).includes(id),
+    );
+  const lenses = [...new Set(ids)].slice(0, 3);
+  if (lenses.length === 0) return fail("有効lens 0件→従来router");
+  const reason =
+    text.match(/"reason"\s*:\s*"([^"]{1,200})"/)?.[1] ?? "selector判定";
+  return { lenses, reason, fallback: false };
+}
+
 /* stuck発火時のB自動昇格（designの二本立てトリガーの片方。もう片方はrouter_check）。
  * entry B＋未昇格のときのみescalateEntryRouteし結果を返す。A/昇格済み/C/nullはnull */
 export function autoEscalateOnStuck(root: string): state.ActiveLoop | null {

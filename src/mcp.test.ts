@@ -25,7 +25,7 @@ function freshRoot(): string {
 }
 
 describe("graphhopper-mcp tool一覧", () => {
-  test("20 toolが登録される", async () => {
+  test("21 toolが登録される", async () => {
     const client = await linked();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
@@ -48,6 +48,7 @@ describe("graphhopper-mcp tool一覧", () => {
         "graphhopper_route_set",
         "graphhopper_router_check",
         "graphhopper_scoreboard",
+        "graphhopper_selector",
         "graphhopper_set_eval",
         "graphhopper_status",
         "graphhopper_verifier_set",
@@ -589,6 +590,15 @@ describe("graphhopper-mcp route系tool（統合）", () => {
     };
     // prompt発行
     expect(await call("graphhopper_route", { request: "typo修正" })).toContain("route");
+    // selector prompt発行（advisory-only。active goal不要）
+    {
+      const sel = await call("graphhopper_selector", {
+        design_excerpt: "doneの定義",
+        diff_stat: "3 files +120 -40",
+      });
+      expect(sel).toContain("lens");
+      expect(sel).toContain("doneの定義");
+    }
     // 不正値はAに倒す（別rootで。pendingはgoalが消費するため）
     {
       const client2 = await linked();

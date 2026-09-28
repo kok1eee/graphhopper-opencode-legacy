@@ -116,6 +116,17 @@ describe("plugin route系tool", () => {
     expect(readPendingRoute(root)).toBeNull();
   });
 
+  test("selector prompt発行（advisory-only・goal不要）", async () => {
+    const root = tmpRoot();
+    const t = await tools(root);
+    const prompt = await t.graphhopper_selector({
+      design_excerpt: "doneの定義",
+      diff_stat: "1 file +10 -2",
+    });
+    expect(prompt).toContain("lens");
+    expect(prompt).toContain("従来router");
+  });
+
   test("route_set不正→A・escalate→A＋designing", async () => {
     const { getActive, bindEntryRoute, setPhase } = await import("./state");
     const root = tmpRoot();
