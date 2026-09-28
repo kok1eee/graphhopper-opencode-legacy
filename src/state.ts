@@ -399,7 +399,28 @@ export type HistoryEvent =
       route: EntryRoute;
       reason?: string;
     }
-  | { type: "escalated"; goal: string; from: EntryRoute; at: string };
+  | { type: "escalated"; goal: string; from: EntryRoute; at: string }
+  | {
+      /* 改善ループ用per-goal集計行。complete時にgoal_completeと2行1appendで同時書き込み。
+       * 全てhistory由来の機械事実。欠測はnull（entry_route未記録のみ"A"）。
+       * last-write集計（entry_routeのみfirst＝昇格前。escalatedと組合せて区別） */
+      type: "goal_summary";
+      goal: string;
+      title: string;
+      duration_s: number | null;
+      entry_route: EntryRoute;
+      router_route: RouterRoute | null;
+      diff_lines: number | null;
+      lenses: VerifierLens[];
+      verdict_level: VerdictLevel | null;
+      verdict_target: DriftTarget | null;
+      max_fail_streak: number;
+      escalated: boolean;
+      critic_level: VerdictLevel | null;
+      rewinds: number;
+      verifier_rounds: number;
+      score: number | null;
+    };
 
 /** append-only の履歴ログ。LLMの自己申告ではなくplugin機械記録の監査証跡 */
 export function recordEvent(root: string, event: HistoryEvent): void {
@@ -753,7 +774,11 @@ export function completeGoal(root: string): ActiveLoop | null {
       writeGoals(root, goals);
     }
     r.goal.score = score;
-    recordEvent(root, { type: "goal_complete", goal: r.goal.id, score: score.value });
+    // goal_complete＋goal_summaryの2行1append（片側欠けの窓を1箇所に限定）
+    recordEventBatch(root, [
+      { type: "goal_complete", goal: r.goal.id, score: score.value },
+      buildGoalSummary(root, r.goal.id, { score: score.value }),
+    ]);
     // diff退避を掃除（.graphhopper/tmp。蓄積＋古いpath誤読の防止）
     removeStashedDiff(root, r.goal.id);
   }
@@ -798,6 +823,139 @@ export function computeGoalScore(root: string, goalId: string): GoalScore {
     100 - 15 * rewinds - 5 * maxFailStreak - 3 * gateBlocks - 5 * Math.max(0, verifierRounds - 1),
   );
   return { value, breakdown };
+}
+
+/* 複数eventの一括追記（goal_complete＋goal_summaryの2行1append用。
+ * 片側欠けの窓を1箇所に限定する。失敗時は握りつぶす＝本線を壊さない） */
+export function recordEventBatch(root: string, events: HistoryEvent[]): void {
+  try {
+    mkdirSync(dir(root), { recursive: true });
+    const now = new Date().toISOString();
+    const records = events.map((e) => ({ ts: now, ...e }));
+    appendFileSync(
+      historyPath(root),
+      records.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+    for (const r of records) writeOutbox(root, r);
+  } catch {
+    // 履歴書き込み失敗でループを止めない
+  }
+}
+
+/** goal_summary行（ts付き。buildTelemetryの要素型） */
+export type GoalSummaryRecord = Extract<
+  HistoryEvent,
+  { type: "goal_summary" }
+> & { ts?: string };
+
+/* per-goal集計の構築（history走査。computeGoalScoreと同型）。
+ * last-write集計（entry_routeのみfirst＝昇格前）。
+ * 未complete・pause中にも呼べる（durationはnow基準。欠測はnull） */
+export function buildGoalSummary(
+  root: string,
+  goalId: string,
+  opts?: { score?: number | null; now?: string },
+): Extract<HistoryEvent, { type: "goal_summary" }> {
+  const now = opts?.now ?? new Date().toISOString();
+  let title = "(unknown)";
+  let startTs: string | null = null;
+  let entryRoute: EntryRoute = "A";
+  let entrySeen = false;
+  let routerRoute: RouterRoute | null = null;
+  let diffLines: number | null = null;
+  let lenses: VerifierLens[] = [];
+  let verdictLevel: VerdictLevel | null = null;
+  let verdictTarget: DriftTarget | null = null;
+  let maxFail = 0;
+  let escalated = false;
+  let criticLevel: VerdictLevel | null = null;
+  let rewinds = 0;
+  let verifierRounds = 0;
+  for (const h of readHistory(root)) {
+    if ((h as { goal?: unknown }).goal !== goalId) continue;
+    switch (h.type) {
+      case "goal_start":
+        if (startTs === null) {
+          startTs = h.ts ?? null;
+          title = h.title;
+        }
+        break;
+      case "entry_route":
+        if (!entrySeen) {
+          entryRoute = h.route;
+          entrySeen = true;
+        }
+        break;
+      case "router_check":
+        routerRoute = h.route;
+        diffLines = h.diff_lines;
+        break;
+      case "verifier_verdict":
+        lenses = h.lens;
+        verdictLevel = h.level;
+        verdictTarget = h.target;
+        verifierRounds += 1;
+        break;
+      case "attempt":
+      case "eval_run":
+        if (h.fail_streak > maxFail) maxFail = h.fail_streak;
+        break;
+      case "escalated":
+        escalated = true;
+        break;
+      case "critic_review_set":
+        criticLevel = h.level;
+        break;
+      case "phase":
+        if (h.from === "polish" && h.to === "implementing") rewinds += 1;
+        break;
+      default:
+        break;
+    }
+  }
+  const duration =
+    startTs === null ? NaN : (Date.parse(now) - Date.parse(startTs)) / 1000;
+  return {
+    type: "goal_summary",
+    goal: goalId,
+    title,
+    duration_s:
+      Number.isNaN(duration) || duration < 0 ? null : Math.round(duration),
+    entry_route: entryRoute,
+    router_route: routerRoute,
+    diff_lines: diffLines,
+    lenses,
+    verdict_level: verdictLevel,
+    verdict_target: verdictTarget,
+    max_fail_streak: maxFail,
+    escalated,
+    critic_level: criticLevel,
+    rewinds,
+    verifier_rounds: verifierRounds,
+    score: opts?.score ?? null,
+  };
+}
+
+/* 改善ループ（reflect）の入力となるgoal行集計。
+ * goal_summary行を返し、欠落分（既存complete＝backfill兼用）はhistoryから再合成する */
+export function buildTelemetry(root: string): GoalSummaryRecord[] {
+  const summaries = new Map<string, GoalSummaryRecord>();
+  const completedScore = new Map<string, number | null>();
+  for (const h of readHistory(root)) {
+    const g = (h as { goal?: unknown }).goal;
+    if (typeof g !== "string") continue;
+    if (h.type === "goal_summary") summaries.set(g, h);
+    else if (h.type === "goal_complete" && !completedScore.has(g)) {
+      completedScore.set(g, (h as { score?: number | null }).score ?? null);
+    }
+  }
+  const out = [...summaries.values()];
+  for (const [g, score] of completedScore) {
+    if (!summaries.has(g)) out.push(buildGoalSummary(root, g, { score }));
+  }
+  out.sort((a, b) => (a.goal < b.goal ? -1 : a.goal > b.goal ? 1 : 0));
+  return out;
 }
 
 /** clear 専用: goal を done 化するが `goal_complete` イベントは記録しない

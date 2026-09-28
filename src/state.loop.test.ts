@@ -51,6 +51,9 @@ import {
   startDiscover,
   startGoal,
   stopLoopByPause,
+  buildGoalSummary,
+  buildTelemetry,
+  recordEventBatch,
   toolCallHash,
 } from "./state";
 
@@ -1583,5 +1586,85 @@ describe("初期脏れsnapshot（baseline誤認防止）", () => {
     );
     s.resumeGoal(root, "s1");
     expect(s.getActive(root)!.state.initial_diff_lines).toBe(100);
+  });
+});
+
+describe("goal_summary telemetry", () => {
+  test("集計規則: last-write・entry_routeのみfirst・rewinds・2round", () => {
+    const root = tmpRoot();
+    const gid = "g-test";
+    recordEvent(root, { type: "goal_start", goal: gid, title: "t" });
+    recordEvent(root, { type: "entry_route", goal: gid, route: "B", reason: "x" });
+    recordEvent(root, { type: "router_check", goal: gid, diff_lines: 100, route: "advisor" });
+    recordEvent(root, { type: "router_check", goal: gid, diff_lines: 500, route: "polish" });
+    recordEvent(root, {
+      type: "verifier_verdict", goal: gid, level: "drift", target: "implementing", lens: ["requirement"],
+    });
+    recordEvent(root, {
+      type: "verifier_verdict", goal: gid, level: "clean", target: null,
+      lens: ["requirement", "behavior", "progress"],
+    });
+    recordEvent(root, { type: "phase", goal: gid, from: "polish", to: "implementing" });
+    recordEvent(root, { type: "phase", goal: gid, from: "polish", to: "implementing" });
+    recordEvent(root, { type: "escalated", goal: gid, from: "B", at: "now" });
+    recordEvent(root, { type: "critic_review_set", goal: gid, level: "clean" });
+    recordEvent(root, { type: "attempt", goal: gid, ok: false, fail_streak: 2, note: "x" });
+    recordEvent(root, { type: "eval_run", goal: gid, ok: true, fail_streak: 3 });
+    const s = buildGoalSummary(root, gid, {
+      score: 80,
+      now: new Date(Date.parse(new Date().toISOString()) + 61000).toISOString(),
+    });
+    expect(s.entry_route).toBe("B");
+    expect(s.router_route).toBe("polish");
+    expect(s.diff_lines).toBe(500);
+    expect(s.lenses).toEqual(["requirement", "behavior", "progress"]);
+    expect(s.verdict_level).toBe("clean");
+    expect(s.rewinds).toBe(2);
+    expect(s.verifier_rounds).toBe(2);
+    expect(s.max_fail_streak).toBe(3);
+    expect(s.escalated).toBe(true);
+    expect(s.critic_level).toBe("clean");
+    expect(s.score).toBe(80);
+    expect(s.duration_s).toBeGreaterThanOrEqual(0);
+  });
+
+  test("欠測はnull（entry_route未記録はA）・goal_start無しはduration null", () => {
+    const root = tmpRoot();
+    const gid = "g-missing";
+    recordEvent(root, { type: "goal_complete", goal: gid, score: 100 });
+    const s = buildGoalSummary(root, gid, { score: 100 });
+    expect(s.entry_route).toBe("A");
+    expect(s.router_route).toBeNull();
+    expect(s.verdict_level).toBeNull();
+    expect(s.lenses).toEqual([]);
+    expect(s.duration_s).toBeNull();
+    expect(s.title).toBe("(unknown)");
+    expect(s.escalated).toBe(false);
+  });
+
+  test("2行1append＋buildTelemetryのbackfill再合成", () => {
+    const root = tmpRoot();
+    const gid = "g-batch";
+    recordEvent(root, { type: "goal_start", goal: gid, title: "t" });
+    recordEventBatch(root, [
+      { type: "goal_complete", goal: gid, score: 90 },
+      buildGoalSummary(root, gid, { score: 90 }),
+    ]);
+    // history末尾2行がgoal_complete＋goal_summary
+    const lines = readFileSync(join(root, ".graphhopper", "history.jsonl"), "utf8")
+      .trim()
+      .split("\n");
+    expect(JSON.parse(lines[lines.length - 2]!).type).toBe("goal_complete");
+    expect(JSON.parse(lines[lines.length - 1]!).type).toBe("goal_summary");
+    expect(buildTelemetry(root).map((t) => t.goal)).toEqual([gid]);
+    // summary欠落の既存completeは再合成される
+    const root2 = tmpRoot();
+    recordEvent(root2, { type: "goal_start", goal: "g-old", title: "old" });
+    recordEvent(root2, { type: "goal_complete", goal: "g-old", score: 70 });
+    const tele = buildTelemetry(root2);
+    expect(tele.length).toBe(1);
+    expect(tele[0]!.goal).toBe("g-old");
+    expect(tele[0]!.score).toBe(70);
+    expect(tele[0]!.title).toBe("old");
   });
 });
