@@ -292,6 +292,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
       "- general: 3観点（要件逸脱・挙動の妥当性・進捗の収束）を1回のレビューでまとめて見る（advisorの単発呼び出し）",
       "",
       "調査効率則: 周辺探索は graft MCP / ast-grep / rg を優先し漁り読み禁止。",
+      "Readはdiff本体＋graft/diffが指した関数・テスト単位のみ。全文catして数える（cat | wc等）・同一範囲の再読は禁止。行特定はgrep/graftで行い、Readは1範囲1回。",
       "Readはdiff本体＋graft/diffが指した関数・テスト単位のみ。graft未構築時は従来Readへフォールバック。",
       "",
       "drift（乖離）を検出したら全件報告する（confidence/severity付き、閾値カットしない）。",

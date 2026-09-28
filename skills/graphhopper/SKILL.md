@@ -150,6 +150,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
   添付が無ければ「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
   周辺探索はgraft-first（漁り読み禁止。graft/diffが指した関数・テスト単位のReadは可）。
+  全文catして数える（cat | wc等）・同一範囲の再読は禁止。行特定はgrep/graftで行い、Readは1範囲1回。
   findingsには証拠状態を必ず付ける（typesafe流・失敗原因分離）: `裏付けあり` /
   `証拠不足` / `診断未実行` / `実行失敗`。原因不明のままlevelだけ付けない
    結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
