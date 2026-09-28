@@ -941,18 +941,23 @@ export function buildGoalSummary(
  * goal_summary行を返し、欠落分（既存complete＝backfill兼用）はhistoryから再合成する */
 export function buildTelemetry(root: string): GoalSummaryRecord[] {
   const summaries = new Map<string, GoalSummaryRecord>();
-  const completedScore = new Map<string, number | null>();
+  const completed = new Map<string, { score: number | null; ts?: string }>();
   for (const h of readHistory(root)) {
     const g = (h as { goal?: unknown }).goal;
     if (typeof g !== "string") continue;
     if (h.type === "goal_summary") summaries.set(g, h);
-    else if (h.type === "goal_complete" && !completedScore.has(g)) {
-      completedScore.set(g, (h as { score?: number | null }).score ?? null);
+    else if (h.type === "goal_complete" && !completed.has(g)) {
+      completed.set(g, {
+        score: (h as { score?: number | null }).score ?? null,
+        ts: h.ts,
+      });
     }
   }
   const out = [...summaries.values()];
-  for (const [g, score] of completedScore) {
-    if (!summaries.has(g)) out.push(buildGoalSummary(root, g, { score }));
+  for (const [g, c] of completed) {
+    // backfill再合成はgoal_completeのtsをnowに使う（クエリ時刻依存の不安定値を避ける）
+    if (!summaries.has(g))
+      out.push(buildGoalSummary(root, g, { score: c.score, now: c.ts }));
   }
   out.sort((a, b) => (a.goal < b.goal ? -1 : a.goal > b.goal ? 1 : 0));
   return out;

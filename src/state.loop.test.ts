@@ -1667,4 +1667,22 @@ describe("goal_summary telemetry", () => {
     expect(tele[0]!.score).toBe(70);
     expect(tele[0]!.title).toBe("old");
   });
+
+  test("backfillのdurationはgoal_completeのts基準（クエリ時刻に依存しない）", () => {
+    const root = tmpRoot();
+    const t0 = "2026-01-01T00:00:00.000Z";
+    const t1 = "2026-01-01T01:00:00.000Z"; // +3600s
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "history.jsonl"),
+      [
+        JSON.stringify({ ts: t0, type: "goal_start", goal: "g-fixed", title: "f" }),
+        JSON.stringify({ ts: t1, type: "goal_complete", goal: "g-fixed", score: 50 }),
+      ].join("\n") + "\n",
+    );
+    const tele = buildTelemetry(root);
+    expect(tele.length).toBe(1);
+    // 修正前はクエリ時刻now基準で巨大値になった
+    expect(tele[0]!.duration_s).toBe(3600);
+  });
 });
