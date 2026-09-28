@@ -27,6 +27,7 @@ export const PARALLEL_NOTE =
 export const VERIFIER_EFFICIENCY_RULE = [
   "調査効率則: 周辺コード探索は graft MCP / ast-grep / rg を優先し、ファイル横断の漁り読みをしない。",
   "Readはdiff本体＋graft/diffが指した関数・テスト単位のみ。graft未構築時は従来Readへフォールバックする。",
+  "全文catして数える（cat | wc等）・同一範囲の再読は禁止。行特定はgrep/graftで行い、Readは1範囲1回。",
   "型・lint診断は自分で実行しない（診断系コマンドはbash deny）。main添付の診断ファイル（.graphhopper/tmp/diag-<goal>.txt）をReadして証拠に使え。添付が無ければ「診断未実行（理由）」を明記し、診断不在を clean の根拠にしない。",
   "ただし診断クリーン≠driftなし（挙動 drift は診断に出ない）。",
 ].join("\n");
