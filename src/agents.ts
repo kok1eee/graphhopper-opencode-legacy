@@ -206,7 +206,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
 
   "graphhopper-jev": {
     description:
-      "入口トリアージ判定専用。やる内容テキストからroute A/B/Cの1行JSONだけ返す（ollayaのtyped choice相当。生成文・理由文は出さない。モデルは agents.graphhopper-jev で設定）",
+      "入口トリアージ判定専用。やる内容テキストからroute（full/light/direct/advised/oracle）の1行JSONだけ返す（ollayaのtyped choice相当。生成文・理由文は出さない。モデルは agents.graphhopper-jev で設定）",
     mode: "all",
     temperature: 0.1,
     /* 判断材料はテキストのみ。探索・診断は不要のためbash全面deny

@@ -64,8 +64,8 @@ graphhopper-opencode/
 | `graphhopper_phase` | フェーズ遷移（designing → implementing → polish → done） |
 | `graphhopper_router_check` | diffサイズを機械測定し advisor(verifier×1)/polish(verifier×3) に分岐（loop-driver.sh相当） |
 | `graphhopper_diff_stash` | verifier fan-out用にdiffを.graphhopper/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
-| `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（A/B/C。不正値はAに倒す。Cはhistory 1行のみ） |
-| `graphhopper_escalate` | B→A昇格（designing巻き戻し＋critic1回＋fan-out×3。A→B禁止のラチェット） |
+| `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す。directはhistory 1行のみ） |
+| `graphhopper_escalate` | light/advised→full昇格（designing巻き戻し＋critic1回＋fan-out×3。full→light禁止のラチェット） |
 | `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート） |
 | `graphhopper_set_eval` | implementingの合否判定コマンド（本体のeval_cmd相当）を設定。設定後はターン終了ごと自動実行され、pass=polish自動遷移／fail=fail_streak機械カウント |
 | `graphhopper_attempt` | 実装試行の成否を記録（eval_cmd未設定時の自己申告フォールバック。連続失敗でescalate→oracle相談） |
@@ -81,7 +81,7 @@ graphhopper-opencode/
 | subagent | phase | 対象artifact | 用途 | tier |
 |---|---|---|---|---|
 | `graphhopper-researcher` | 任意 | コードベース/外部doc | 事実収集・調査専用。高頻度なので最安モデル | 最下層コスト |
-| `graphhopper-jev` | goal開始前 | やる内容テキスト | 入口トリアージ（route A/B/Cの1行JSON判定。ollaya型typed choice相当） | 最下層コスト |
+| `graphhopper-jev` | goal開始前 | やる内容テキスト | 入口トリアージ（route 5択の1行JSON判定。ollaya型typed choice相当） | 最下層コスト |
 | `graphhopper-advisor` | 任意 | 問い・判定材料テキスト | selector判定・セカンドオピニオン（stuck時はoracle。出力は非拘束） | 最下層コスト |
 | `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 上位品質・別ベンダー推奨 |
 | `graphhopper-oracle` | implementing（詰まった時。`graphhopper_attempt`のfail_streakがstuck_threshold到達） | 失敗試行の文脈 | 手詰まり打開の相談役 | 上位品質 |

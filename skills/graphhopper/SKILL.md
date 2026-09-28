@@ -34,7 +34,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
                      drift target=implementing の巻き戻し
 ```
 
-### 入口トリアージ（jev・route A/B/C）
+### 入口トリアージ（jev・route full/light/direct/advised/oracle）
 
 フルループが大袈裟な作業に相応の重さで回す入口判定。判定は安価な `graphhopper-jev`
 （既定longcat無料。ollaya型typed choice相当＝1行JSONのみ出力）:
@@ -42,15 +42,18 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - `graphhopper_route(request)` → prompt取得 → `task(graphhopper-jev)` /
   `graphhopper_invoke(agent: 'graphhopper-jev')` で判定 →
   `graphhopper_route_set(route, reason)` で記録
-- **A=フル**（現行通り）/**B=軽量**（thin design＋task列のみ、critic省略、verifier general×1）/
-  **C=直行**（loopなし・goalを作らない。historyに1行のみ残る）
-- parse失敗・範囲外・未呼び出しは**Aに倒す**（fail-safe。state null＝A）
-- **昇格のみ可**（A→B禁止のラチェット）。stuck発火時は `graphhopper_escalate`、
-  `router_check` でB＋大diffなら**自動昇格**（designing巻き戻し＋肉付け＋critic1回＋fan-out×3）。
-  stuck発火時もBは自動昇格する（Aのstuckは従来通りoracle相談）。
+- **full=フル**（現行通り）/**light=軽量**（thin design＋task列のみ、critic省略、verifier general×1）/
+  **direct=直行**（loopなし・goalを作らない。historyに1行のみ残る）/
+  **advised=軽量＋第二意見**（light相当＋implementing前にadvisor相談1回）/
+  **oracle=多角**（full相当＋開始時にoracle相談1回。stuck時は同session継続）
+- parse失敗・範囲外・未呼び出しは**fullに倒す**（fail-safe。state null＝full）。
+  旧A/B/Cも受理しfull/light/directに写像する
+- **昇格のみ可**（full→light禁止のラチェット）。stuck発火時は `graphhopper_escalate`、
+  `router_check` でlight/advised＋大diffなら**自動昇格**（designing巻き戻し＋肉付け＋critic1回＋fan-out×3）。
+  stuck発火時もlight/advisedは自動昇格する（fullのstuckは従来通りoracle相談）。
   昇格後はcritic記録なしにimplementingへ進めない（機械ゲート）
-- B適用条件（jev prompt内チェックリスト）：単一関心・設計判断なし・既存踏襲・テスト容易。
-  1つでも欠けたらA。誤Bは昇格で回収する前提
+- light適用条件（jev prompt内チェックリスト）：単一関心・設計判断なし・既存踏襲・テスト容易。
+  1つでも欠けたらfull。誤lightは昇格で回収する前提
 
 ### designing
 

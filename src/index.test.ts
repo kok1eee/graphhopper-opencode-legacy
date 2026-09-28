@@ -103,16 +103,16 @@ describe("plugin route系tool", () => {
     return bound;
   }
 
-  test("route prompt発行＋route_set bare B→pending→goal消費", async () => {
+  test("route prompt発行＋route_set bare light→pending→goal消費", async () => {
     const { getActive, readPendingRoute } = await import("./state");
     const root = tmpRoot();
     const t = await tools(root);
     const prompt = await t.graphhopper_route({ request: "typo修正" });
     expect(prompt).toContain("route");
-    expect(await t.graphhopper_route_set({ route: "B" })).toContain("pending");
-    expect(readPendingRoute(root)?.route).toBe("B");
+    expect(await t.graphhopper_route_set({ route: "light" })).toContain("pending");
+    expect(readPendingRoute(root)?.route).toBe("light");
     await t.graphhopper_goal({ action: "start", title: "t" });
-    expect(getActive(root)!.state.entry_route).toBe("B");
+    expect(getActive(root)!.state.entry_route).toBe("light");
     expect(readPendingRoute(root)).toBeNull();
   });
 
@@ -127,29 +127,41 @@ describe("plugin route系tool", () => {
     expect(prompt).toContain("従来router");
   });
 
-  test("route_set不正→A・escalate→A＋designing", async () => {
+  test("route_set不正→full・escalate→full＋designing", async () => {
     const { getActive, bindEntryRoute, setPhase } = await import("./state");
     const root = tmpRoot();
     const t = await tools(root);
-    expect(await t.graphhopper_route_set({ route: "zzz" })).toContain("entry_route=A");
+    expect(await t.graphhopper_route_set({ route: "zzz" })).toContain("entry_route=full");
     await t.graphhopper_goal({ action: "start", title: "t" });
-    expect(getActive(root)!.state.entry_route).toBe("A");
+    expect(getActive(root)!.state.entry_route).toBe("full");
     expect(await t.graphhopper_escalate({})).toContain("昇格不可");
-    // Bにしてからescalate
+    // lightにしてからescalate
     const root2 = tmpRoot();
     const t2 = await tools(root2);
     await t2.graphhopper_goal({ action: "start", title: "t" });
-    bindEntryRoute(root2, "B");
+    bindEntryRoute(root2, "light");
     setPhase(root2, "implementing");
-    expect(await t2.graphhopper_escalate({})).toContain("escalated: B -> A");
+    expect(await t2.graphhopper_escalate({})).toContain("escalated: light -> full");
     expect(getActive(root2)!.state.phase).toBe("designing");
   });
 
-  test("goal start応答はentry route別指示（B注記）", async () => {
+  test("goal start応答はentry route別指示（light注記）", async () => {
     const root = tmpRoot();
     const t = await tools(root);
-    await t.graphhopper_route_set({ route: "B" });
+    await t.graphhopper_route_set({ route: "light" });
     const started = await t.graphhopper_goal({ action: "start", title: "t" });
-    expect(started).toContain("entry_route=B");
+    expect(started).toContain("entry_route=light");
+  });
+
+  test("route_set directはhistoryのみ（pendingなし・goal消費なし）", async () => {
+    const { getActive, readPendingRoute, readHistory } = await import("./state");
+    const root = tmpRoot();
+    const t = await tools(root);
+    expect(await t.graphhopper_route_set({ route: "direct" })).toContain("historyのみ");
+    expect(readPendingRoute(root)).toBeNull();
+    await t.graphhopper_goal({ action: "start", title: "t" });
+    expect(getActive(root)!.state.entry_route).toBeNull();
+    // directはhistoryに1行残る（goal無しで記録された分）
+    expect(readHistory(root).some((h) => h.type === "entry_route")).toBe(true);
   });
 });

@@ -75,9 +75,25 @@ export type DriftTarget = "implementing" | "design" | "requirements";
 /** general: route=advisor の単発呼び出し（3レンズを1つにまとめた統合charter） */
 export type VerifierLens = "requirement" | "behavior" | "progress" | "general";
 
-/* jev入口トリアージのroute。null＝A（未呼び出し・legacyの機械定義）。
- * B→A昇格のみ可（A→B禁止のラチェット）。Cはgoalを作らない */
-export type EntryRoute = "A" | "B" | "C";
+/* jev入口トリアージのroute。null＝full（未呼び出し・legacyの機械定義）。
+ * light/advised→full昇格のみ可（full→light禁止のラチェット）。directはgoalを作らない */
+export type EntryRoute = "full" | "light" | "direct" | "advised" | "oracle";
+
+/* 旧A/B/C→新名の写像（history既存値はdisk上不変。read時に正規化する） */
+const LEGACY_ROUTE_MAP: Record<string, EntryRoute> = {
+  A: "full",
+  B: "light",
+  C: "direct",
+};
+
+export function normalizeEntryRoute(v: unknown): EntryRoute | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim().toLowerCase();
+  const names: EntryRoute[] = ["full", "light", "direct", "advised", "oracle"];
+  if ((names as string[]).includes(t)) return t as EntryRoute;
+  const legacy = LEGACY_ROUTE_MAP[v.trim().toUpperCase()];
+  return legacy ?? null;
+}
 
 export interface VerifierVerdict {
   level: VerdictLevel;
@@ -177,9 +193,9 @@ export interface LoopState {
   /** goal start時の未コミット脏れ行数（baseline rev基準）。実効diff＝測定－初期値。
    * null＝legacy/未測定→0扱い。designing中はsource編集不可のためstart時測定で安定 */
   initial_diff_lines: number | null;
-  /** jev入口判定のroute。null＝A（未呼び出し・legacy）。B→A昇格のみ可 */
+  /** jev入口判定のroute。null＝full（未呼び出し・legacy）。light/advised→full昇格のみ可 */
   entry_route: EntryRoute | null;
-  /** B→A昇格の実施時刻。null＝未昇格 */
+  /** light/advised→full昇格の実施時刻。null＝未昇格 */
   escalated_at: string | null;
   updated_at: string;
 }
@@ -402,7 +418,7 @@ export type HistoryEvent =
   | { type: "escalated"; goal: string; from: EntryRoute; at: string }
   | {
       /* 改善ループ用per-goal集計行。complete時にgoal_completeと2行1appendで同時書き込み。
-       * 全てhistory由来の機械事実。欠測はnull（entry_route未記録のみ"A"）。
+       * 全てhistory由来の機械事実。欠測はnull（entry_route未記録のみ"full"）。
        * last-write集計（entry_routeのみfirst＝昇格前。escalatedと組合せて区別） */
       type: "goal_summary";
       goal: string;
@@ -639,9 +655,16 @@ export function startGoal(
     goal_id: goal.id,
     session_id: sessionID,
   };
-  // pending entry_route（route_set先行）の消費。無ければnull＝A
+  // pending entry_route（route_set先行）の消費。無ければnull＝full。
+  // directはpendingを書かない（historyのみ）ため消費集合に入れない
   const pending = readPendingRoute(root);
-  if (pending && (pending.route === "A" || pending.route === "B")) {
+  if (
+    pending &&
+    (pending.route === "full" ||
+      pending.route === "light" ||
+      pending.route === "advised" ||
+      pending.route === "oracle")
+  ) {
     next.entry_route = pending.route;
   }
   clearPendingRoute(root);
@@ -860,7 +883,7 @@ export function buildGoalSummary(
   const now = opts?.now ?? new Date().toISOString();
   let title = "(unknown)";
   let startTs: string | null = null;
-  let entryRoute: EntryRoute = "A";
+  let entryRoute: EntryRoute = "full";
   let entrySeen = false;
   let routerRoute: RouterRoute | null = null;
   let diffLines: number | null = null;
@@ -883,7 +906,8 @@ export function buildGoalSummary(
         break;
       case "entry_route":
         if (!entrySeen) {
-          entryRoute = h.route;
+          // 旧A/B/C行は新名に正規化（disk不変・read時変換）
+          entryRoute = normalizeEntryRoute(h.route) ?? "full";
           entrySeen = true;
         }
         break;
@@ -1030,8 +1054,10 @@ export function readPendingRoute(root: string): PendingRoute | null {
   try {
     const raw = readFileSync(pendingRoutePath(root), "utf8");
     const p = JSON.parse(raw) as Partial<PendingRoute>;
-    if (p.route !== "A" && p.route !== "B" && p.route !== "C") return null;
-    return { route: p.route, reason: p.reason, at: String(p.at ?? "") };
+    // 旧A/B/Cも受理し新名に正規化（history互換）。directは消費側で除外する
+    const route = normalizeEntryRoute(p.route);
+    if (!route) return null;
+    return { route, reason: p.reason, at: String(p.at ?? "") };
   } catch {
     return null;
   }
@@ -1046,7 +1072,7 @@ export function clearPendingRoute(root: string): void {
 }
 
 /** route_set→goal先行の救済: entry未記録のactive goalに直接bindする。
- * 記録済み・goal無しはnull（pendingのみ残る） */
+ * 記録済み・goal無し・directはnull（pendingのみ残る／directはhistoryのみ） */
 export function bindEntryRoute(
   root: string,
   route: EntryRoute,
@@ -1054,7 +1080,7 @@ export function bindEntryRoute(
 ): ActiveLoop | null {
   const active = getActive(root);
   if (!active || active.state.entry_route) return null;
-  if (route !== "A" && route !== "B") return null;
+  if (route === "direct") return null;
   const r = mutateActive(root, () => ({ state: { entry_route: route } }));
   if (r) {
     recordEvent(root, {
@@ -1067,16 +1093,17 @@ export function bindEntryRoute(
   return r;
 }
 
-/* B→A昇格（ラチェット）。A→B・null→Bは拒否。
- * 実効: entry_route=A＋escalated_at＋phaseをdesigningに戻す（design肉付け＋critic1回＋
- * fan-outのため。LEGAL_TRANSITIONSの昇格専用経路を使う）。C・goal無しはnull */
+/* light/advised→full昇格（ラチェット）。full→light・null→lightは拒否。
+ * 実効: entry_route=full＋escalated_at＋phaseをdesigningに戻す（design肉付け＋critic1回＋
+ * fan-outのため。LEGAL_TRANSITIONSの昇格専用経路を使う）。direct・oracle・goal無しはnull */
 export function escalateEntryRoute(root: string): ActiveLoop | null {
   const active = getActive(root);
   if (!active) return null;
-  if (active.state.entry_route !== "B") return null;
+  const from = active.state.entry_route;
+  if (from !== "light" && from !== "advised") return null;
   const r = mutateActive(root, () => ({
     state: {
-      entry_route: "A" as EntryRoute,
+      entry_route: "full" as EntryRoute,
       escalated_at: new Date().toISOString(),
       phase: "designing" as Phase,
       ...phaseResetFields(),
@@ -1087,7 +1114,7 @@ export function escalateEntryRoute(root: string): ActiveLoop | null {
     recordEvent(root, {
       type: "escalated",
       goal: r.goal.id,
-      from: "B",
+      from,
       at: r.state.escalated_at ?? "",
     });
   }
@@ -1097,7 +1124,7 @@ export function escalateEntryRoute(root: string): ActiveLoop | null {
 /* 遷移合法性表（takt workflow doctorの発想の機械版）。
  * - 同一phaseは許可（notes更新等の無遷移呼び出しのため）
  * - polish→implementingのみ巻き戻し可（verifier driftの行き先）
- * - implementing/polish→designingはB→A昇格専用経路（escalateEntryRoute経由。
+ * - implementing/polish→designingはlight/advised→full昇格専用経路（escalateEntryRoute経由。
  *   濫用時はhistoryのentry_route/escalated/escalated_atで監査可）
  * - *→doneは不可: doneはcompleteGoal（verifier cleanガード付き）のみ。
  *   clearActiveGoalはstate直書きのためこの表の対象外 */
@@ -1374,8 +1401,8 @@ export interface VerifierResult {
 
 /** verifier_set 入力の検証。通れば null、ダメならエラー文（tool がそのまま返す）。
  * self-graded 完了防止の機械ゲート（旧 lens 空拒否の後継）。
- * opts.entryRoute: B非昇格はgeneral×1のみ可、昇格後は3lens必須。
- * null/Aは現行通り（legacy互換・Aフルはprose＋router運用）。 */
+ * opts.entryRoute: light/advised非昇格はgeneral×1のみ可、昇格後は3lens必須。
+ * null/full/oracleは現行通り（legacy互換・fullはprose＋router運用）。 */
 export function checkVerifierResults(
   results: VerifierResult[] | null | undefined,
   opts?: { entryRoute?: EntryRoute | null; escalated?: boolean },
@@ -1415,21 +1442,21 @@ export function checkVerifierResults(
       return `error: drift には target が必要です (lens: ${r.lens})`;
     }
   }
-  // entry route×lens照合（B非昇格はgeneral×1のみ、昇格後は3lens必須。
-  // 昇格後はentry_route自体がAに戻るためescalated旗で判定する。
-  // null/A非昇格は現行通り＝legacy互換・Aフルはprose＋router運用）
+  // entry route×lens照合（light/advised非昇格はgeneral×1のみ、昇格後は3lens必須。
+  // 昇格後はentry_route自体がfullに戻るためescalated旗で判定する。
+  // null/full/oracle非昇格は現行通り＝legacy互換・fullはprose＋router運用）
   if (opts?.escalated) {
     if (
       !seen.has("requirement") ||
       !seen.has("behavior") ||
       !seen.has("progress")
     ) {
-      return "error: 昇格後（B→A）の verifier は requirement/behavior/progress の3lens必須";
+      return "error: 昇格後（light/advised→full）の verifier は requirement/behavior/progress の3lens必須";
     }
-  } else if (opts?.entryRoute === "B") {
+  } else if (opts?.entryRoute === "light" || opts?.entryRoute === "advised") {
     const lenses = [...seen];
     if (lenses.length !== 1 || lenses[0] !== "general") {
-      return "error: entry_route=B（非昇格）の verifier は general×1 のみ可。fan-outが必要なら graphhopper_escalate でB→A昇格してから3lensで記録せよ";
+      return "error: entry_route=light/advised（非昇格）の verifier は general×1 のみ可。fan-outが必要なら graphhopper_escalate でfullへ昇格してから3lensで記録せよ";
     }
   }
   return null;

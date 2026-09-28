@@ -446,19 +446,26 @@ describe("continuationText 3段階文面", () => {
 describe("jev判定parse・thin gate（gate.ts）", () => {
   test("parseEntryRoute: 正常系とfail-safe", async () => {
     const g = await import("./gate");
-    expect(g.parseEntryRoute('{"route":"B"}').route).toBe("B");
-    expect(g.parseEntryRoute('前置き\n{"route": "c"}\n後書き').route).toBe("C");
-    expect(g.parseEntryRoute("garbage").route).toBe("A");
-    expect(g.parseEntryRoute("").route).toBe("A");
-    expect(g.parseEntryRoute(null).route).toBe("A");
-    expect(g.parseEntryRoute('{"route":"Z"}').route).toBe("A");
-    // bare入力（route_set schemaが素のA/B/Cを受ける。simplify指摘のcritical回帰）
-    expect(g.parseEntryRoute("B").route).toBe("B");
-    expect(g.parseEntryRoute("b").route).toBe("B");
-    expect(g.parseEntryRoute("  c  ").route).toBe("C");
-    expect(g.parseEntryRoute("B\n").route).toBe("B");
-    expect(g.parseEntryRoute(" A ").route).toBe("A");
-    expect(g.parseEntryRoute("a").route).toBe("A");
+    expect(g.parseEntryRoute('{"route":"light"}').route).toBe("light");
+    expect(g.parseEntryRoute('{"route":"advised"}').route).toBe("advised");
+    expect(g.parseEntryRoute('{"route":"oracle"}').route).toBe("oracle");
+    expect(g.parseEntryRoute('前置き\n{"route": "direct"}\n後書き').route).toBe("direct");
+    expect(g.parseEntryRoute("garbage").route).toBe("full");
+    expect(g.parseEntryRoute("").route).toBe("full");
+    expect(g.parseEntryRoute(null).route).toBe("full");
+    expect(g.parseEntryRoute('{"route":"Z"}').route).toBe("full");
+    // 旧A/B/C互換（bare・JSON内。simplify指摘のcritical回帰）
+    expect(g.parseEntryRoute('{"route":"B"}').route).toBe("light");
+    expect(g.parseEntryRoute('前置き\n{"route": "c"}\n後書き').route).toBe("direct");
+    expect(g.parseEntryRoute("B").route).toBe("light");
+    expect(g.parseEntryRoute("b").route).toBe("light");
+    expect(g.parseEntryRoute("  c  ").route).toBe("direct");
+    expect(g.parseEntryRoute("B\n").route).toBe("light");
+    expect(g.parseEntryRoute(" A ").route).toBe("full");
+    expect(g.parseEntryRoute("a").route).toBe("full");
+    // 大小文字不問の新名
+    expect(g.parseEntryRoute("Light").route).toBe("light");
+    expect(g.parseEntryRoute("  ADVISED  ").route).toBe("advised");
   });
 
   test("parseSelectorOutput: 正常系とfail-safe（従来router継続）", async () => {
@@ -500,14 +507,20 @@ describe("jev判定parse・thin gate（gate.ts）", () => {
     expect(g.checkDesignDocThin(root, goal.id)).toEqual([]);
   });
 
-  test("effectivePhaseAction: Bのみ注記", async () => {
+  test("effectivePhaseAction: light/advisedのみ注記", async () => {
     const g = await import("./gate");
     expect(g.effectivePhaseAction("designing", null)).toBe(g.PHASE_ACTION["designing"]);
-    expect(g.effectivePhaseAction("designing", "A")).toBe(g.PHASE_ACTION["designing"]);
-    const b = g.effectivePhaseAction("designing", "B");
-    expect(b).toContain("thin doc");
-    expect(b).toContain("critic省略");
-    expect(g.effectivePhaseAction("polish", "B")).toContain("general×1");
+    expect(g.effectivePhaseAction("designing", "full")).toBe(g.PHASE_ACTION["designing"]);
+    const light = g.effectivePhaseAction("designing", "light");
+    expect(light).toContain("thin doc");
+    expect(light).toContain("critic省略");
+    expect(g.effectivePhaseAction("polish", "light")).toContain("general×1");
+    const advised = g.effectivePhaseAction("designing", "advised");
+    expect(advised).toContain("thin doc");
+    expect(advised).toContain("graphhopper-advisor");
+    const oracle = g.effectivePhaseAction("designing", "oracle");
+    expect(oracle).toContain("graphhopper-oracle");
+    expect(g.effectivePhaseAction("designing", "direct")).toBe(g.PHASE_ACTION["designing"]);
   });
 });
 

@@ -393,7 +393,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             `goal: "${a.goal.title}" (${a.goal.id}) [${a.goal.status}]`,
             `phase: ${a.state.phase}`,
             `session: ${a.state.session_id ?? "unbound"}`,
-            `entry_route: ${a.state.entry_route ?? "A（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にB→A昇格）` : ""}`,
+            `entry_route: ${a.state.entry_route ?? "full（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にlight/advised→full昇格）` : ""}`,
             a.state.router.route
               ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}`
               : "router: (not checked)",
@@ -441,7 +441,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
 
       graphhopper_route: tool({
         description:
-          "jev入口トリアージの判定promptを発行する。やる内容を渡すとroute A/B/C の判定手順を返す（LLM呼び出しはtool外: task/invokeのgraphhopper-jevで判定しgraphhopper_route_setで記録せよ）",
+          "jev入口トリアージの判定promptを発行する。やる内容を渡すとroute（full/light/direct/advised/oracle）の判定手順を返す（LLM呼び出しはtool外: task/invokeのgraphhopper-jevで判定しgraphhopper_route_setで記録せよ）",
         args: {
           request: tool.schema
             .string()
@@ -455,18 +455,18 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             buildJevPrompt(args.request),
             "",
             "2. 返却JSONを graphhopper_route_set(route, reason) で記録する。",
-            "3. A/Bなら graphhopper_goal(start)（pending routeが消費される）。Cならloopなしで直接対応する。",
+            "3. full/light/advised/oracleなら graphhopper_goal(start)（pending routeが消費される）。directならloopなしで直接対応する。",
           ].join("\n");
         },
       }),
 
       graphhopper_route_set: tool({
         description:
-          "jev判定の記録。route∉{A,B,C}・空はAに倒す（fail-safe）。A/Bは次回goal start時に消費されるpendingに置く。Cはhistoryに1行残すのみ（goalを作らない）",
+          "jev判定の記録。不正・空はfullに倒す（fail-safe）。full/light/advised/oracleは次回goal start時に消費されるpendingに置く。directはhistoryに1行残すのみ（goalを作らない）",
         args: {
           route: tool.schema
             .string()
-            .describe("jev返却のroute（A/B/C。大文字小文字不問。不正値はAに倒す）"),
+            .describe("jev返却のroute（full/light/direct/advised/oracle。旧A/B/Cも受理。大文字小文字不問。不正値はfullに倒す）"),
           reason: tool.schema
             .string()
             .optional()
@@ -475,15 +475,15 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         async execute(args) {
           const parsed = parseEntryRoute(args.route);
           const reason = args.reason ?? parsed.reason;
-          if (parsed.route === "C") {
+          if (parsed.route === "direct") {
             const active = state.getActive(root);
             state.recordEvent(root, {
               type: "entry_route",
               ...(active?.goal.id ? { goal: active.goal.id } : {}),
-              route: "C",
+              route: "direct",
               reason,
             });
-            return "entry_route=C を記録（historyのみ）。loopなしで直接対応せよ。goalは作らない。";
+            return "entry_route=direct を記録（historyのみ）。loopなしで直接対応せよ。goalは作らない。";
           }
           state.writePendingRoute(root, parsed.route, reason);
           const bound = state.bindEntryRoute(root, parsed.route, reason);
@@ -523,14 +523,15 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
 
       graphhopper_escalate: tool({
         description:
-          "B→A昇格（ラチェット）。entry_route=Bのときのみ有効。phaseをdesigningに戻しdesign肉付け＋critic1回＋verifier fan-outに格上げする。A→B・未設定・Cは拒否",
+          "light/advised→full昇格（ラチェット）。entry_route=light/advisedのときのみ有効。phaseをdesigningに戻しdesign肉付け＋critic1回＋verifier fan-outに格上げする。full→light・未設定・direct/oracleは拒否",
         args: {},
         async execute() {
+          const from = state.getActive(root)?.state.entry_route;
           const r = state.escalateEntryRoute(root);
           if (!r)
-            return "error: 昇格不可（active goalなし、または entry_route=B ではない）。A→B引き下げ・C・未設定からの昇格は禁止";
+            return "error: 昇格不可（active goalなし、または entry_route=light/advised ではない）。full→light引き下げ・direct/oracle・未設定からの昇格は禁止";
           return [
-            "escalated: B -> A（designingに巻き戻し）。",
+            `escalated: ${from} -> full（designingに巻き戻し）。`,
             ESCALATE_NEXT,
           ].join("\n");
         },
@@ -624,7 +625,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             if (esc) {
               return [
                 `attempt recorded: fail (fail_streak=${r.fail_streak})`,
-                `stuck: ${stuck.reasons.join(", ")} → B→A自動昇格（designingに巻き戻し）。`,
+                `stuck: ${stuck.reasons.join(", ")} → light/advised→full自動昇格（designingに巻き戻し）。`,
                 ESCALATE_NEXT,
                 managed,
               ]
@@ -666,13 +667,17 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           const route: state.RouterRoute =
             diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
           state.recordRouterCheck(root, baseline, diffLines, route);
-          // Bの想定外（大diff）は自動昇格: designingに戻し肉付け＋critic＋fan-outへ
+          // light/advisedの想定外（大diff）は自動昇格: designingに戻し肉付け＋critic＋fan-outへ
           const pre = state.getActive(root);
-          if (pre?.state.entry_route === "B" && route === "polish") {
+          if (
+            (pre?.state.entry_route === "light" ||
+              pre?.state.entry_route === "advised") &&
+            route === "polish"
+          ) {
             state.escalateEntryRoute(root);
             return [
               `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
-              "route: polish + B→A自動昇格（designingに巻き戻し）。",
+              "route: polish + light/advised→full自動昇格（designingに巻き戻し）。",
               ESCALATE_NEXT,
             ].join("\n");
           }
@@ -1455,7 +1460,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               ) {
                 const esc = autoEscalateOnStuck(root);
                 stuckLine = esc
-                  ? `stuck: ${stuck.reasons.join(", ")} → B→A自動昇格（designingに巻き戻し）。${ESCALATE_NEXT}`
+                  ? `stuck: ${stuck.reasons.join(", ")} → light/advised→full自動昇格（designingに巻き戻し）。${ESCALATE_NEXT}`
                   : `stuck: ${stuck.reasons.join(", ")} — task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。`;
               }
             }

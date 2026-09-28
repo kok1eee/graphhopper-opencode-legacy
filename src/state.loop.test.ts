@@ -1413,47 +1413,69 @@ describe("退避diff掃除（complete/clear）", () => {
 });
 
 describe("entry_route（jevトリアージ）", () => {
-  test("pendingはgoal startで消費される（B）", async () => {
+  test("pendingはgoal startで消費される（light）", async () => {
     const s = await import("./state");
     const root = tmpRoot();
-    s.writePendingRoute(root, "B", "test");
-    expect(s.readPendingRoute(root)?.route).toBe("B");
+    s.writePendingRoute(root, "light", "test");
+    expect(s.readPendingRoute(root)?.route).toBe("light");
     const { goal } = s.startGoal(root, "t", "s1");
-    expect(s.getActive(root)!.state.entry_route).toBe("B");
+    expect(s.getActive(root)!.state.entry_route).toBe("light");
     expect(s.readPendingRoute(root)).toBeNull();
     expect(
-      s.readHistory(root).some((h) => h.type === "entry_route" && (h as { route?: string }).route === "B" && (h as { goal?: string }).goal === goal.id),
+      s.readHistory(root).some((h) => h.type === "entry_route" && (h as { route?: string }).route === "light" && (h as { goal?: string }).goal === goal.id),
     ).toBe(true);
   });
 
-  test("pending無しはnull＝A", async () => {
+  test("旧B pendingはlightに正規化される", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "pending_route.json"),
+      JSON.stringify({ route: "B", reason: "legacy", at: "t" }),
+    );
+    expect(s.readPendingRoute(root)?.route).toBe("light");
+  });
+
+  test("pending無しはnull＝full", async () => {
     const s = await import("./state");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
     expect(s.getActive(root)!.state.entry_route).toBeNull();
   });
 
-  test("bindEntryRouteは未記録にのみbindする", async () => {
+  test("bindEntryRouteは未記録にのみbindする（direct拒否）", async () => {
     const s = await import("./state");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
-    expect(s.bindEntryRoute(root, "B", "r")!.state.entry_route).toBe("B");
-    expect(s.bindEntryRoute(root, "A", "r")).toBeNull();
-    expect(s.getActive(root)!.state.entry_route).toBe("B");
+    expect(s.bindEntryRoute(root, "advised", "r")!.state.entry_route).toBe("advised");
+    expect(s.bindEntryRoute(root, "full", "r")).toBeNull();
+    expect(s.getActive(root)!.state.entry_route).toBe("advised");
+    const root2 = tmpRoot();
+    s.startGoal(root2, "t", "s1");
+    expect(s.bindEntryRoute(root2, "direct", "r")).toBeNull();
+    expect(s.getActive(root2)!.state.entry_route).toBeNull();
   });
 
-  test("escalateはB→Aのみ（designing巻き戻し＋escalated_at）", async () => {
+  test("escalateはlight/advised→fullのみ（designing巻き戻し＋escalated_at）", async () => {
     const s = await import("./state");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
     expect(s.escalateEntryRoute(root)).toBeNull();
-    s.bindEntryRoute(root, "B");
+    s.bindEntryRoute(root, "light");
     s.setPhase(root, "implementing");
     const r = s.escalateEntryRoute(root)!;
-    expect(r.state.entry_route).toBe("A");
+    expect(r.state.entry_route).toBe("full");
     expect(r.state.phase).toBe("designing");
     expect(r.state.escalated_at).not.toBeNull();
     expect(s.escalateEntryRoute(root)).toBeNull();
+    // oracleは昇格対象外
+    const root2 = tmpRoot();
+    s.startGoal(root2, "t", "s1");
+    s.bindEntryRoute(root2, "oracle");
+    expect(s.escalateEntryRoute(root2)).toBeNull();
   });
 
   test("verifier_setのroute×lens照合", () => {
@@ -1463,45 +1485,64 @@ describe("entry_route（jevトリアージ）", () => {
       { lens: "behavior", level: "clean" },
       { lens: "progress", level: "clean" },
     ] as Parameters<typeof checkVerifierResults>[0];
-    expect(checkVerifierResults([g], { entryRoute: "B" })).toBeNull();
-    expect(checkVerifierResults(three, { entryRoute: "B" })).not.toBeNull();
-    expect(checkVerifierResults(three, { entryRoute: "B", escalated: true })).toBeNull();
-    expect(checkVerifierResults([g], { entryRoute: "B", escalated: true })).not.toBeNull();
-    expect(checkVerifierResults([g], { entryRoute: "A" })).toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "light" })).toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "advised" })).toBeNull();
+    expect(checkVerifierResults(three, { entryRoute: "light" })).not.toBeNull();
+    expect(checkVerifierResults(three, { entryRoute: "light", escalated: true })).toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "light", escalated: true })).not.toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "full" })).toBeNull();
+    expect(checkVerifierResults(three, { entryRoute: "oracle" })).toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "oracle" })).toBeNull();
     expect(checkVerifierResults([g], {})).toBeNull();
     expect(checkVerifierResults([g])).toBeNull();
   });
+
+  test("normalizeEntryRoute: 新名・旧名・不正", async () => {
+    const s = await import("./state");
+    expect(s.normalizeEntryRoute("light")).toBe("light");
+    expect(s.normalizeEntryRoute("Advised")).toBe("advised");
+    expect(s.normalizeEntryRoute("B")).toBe("light");
+    expect(s.normalizeEntryRoute("c")).toBe("direct");
+    expect(s.normalizeEntryRoute("zzz")).toBeNull();
+    expect(s.normalizeEntryRoute(null)).toBeNull();
+  });
 });
 
-describe("B designing巻き戻しのescalate強制", () => {
-  test("B未昇格の素の巻き戻しはescalate誘導エラー", async () => {
+describe("light/advised designing巻き戻しのescalate強制", () => {
+  test("light未昇格の素の巻き戻しはescalate誘導エラー", async () => {
     const s = await import("./state");
     const { checkPhaseMove } = await import("./gate");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
-    s.bindEntryRoute(root, "B");
+    s.bindEntryRoute(root, "light");
     s.setPhase(root, "implementing");
     const err = checkPhaseMove(root, "designing");
     expect(err).toContain("graphhopper_escalate");
-    // Aは素の巻き戻し可
+    // fullは素の巻き戻し可
     const root2 = tmpRoot();
     s.startGoal(root2, "t", "s1");
     s.setPhase(root2, "implementing");
     expect(checkPhaseMove(root2, "designing")).toBeNull();
-    // polish起点もBはescalate強制
+    // polish起点もlightはescalate強制
     const root3 = tmpRoot();
     s.startGoal(root3, "t", "s1");
-    s.bindEntryRoute(root3, "B");
+    s.bindEntryRoute(root3, "light");
     s.setPhase(root3, "implementing");
     s.setPhase(root3, "polish");
     expect(checkPhaseMove(root3, "designing")).toContain("graphhopper_escalate");
+    // oracleは素の巻き戻し可（full相当）
+    const root4 = tmpRoot();
+    s.startGoal(root4, "t", "s1");
+    s.bindEntryRoute(root4, "oracle");
+    s.setPhase(root4, "implementing");
+    expect(checkPhaseMove(root4, "designing")).toBeNull();
   });
 
   test("escalateはpolishからも可（last_verifierリセット）", async () => {
     const s = await import("./state");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
-    s.bindEntryRoute(root, "B");
+    s.bindEntryRoute(root, "light");
     s.setPhase(root, "implementing");
     s.setPhase(root, "polish");
     s.setVerifierVerdict(root, {
@@ -1514,7 +1555,7 @@ describe("B designing巻き戻しのescalate強制", () => {
     const r = s.escalateEntryRoute(root)!;
     expect(r.state.phase).toBe("designing");
     expect(r.state.last_verifier).toBeNull();
-    expect(r.state.entry_route).toBe("A");
+    expect(r.state.entry_route).toBe("full");
   });
 });
 
@@ -1524,7 +1565,7 @@ describe("昇格後critic必須＋stuck自動昇格", () => {
     const { checkPhaseMove } = await import("./gate");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
-    s.bindEntryRoute(root, "B");
+    s.bindEntryRoute(root, "light");
     s.setPhase(root, "implementing");
     s.escalateEntryRoute(root);
     expect(checkPhaseMove(root, "implementing")).toContain("critic_review");
@@ -1532,15 +1573,15 @@ describe("昇格後critic必須＋stuck自動昇格", () => {
     expect(checkPhaseMove(root, "implementing")).toBeNull();
   });
 
-  test("autoEscalateOnStuckはB未昇格のみ昇格", async () => {
+  test("autoEscalateOnStuckはlight/advised未昇格のみ昇格", async () => {
     const s = await import("./state");
     const g = await import("./gate");
     const root = tmpRoot();
     s.startGoal(root, "t", "s1");
     expect(g.autoEscalateOnStuck(root)).toBeNull();
-    s.bindEntryRoute(root, "B");
+    s.bindEntryRoute(root, "advised");
     s.setPhase(root, "implementing");
-    expect(g.autoEscalateOnStuck(root)!.state.entry_route).toBe("A");
+    expect(g.autoEscalateOnStuck(root)!.state.entry_route).toBe("full");
     expect(g.autoEscalateOnStuck(root)).toBeNull();
   });
 });
@@ -1594,7 +1635,7 @@ describe("goal_summary telemetry", () => {
     const root = tmpRoot();
     const gid = "g-test";
     recordEvent(root, { type: "goal_start", goal: gid, title: "t" });
-    recordEvent(root, { type: "entry_route", goal: gid, route: "B", reason: "x" });
+    recordEvent(root, { type: "entry_route", goal: gid, route: "light", reason: "x" });
     recordEvent(root, { type: "router_check", goal: gid, diff_lines: 100, route: "advisor" });
     recordEvent(root, { type: "router_check", goal: gid, diff_lines: 500, route: "polish" });
     recordEvent(root, {
@@ -1606,7 +1647,7 @@ describe("goal_summary telemetry", () => {
     });
     recordEvent(root, { type: "phase", goal: gid, from: "polish", to: "implementing" });
     recordEvent(root, { type: "phase", goal: gid, from: "polish", to: "implementing" });
-    recordEvent(root, { type: "escalated", goal: gid, from: "B", at: "now" });
+    recordEvent(root, { type: "escalated", goal: gid, from: "light", at: "now" });
     recordEvent(root, { type: "critic_review_set", goal: gid, level: "clean" });
     recordEvent(root, { type: "attempt", goal: gid, ok: false, fail_streak: 2, note: "x" });
     recordEvent(root, { type: "eval_run", goal: gid, ok: true, fail_streak: 3 });
@@ -1614,7 +1655,7 @@ describe("goal_summary telemetry", () => {
       score: 80,
       now: new Date(Date.parse(new Date().toISOString()) + 61000).toISOString(),
     });
-    expect(s.entry_route).toBe("B");
+    expect(s.entry_route).toBe("light");
     expect(s.router_route).toBe("polish");
     expect(s.diff_lines).toBe(500);
     expect(s.lenses).toEqual(["requirement", "behavior", "progress"]);
@@ -1628,12 +1669,12 @@ describe("goal_summary telemetry", () => {
     expect(s.duration_s).toBeGreaterThanOrEqual(0);
   });
 
-  test("欠測はnull（entry_route未記録はA）・goal_start無しはduration null", () => {
+  test("欠測はnull（entry_route未記録はfull）・goal_start無しはduration null", () => {
     const root = tmpRoot();
     const gid = "g-missing";
     recordEvent(root, { type: "goal_complete", goal: gid, score: 100 });
     const s = buildGoalSummary(root, gid, { score: 100 });
-    expect(s.entry_route).toBe("A");
+    expect(s.entry_route).toBe("full");
     expect(s.router_route).toBeNull();
     expect(s.verdict_level).toBeNull();
     expect(s.lenses).toEqual([]);
@@ -1684,5 +1725,22 @@ describe("goal_summary telemetry", () => {
     expect(tele.length).toBe(1);
     // 修正前はクエリ時刻now基準で巨大値になった
     expect(tele[0]!.duration_s).toBe(3600);
+  });
+
+  test("旧A/B/C行はread時正規化（disk不変）", () => {
+    const root = tmpRoot();
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "history.jsonl"),
+      [
+        JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", type: "goal_start", goal: "g-leg", title: "l" }),
+        JSON.stringify({ ts: "2026-01-01T00:01:00.000Z", type: "entry_route", goal: "g-leg", route: "B" }),
+        JSON.stringify({ ts: "2026-01-01T00:02:00.000Z", type: "goal_complete", goal: "g-leg", score: 60 }),
+      ].join("\n") + "\n",
+    );
+    const tele = buildTelemetry(root);
+    expect(tele.length).toBe(1);
+    expect(tele[0]!.entry_route).toBe("light");
+    expect(tele[0]!.duration_s).toBe(120);
   });
 });

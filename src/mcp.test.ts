@@ -619,20 +619,20 @@ describe("graphhopper-mcp route系tool（統合）", () => {
         arguments: { root: root2, route: "zzz" },
       });
       const c2 = r2.content as { type: string; text: string }[];
-      expect(c2[0]?.text ?? "").toContain("entry_route=A");
+      expect(c2[0]?.text ?? "").toContain("entry_route=full");
       await client2.close();
     }
     await call("graphhopper_goal", { action: "start", title: "route test" });
     // goal先行のbind
-    expect(await call("graphhopper_route_set", { route: "B" })).toContain("bind");
-    // B＋general×1は可
+    expect(await call("graphhopper_route_set", { route: "light" })).toContain("bind");
+    // light＋general×1は可
     expect(
       await call("graphhopper_verifier_set", {
         results: [{ lens: "general", level: "clean" }],
         reason: "ok",
       }),
     ).toContain("verifier verdict: clean");
-    // B＋3lensは拒否
+    // light＋3lensは拒否
     expect(
       await call("graphhopper_verifier_set", {
         results: [
@@ -643,8 +643,8 @@ describe("graphhopper-mcp route系tool（統合）", () => {
         reason: "ok",
       }),
     ).toContain("general×1");
-    // escalateでA＋designing
-    expect(await call("graphhopper_escalate", {})).toContain("escalated: B -> A");
+    // escalateでfull＋designing
+    expect(await call("graphhopper_escalate", {})).toContain("escalated: light -> full");
     // 昇格後は3lens必須（general×1は拒否）
     expect(
       await call("graphhopper_verifier_set", {
@@ -671,14 +671,14 @@ describe("graphhopper-mcp route系tool（統合）", () => {
       return c[0]?.text ?? "";
     };
     await call("graphhopper_goal", { action: "start", title: "auto esc" });
-    st.bindEntryRoute(root, "B");
+    st.bindEntryRoute(root, "advised");
     await call("graphhopper_phase", { phase: "implementing" });
     // goal開始後の実装分だけが実効diffになる（start前脏れは除外される）
     writeFileSync(join(root, "a.txt"), Array(450).fill("y").join("\n") + "\n");
     const out = await call("graphhopper_router_check", {});
     expect(out).toContain("自動昇格");
     expect(st.getActive(root)!.state.phase).toBe("designing");
-    expect(st.getActive(root)!.state.entry_route).toBe("A");
+    expect(st.getActive(root)!.state.entry_route).toBe("full");
     await client.close();
   });
 

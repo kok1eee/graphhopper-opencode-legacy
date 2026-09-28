@@ -150,7 +150,7 @@ function statusText(root: string): string {
     `goal: "${a.goal.title}" (${a.goal.id}) [${a.goal.status}]`,
     `phase: ${a.state.phase}`,
     `session: ${a.state.session_id ?? "unbound"}`,
-    `entry_route: ${a.state.entry_route ?? "A（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にB→A昇格）` : ""}`,
+    `entry_route: ${a.state.entry_route ?? "full（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にlight/advised→full昇格）` : ""}`,
     a.state.router.route
       ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}`
       : "router: (not checked)",
@@ -342,7 +342,7 @@ function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
       return {
         text: [
           `attempt recorded: fail (fail_streak=${r.fail_streak})`,
-          `stuck: ${stuck.reasons.join(", ")} → B→A自動昇格（designingに巻き戻し）。`,
+          `stuck: ${stuck.reasons.join(", ")} → light/advised→full自動昇格（designingに巻き戻し）。`,
           ESCALATE_NEXT,
           managed,
         ]
@@ -443,7 +443,7 @@ async function evalOnce(root: string): Promise<string> {
     if (stuck.escalate && state.noteStuckNotified(root, stuck.reasons)) {
       const esc = autoEscalateOnStuck(root);
       stuckLine = esc
-        ? `stuck: ${stuck.reasons.join(", ")} → B→A自動昇格（designingに巻き戻し）。${ESCALATE_NEXT}`
+        ? `stuck: ${stuck.reasons.join(", ")} → light/advised→full自動昇格（designingに巻き戻し）。${ESCALATE_NEXT}`
         : `stuck: ${stuck.reasons.join(", ")} — task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。`;
     }
   }
@@ -472,12 +472,16 @@ async function routerCheck(root: string): Promise<ToolOut> {
     diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
   state.recordRouterCheck(root, baseline, diffLines, route);
   const pre = state.getActive(root);
-  if (pre?.state.entry_route === "B" && route === "polish") {
+  if (
+    (pre?.state.entry_route === "light" ||
+      pre?.state.entry_route === "advised") &&
+    route === "polish"
+  ) {
     state.escalateEntryRoute(root);
     return {
       text: [
         `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
-        "route: polish + B→A自動昇格（designingに巻き戻し）。",
+        "route: polish + light/advised→full自動昇格（designingに巻き戻し）。",
         ESCALATE_NEXT,
       ].join("\n"),
       data: { diffLines, route, threshold: cfg.router_threshold_lines, escalated: true },
@@ -950,12 +954,12 @@ const TOOL_DEFS: ToolDef[] = [
   {
     name: "graphhopper_route_set",
     description:
-      "jev判定の記録。不正値はAに倒す。A/Bは次回goal start時に消費。Cはhistoryに1行残すのみ",
+      "jev判定の記録。不正値はfullに倒す。full/light/advised/oracleは次回goal start時に消費。directはhistoryに1行残すのみ",
     inputSchema: {
       type: "object",
       properties: {
         root: ROOT_PROP,
-        route: { type: "string", description: "jev返却のroute（A/B/C。不正値はAに倒す）" },
+        route: { type: "string", description: "jev返却のroute（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す）" },
         reason: { type: "string", description: "判定理由の要旨（任意）" },
       },
       required: ["route"],
@@ -972,17 +976,17 @@ const TOOL_DEFS: ToolDef[] = [
     run: (a, ctx) => {
       const parsed = parseEntryRoute(a.route as string);
       const reason = (a.reason as string | undefined) ?? parsed.reason;
-      if (parsed.route === "C") {
+      if (parsed.route === "direct") {
         const active = state.getActive(ctx.root);
         state.recordEvent(ctx.root, {
           type: "entry_route",
           ...(active?.goal.id ? { goal: active.goal.id } : {}),
-          route: "C",
+          route: "direct",
           reason,
         });
         return {
-          text: "entry_route=C を記録（historyのみ）。loopなしで直接対応せよ。",
-          data: { route: "C", bound: false },
+          text: "entry_route=direct を記録（historyのみ）。loopなしで直接対応せよ。",
+          data: { route: "direct", bound: false },
         };
       }
       state.writePendingRoute(ctx.root, parsed.route, reason);
@@ -1033,7 +1037,7 @@ const TOOL_DEFS: ToolDef[] = [
   {
     name: "graphhopper_escalate",
     description:
-      "B→A昇格。designingに巻き戻しdesign肉付け＋critic1回＋fan-outに格上げ。A→B・未設定・Cは拒否",
+      "light/advised→full昇格。designingに巻き戻しdesign肉付け＋critic1回＋fan-outに格上げ。full→light・未設定・direct/oracleは拒否",
     inputSchema: { type: "object", properties: { root: ROOT_PROP } },
     schema: z.object({ root: rootZ }),
     outputSchema: {
@@ -1042,14 +1046,15 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["escalated"],
     },
     run: (a, ctx) => {
+      const from = state.getActive(ctx.root)?.state.entry_route;
       const r = state.escalateEntryRoute(ctx.root);
       if (!r)
         return {
-          text: "error: 昇格不可（active goalなし、または entry_route=B ではない）",
+          text: "error: 昇格不可（active goalなし、または entry_route=light/advised ではない）",
           data: { escalated: false },
         };
       return {
-        text: "escalated: B -> A（designingに巻き戻し）。design肉付け＋critic1回＋fan-out×3が必須。",
+        text: `escalated: ${from} -> full（designingに巻き戻し）。design肉付け＋critic1回＋fan-out×3が必須。`,
         data: { escalated: true },
       };
     },
