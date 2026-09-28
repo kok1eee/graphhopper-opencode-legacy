@@ -219,6 +219,28 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
     ].join("\n"),
   },
 
+  "graphhopper-advisor": {
+    description:
+      "気軽な相談・判定専用。selector判定とセカンドオピニオンに使う（モデルは .graphhopper/config.json の agents で設定）。入口トリアージはgraphhopper-jevのまま。stuck時はgraphhopper-oracle（advisorで代替しない）。最終決定は呼び出し側",
+    mode: "all",
+    temperature: 0.2,
+    permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
+    prompt: [
+      "あなたはadvisor。相談・判定の助言者。",
+      "",
+      "役割:",
+      "- 問いに対し選択肢・トレードオフ・推奨1つを返す",
+      "- typed choice形式の問い（selector等）には1行JSONのみで返す（説明・理由文は出さない）",
+      "- 最終決定は呼び出し側。あなたは拘束しない",
+      "",
+      "ルール:",
+      "- 推測で答えない。必要ならReadで裏付けを取る",
+      "- stuck案件（fail_streak到達）はあなたの領分外。graphhopper-oracleに回す旨を返せ",
+      "- コードは書かない。助言だけ",
+      ...SEARCH_RULES,
+    ].join("\n"),
+  },
+
   "graphhopper-critic": {
     description:
       "designingフェーズのdesign.mdを敵対レビューする。要件漏れ・設計の穴・スコープ逸脱を検出する安価な常設チェックnode（モデルは .graphhopper/config.json の agents で設定）。verifierとは対照的に実装前の計画のみを対象とし、メインとは別ベンダーで系列多様性を設計段階で得る",
@@ -338,7 +360,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
 /**
  * LSP読取7件の公開範囲（design g-mu5atclj D5）。
  * main＋researcher＋verifier＋oracleに公開し、
- * critic/simplify/librarianには明示denyする（deny-guard方式）。
+ * critic/simplify/librarian/advisorには明示denyする（deny-guard方式）。
  */
 const LSP_TOOLS = [
   "lsp_hover",
@@ -355,6 +377,7 @@ const LSP_DENY_AGENTS: ReadonlySet<string> = new Set([
   "graphhopper-simplify",
   "graphhopper-librarian",
   "graphhopper-jev",
+  "graphhopper-advisor",
 ]);
 
 export function injectAgents(

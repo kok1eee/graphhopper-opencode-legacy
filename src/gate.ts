@@ -130,7 +130,8 @@ export const SELECTOR_PROMPT = `あなたはverifier編成セレクタ。design�
 - progress=進捗・残件・タスク列との対応
 - general=上記を統合した単発（小規模・単一関心向け）
 契約変更・migration・互換性が絡む場合はrequirementを含めよ。
-reasonは1行まで。JSON以外の文字を出すな`;
+reasonは1行まで。JSON以外の文字を出すな。
+判断材料は渡されたテキスト（design抜粋＋diff統計）のみ。探索・診断は不要。`;
 
 /* selector prompt組立（plugin/MCPのselector toolの単一源泉）。
  * (1)入力はdesign抜粋＋diff statのみ（blast radiusは(3)の領分） */

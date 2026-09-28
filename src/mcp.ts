@@ -999,7 +999,7 @@ const TOOL_DEFS: ToolDef[] = [
   {
     name: "graphhopper_selector",
     description:
-      "verifier編成selectorの判定promptを発行する（advisory-only）。LLM呼び出しはtool外: graphhopper_invoke(agent: 'graphhopper-verifier')等で判定し、出力はparseSelectorOutput相当で検証せよ。不正時は従来routerを継続（general倒しはしない）",
+      "verifier編成selectorの判定promptを発行する（advisory-only）。LLM呼び出しはtool外: task(subagent_type: 'graphhopper-advisor')／graphhopper_invoke(agent: 'graphhopper-advisor')で判定し、出力はparseSelectorOutput相当で検証せよ。不正時は従来routerを継続（general倒しはしない）",
     inputSchema: {
       type: "object",
       properties: {
@@ -1024,7 +1024,7 @@ const TOOL_DEFS: ToolDef[] = [
         text: [
           prompt,
           "",
-          "次: 安価な判定者（graphhopper_invoke等）に上記を渡し、返却JSONのlenses（1-3件・既知IDのみ採用）を参考にverifier編成を決めよ。不正・空の場合は従来router（advisor/polish）を継続せよ。",
+          "次: task(subagent_type: 'graphhopper-advisor')／graphhopper_invoke(agent: 'graphhopper-advisor')に上記を渡し、返却JSONのlenses（1-3件・既知IDのみ採用）を参考にverifier編成を決めよ。不正・空の場合は従来router（advisor/polish）を継続せよ。",
         ].join("\n"),
         data: { prompt },
       };

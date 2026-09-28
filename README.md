@@ -36,7 +36,7 @@ graphhopper-opencode/
 │   ├── state.ts   — .graphhopper/ 配下の state 管理（atomic write）
 │   ├── gate.ts    — helper・定数の単一源泉（entryは関数exportのみの制約対応）
 │   ├── mcp.ts     — MCPブリッジ（20 tool＋resources/prompts。API経由セッション用）
-│   ├── agents.ts  — 7 subagent 定義（config hook で注入。入口トリアージ用graphhopper-jev含む）
+│   ├── agents.ts  — 8 subagent 定義（config hook で注入。入口トリアージ用graphhopper-jev・相談判定用graphhopper-advisor含む）
 │   ├── prompts.ts — MCP prompts charter定型文の単一源泉（8件）
 │   ├── invoke.ts  — graphhopper_invoke（opencode run spawn・中断伝播・heartbeat）
 │   ├── watch.ts   — outbox監視（--notifyでmacOS通知）
@@ -82,6 +82,7 @@ graphhopper-opencode/
 |---|---|---|---|---|
 | `graphhopper-researcher` | 任意 | コードベース/外部doc | 事実収集・調査専用。高頻度なので最安モデル | 最下層コスト |
 | `graphhopper-jev` | goal開始前 | やる内容テキスト | 入口トリアージ（route A/B/Cの1行JSON判定。ollaya型typed choice相当） | 最下層コスト |
+| `graphhopper-advisor` | 任意 | 問い・判定材料テキスト | selector判定・セカンドオピニオン（stuck時はoracle。出力は非拘束） | 最下層コスト |
 | `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 上位品質・別ベンダー推奨 |
 | `graphhopper-oracle` | implementing（詰まった時。`graphhopper_attempt`のfail_streakがstuck_threshold到達） | 失敗試行の文脈 | 手詰まり打開の相談役 | 上位品質 |
 | `graphhopper-simplify` | polish（実装後・post-hoc。大diffのみ） | コードdiff | simplify提案（3レンズ: 再利用・品質・効率） | 中位 |

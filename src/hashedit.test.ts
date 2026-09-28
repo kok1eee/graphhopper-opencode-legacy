@@ -233,6 +233,23 @@ describe("subagent read-only guard", () => {
       "graphhopper-librarian",
     );
   });
+
+  test("advisor定義: 権限・LSP deny・jev不変", () => {
+    const advisor = GRAPHHOPPER_AGENTS["graphhopper-advisor"];
+    expect(advisor).toBeDefined();
+    expect(advisor?.permission).toMatchObject({ edit: "deny" });
+    expect(advisor?.prompt).toContain("graphhopper-oracle");
+    expect(advisor?.prompt).toContain("1行JSON");
+    // LSP deny注入
+    const input: { agent?: Record<string, { tools?: Record<string, boolean> }> } = {};
+    injectAgents(input as never, "/tmp/gh-nope");
+    expect(input.agent?.["graphhopper-advisor"]?.tools?.["lsp_hover"]).toBe(false);
+    // jevは入口専用のまま（bash全面deny・文面不変）
+    expect(GRAPHHOPPER_AGENTS["graphhopper-jev"]?.permission).toMatchObject({
+      edit: "deny",
+      bash: "deny",
+    });
+  });
 });
 
 describe("runGraphhopperEdit統合経路（分岐→アクション対応）", () => {

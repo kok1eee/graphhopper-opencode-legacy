@@ -511,7 +511,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         async execute(args) {
           return [
             "## selector判定手順（advisory-only）",
-            "1. 安価な判定者に以下を渡す:",
+            "1. task(subagent_type: 'graphhopper-advisor') または graphhopper_invoke(agent: 'graphhopper-advisor') に以下を渡す:",
             "",
             buildSelectorPrompt(args.design_excerpt, args.diff_stat),
             "",

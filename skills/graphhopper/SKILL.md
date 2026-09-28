@@ -18,6 +18,7 @@ graphhopper本体（Claude Code版）の3相グラフをopencodeに移植した�
 | 計画の敵対検証 | critic（designingで1回） | 要件漏れ・設計の穴・スコープ逸脱。質はここ |
 | 実装後のdrift検出 | verifier（polishでfan-out） | requirement/behavior/progressの3lens |
 | 手詰まり打開 | oracle（escalate時のみ） | 失敗文脈を渡して助言のみ受け取る |
+| 気軽な相談・判定 | `graphhopper-advisor` | selector判定・セカンドオピニオン。stuck時はoracle（advisorで代替しない）。出力は非拘束 |
 | repo内事実収集 | researcher（read-only） | graft-first。判断を含めない |
 | repo外公式doc | librarian（read-only） | URL・引用付き。判断を含めない |
 | 大diff整理 | simplify（route=polishのみ） | 提案のみ。適用はメイン |
@@ -141,7 +142,7 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
 
 1. `graphhopper_selector(design_excerpt, diff_stat)` で判定promptを発行する
    （design抜粋＋diff統計のみ。blast radiusは渡さない）
-2. 安価な判定者に渡し、返却JSONのlenses（1-3件・既知IDのみ採用）を参考にする
+2. `task(subagent_type: 'graphhopper-advisor')`／`graphhopper_invoke(agent: 'graphhopper-advisor')` に渡し、返却JSONのlenses（1-3件・既知IDのみ採用）を参考にする
 3. 不正・空の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）
 
 #### verifier（drift 検出）
