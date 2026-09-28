@@ -274,6 +274,10 @@ export async function invokeStructured(
   );
   const argv = buildArgs({ agent: args.agent, model, dir: root, title: "gh-invoke", prompt: args.prompt });
   const childEnv: NodeJS.ProcessEnv = { ...process.env, [DEPTH_ENV]: String(depth + 1) };
+  // 壊れたbearerの混入防止: AWS_BEARER_TOKEN_BEDROCK は全認証手段より優先されるため、
+  // 陳腐な値がsession envにあるとSSOプロファイルがshadowされてBedrock系が全滅する
+  // （2026-09-28実証）。正規運用はSSOプロファイルのため子には渡さない
+  delete childEnv["AWS_BEARER_TOKEN_BEDROCK"];
   // 起動ずらし（herd回避・opt-in）。中断済みならspawn前に諦める
   if (invokeOpts.signal?.aborted) {
     return {

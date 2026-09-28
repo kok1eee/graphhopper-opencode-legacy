@@ -144,10 +144,13 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
      `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
      伝播してkillされる（取り消し後の裏回りなし）。
      推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
-- **モデル割当（2026-09-26改定・mimo枠終了のため）**: verifier/criticは `claude-oauth/claude-sonnet-5`
-  （Max共有枠。機械ゲート発火時のみ呼ぶ設計のため常時消費にはならない）。
+- **モデル割当（2026-09-28改定・Bedrock配線後）**: criticは `amazon-bedrock/grok-4.6`
+  （Bedrock cross-region `global.xai.grok-4.6`。1回/goalのため約$0.14と誤差。系列多様性も確保）。
+  verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。
   researcher/librarianは無料枠（bunny-free）、simplifyはdeepseek-flash、oracleはopus-5を維持。
-  criticの系列多様性はBedrock配線後に安価な別ベンダーへ戻す余地あり
+  注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
+  `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
+  `env -u AWS_BEARER_TOKEN_BEDROCK` を付ける
 - **diff肥大は検証コスト3倍**: polish routeは3lensが全差分を読む。748行級は1回で3×748行の
   コンテキスト消費。goalを小さく切ってadvisor（verifier×1）に収めるのが最大の節約。
   巻き戻しはさらに3倍するので、criticで初回品質を上げることも節約になる

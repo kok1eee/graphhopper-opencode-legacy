@@ -250,3 +250,31 @@ describe("invoke 並列安全（中断・heartbeat・ずらし）", () => {
     expect(r.cancelled).toBe(true);
   });
 });
+
+describe("invoke 子envのbearer除去", () => {
+  test("壊れたAWS_BEARER_TOKEN_BEDROCKは子に渡さない", async () => {
+    process.env["AWS_BEARER_TOKEN_BEDROCK"] = "ABSK-stale-test-value";
+    let seen: Record<string, string | undefined> | null = null;
+    const capture: SpawnFn = ((_cmd: string, _args: string[], opts: unknown) => {
+      seen = (opts as { env: Record<string, string | undefined> }).env;
+      const p = new EventEmitter() as unknown as FakeProc;
+      p.pid = 424243;
+      p.killCalled = [];
+      p.stdout = new EventEmitter();
+      p.stderr = new EventEmitter();
+      setTimeout(() => {
+        p.stdout.emit("data", Buffer.from("ok", "utf8"));
+        p.emit("exit", 0);
+      }, 0);
+      return p as unknown as ChildProcess;
+    }) as SpawnFn;
+    try {
+      const root = mkdtempSync(join(tmpdir(), "gh-invoke-bearer-"));
+      await invoke({ agent: "graphhopper-critic", prompt: "hi", root }, capture);
+      expect(seen).not.toBeNull();
+      expect(seen!["AWS_BEARER_TOKEN_BEDROCK"]).toBeUndefined();
+    } finally {
+      delete process.env["AWS_BEARER_TOKEN_BEDROCK"];
+    }
+  });
+});

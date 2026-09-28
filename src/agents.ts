@@ -185,7 +185,9 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
     description:
       "designingフェーズのdesign.mdを敵対レビューする。要件漏れ・設計の穴・スコープ逸脱を検出する安価な常設チェックnode（モデルは .graphhopper/config.json の agents で設定）。verifierとは対照的に実装前の計画のみを対象とし、メインとは別ベンダーで系列多様性を設計段階で得る",
     mode: "all",
-    temperature: 0.2,
+    /* temperature未指定: Bedrock経由grok-4.6はtemperatureフィールド自体を拒否するため
+     * agent側で送らない（sonnet運用時の0.2固定は捨てる。既定温度でのばらつきは
+     * criticの敵対レビュー用途では許容）。verifier等は維持 */
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
       "あなたはcritic。実装前に、設計ドキュメントの質を敵対的に検証する。",
