@@ -51,6 +51,88 @@ export const PHASE_ACTION_BRIEF: Record<state.Phase, string> = {
 export const PONYTAIL_BRIEF =
   "ponytail継続適用: YAGNI・怠惰原則（詳細は初回注入参照）。interface変更はhigh扱いで人間に提示";
 
+/* jev入口判定のprompt定数（ollayaのbaked質問セット相当。指示文の単一源泉則で
+ * gate.tsに置く）。出力は1行JSONのみ。B適用はチェックリスト化し複合時はA */
+export const JEV_ROUTE_PROMPT = `あなたは入口トリアージ判定器。やる内容からrouteを1つ選べ。
+出力は1行のJSONのみ: {"route":"A|B|C"}
+- A=フルループ: 設計判断・複数関心・規模不明・曖昧・以下に当てはまらない全て
+- B=軽量: 全て満たす時のみ → (1)単一関心 (2)設計判断なし (3)既存パターンの踏襲 (4)テスト容易。1つでも欠けたらA
+- C=直行: 単一ファイルの小修正・質問への回答・一回きりのコマンド実行
+複合・曖昧はA。理由文・確信度は不要。JSON以外の文字を出すな`;
+
+/* jev出力の厳密parse。route∉{A,B,C}・非JSON・空はAに倒す（fail-safe）。
+ * 未呼び出し（null）はstate側でnull＝Aとして扱う */
+export function parseEntryRoute(text: string | null | undefined): {
+  route: state.EntryRoute;
+  reason: string;
+} {
+  if (typeof text !== "string" || text.trim().length === 0) {
+    return { route: "A", reason: "jev未呼び出し→A" };
+  }
+  // bare入力（route_setのschemaが素のA/B/Cを受け付けるため先に照合）
+  const bare = text.trim().toUpperCase();
+  if (bare === "A" || bare === "B" || bare === "C") {
+    return { route: bare, reason: "jev判定（bare）" };
+  }
+  const m = text.match(/\{[^{}]*"route"\s*:\s*"([A-Za-z])"[^{}]*\}/);
+  const r = m?.[1]?.toUpperCase();
+  if (r === "A" || r === "B" || r === "C") {
+    return { route: r, reason: "jev判定" };
+  }
+  return { route: "A", reason: "parse失敗→A" };
+}
+
+/* B用thin design gate: task列の存在のみ（goal理解・設計判断・棄却は問わない）。
+ * Bは薄いspecで回す代わり、昇格時にdesigningへ戻って肉付けする */
+export function checkDesignDocThin(root: string, goalId: string): string[] {
+  let raw: string;
+  try {
+    raw = decodeUtf8Strict(readFileSync(state.planPath(root, goalId)));
+  } catch {
+    return ["design doc自体が無い"];
+  }
+  if (!TASK_LINE.test(raw)) return ["タスク行（- ...）"];
+  return [];
+}
+
+/* route別phase指示（effective route）。Bはcritic省略・verifier×1の注記を付与。
+ * transform注入・tool応答の単一源泉 */
+export function effectivePhaseAction(
+  phase: state.Phase,
+  entryRoute: state.EntryRoute | null,
+): string {
+  const base = PHASE_ACTION[phase];
+  if (entryRoute !== "B") return base;
+  const note =
+    "（entry_route=B軽量: designingはthin doc＋task列のみで可、critic省略、" +
+    "polishのverifierはgeneral×1。詰まったらgraphhopper_escalateでB→A昇格）";
+  // 単一源泉則: B designingもPHASE_ACTION.designingを基にし、差分は例外条項で明示する
+  return `${base}${note}`;
+}
+
+/* 昇格後の次アクション定型文（plugin/MCPの昇格系3箇所の単一源泉） */
+export const ESCALATE_NEXT =
+  "次: design.mdを肉付けし、task(graphhopper-critic)／graphhopper_invoke(agent: 'graphhopper-critic')で1回レビューしてから implementing へ。polishでは verifier fan-out×3（requirement/behavior/progress）が必須。";
+
+/* jev prompt組立（plugin/MCPのroute toolの単一源泉） */
+export function buildJevPrompt(request: string): string {
+  return [JEV_ROUTE_PROMPT, "", "やる内容:", request].join("\n");
+}
+
+/* stuck発火時のB自動昇格（designの二本立てトリガーの片方。もう片方はrouter_check）。
+ * entry B＋未昇格のときのみescalateEntryRouteし結果を返す。A/昇格済み/C/nullはnull */
+export function autoEscalateOnStuck(root: string): state.ActiveLoop | null {
+  const active = state.getActive(root);
+  if (
+    !active ||
+    active.state.entry_route !== "B" ||
+    active.state.escalated_at
+  ) {
+    return null;
+  }
+  return state.escalateEntryRoute(root);
+}
+
 /* design gate・信号A計数の対象tool（D2a/D2b）。before/after両hookで共有する
  * 単一の真実源。3名のいずれかが漏れると新tool経由でgate/stuck検知が
  * バイパスされるため、hashedit.test.tsで機械検証する。 */
@@ -311,10 +393,39 @@ export function checkPhaseMove(
       "graphhopper_critic_set で記録してから遷移せよ（opt-in運用なら config で require_critic=false）。"
     );
   }
-  // design doc構造ゲート（骨格のみ。質はcriticの領分）。
-  // scaffoldが自動生成するため、失敗するのは骨格を削った場合のみ
+  // Bのdesigning巻き戻しはescalate経路に限定（escalated_at無しの素の巻き戻しだと
+  // ratchet（critic1回＋fan-out×3前提）が成立しない。Aの巻き戻しは許可）
+  if (
+    to === "designing" &&
+    (active.state.phase === "implementing" || active.state.phase === "polish") &&
+    active.state.entry_route === "B" &&
+    !active.state.escalated_at
+  ) {
+    return (
+      "error: entry_route=B の designing巻き戻しは graphhopper_escalate を使え" +
+      "（素の phase 遷移では escalated_at が立たず昇格条件が成立しない）。"
+    );
+  }
+  // 昇格後はcritic1回が必須（escalateの実効条件。proseだけだと素通りするため機械化。
+  // legacy（escalated_at null）・Aには影響なし）
+  if (
+    to === "implementing" &&
+    active.state.phase === "designing" &&
+    active.state.escalated_at &&
+    !active.state.critic_review
+  ) {
+    return (
+      "error: B→A昇格後は designing→implementing に critic_review 記録が必要。" +
+      "task(graphhopper-critic)／graphhopper_invoke(agent: 'graphhopper-critic')で肉付けdesignを1回レビューし、graphhopper_critic_set で記録してから遷移せよ。"
+    );
+  }
+  // scaffoldが自動生成するため、失敗するのは骨格を削った場合のみ。
+  // entry_route=Bはthin gate（task列のみ。Bは薄いspecで回し昇格時に肉付けする）
   if (to === "implementing" && active.state.phase === "designing") {
-    const missing = checkDesignDoc(root, active.goal.id);
+    const missing =
+      active.state.entry_route === "B"
+        ? checkDesignDocThin(root, active.goal.id)
+        : checkDesignDoc(root, active.goal.id);
     if (missing.length > 0) {
       return (
         `error: design.md の骨格不足（${missing.join("・")}）。` +

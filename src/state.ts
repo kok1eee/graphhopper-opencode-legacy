@@ -73,6 +73,10 @@ export type DriftTarget = "implementing" | "design" | "requirements";
 /** general: route=advisor の単発呼び出し（3レンズを1つにまとめた統合charter） */
 export type VerifierLens = "requirement" | "behavior" | "progress" | "general";
 
+/* jev入口トリアージのroute。null＝A（未呼び出し・legacyの機械定義）。
+ * B→A昇格のみ可（A→B禁止のラチェット）。Cはgoalを作らない */
+export type EntryRoute = "A" | "B" | "C";
+
 export interface VerifierVerdict {
   level: VerdictLevel;
   reason: string;
@@ -168,6 +172,10 @@ export interface LoopState {
   /** 直近に stuck 通知した理由集合。同一理由の再通知を抑止する。
    * resume でクリアする */
   last_stuck_reasons: string[];
+  /** jev入口判定のroute。null＝A（未呼び出し・legacy）。B→A昇格のみ可 */
+  entry_route: EntryRoute | null;
+  /** B→A昇格の実施時刻。null＝未昇格 */
+  escalated_at: string | null;
   updated_at: string;
 }
 
@@ -377,7 +385,16 @@ export type HistoryEvent =
       goal: string;
       path: string;
       reason: string;
-    };
+    }
+  | {
+      /* jev入口判定の記録。Cはgoalを作らないためgoal任意。
+       * 監査用1行（誤Cの検知・回収のためhistoryには残す） */
+      type: "entry_route";
+      goal?: string;
+      route: EntryRoute;
+      reason?: string;
+    }
+  | { type: "escalated"; goal: string; from: EntryRoute; at: string };
 
 /** append-only の履歴ログ。LLMの自己申告ではなくplugin機械記録の監査証跡 */
 export function recordEvent(root: string, event: HistoryEvent): void {
@@ -526,6 +543,8 @@ function emptyState(): LoopState {
     last_diff_lines: null,
     diff_stall: 0,
     last_stuck_reasons: [],
+    entry_route: null,
+    escalated_at: null,
     updated_at: new Date().toISOString(),
   };
 }
@@ -593,8 +612,22 @@ export function startGoal(
     goal_id: goal.id,
     session_id: sessionID,
   };
+  // pending entry_route（route_set先行）の消費。無ければnull＝A
+  const pending = readPendingRoute(root);
+  if (pending && (pending.route === "A" || pending.route === "B")) {
+    next.entry_route = pending.route;
+  }
+  clearPendingRoute(root);
   writeState(root, next);
   recordEvent(root, { type: "goal_start", goal: goal.id, title: goal.title });
+  if (next.entry_route) {
+    recordEvent(root, {
+      type: "entry_route",
+      goal: goal.id,
+      route: next.entry_route,
+      reason: pending?.reason,
+    });
+  }
   // design scaffold: 骨格を自動生成（既存があれば壊さない）。
   // 構造検証ゲートのアンカーになる
   scaffoldDesignDoc(root, goal.id, goal.title);
@@ -797,20 +830,127 @@ export function resetLoopForClear(root: string): void {
   });
 }
 
+export interface PendingRoute {
+  route: EntryRoute;
+  reason?: string;
+  at: string;
+}
+
+function pendingRoutePath(root: string): string {
+  return join(dir(root), "pending_route.json");
+}
+
+/** route_set先行の一時置き場（goal start時に消費・削除。再起動耐性のためstate外ファイル） */
+export function writePendingRoute(root: string, route: EntryRoute, reason?: string): void {
+  try {
+    mkdirSync(dir(root), { recursive: true });
+    writeFileSync(
+      pendingRoutePath(root),
+      JSON.stringify({ route, reason, at: new Date().toISOString() }),
+      "utf8",
+    );
+  } catch {
+    // 書けなければpending無し扱い（→A）。軽さ優先で黙殺
+  }
+}
+
+export function readPendingRoute(root: string): PendingRoute | null {
+  try {
+    const raw = readFileSync(pendingRoutePath(root), "utf8");
+    const p = JSON.parse(raw) as Partial<PendingRoute>;
+    if (p.route !== "A" && p.route !== "B" && p.route !== "C") return null;
+    return { route: p.route, reason: p.reason, at: String(p.at ?? "") };
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingRoute(root: string): void {
+  try {
+    unlinkSync(pendingRoutePath(root));
+  } catch {
+    // 存在しなければ何もしない
+  }
+}
+
+/** route_set→goal先行の救済: entry未記録のactive goalに直接bindする。
+ * 記録済み・goal無しはnull（pendingのみ残る） */
+export function bindEntryRoute(
+  root: string,
+  route: EntryRoute,
+  reason?: string,
+): ActiveLoop | null {
+  const active = getActive(root);
+  if (!active || active.state.entry_route) return null;
+  if (route !== "A" && route !== "B") return null;
+  const r = mutateActive(root, () => ({ state: { entry_route: route } }));
+  if (r) {
+    recordEvent(root, {
+      type: "entry_route",
+      goal: r.goal.id,
+      route,
+      reason,
+    });
+  }
+  return r;
+}
+
+/* B→A昇格（ラチェット）。A→B・null→Bは拒否。
+ * 実効: entry_route=A＋escalated_at＋phaseをdesigningに戻す（design肉付け＋critic1回＋
+ * fan-outのため。LEGAL_TRANSITIONSの昇格専用経路を使う）。C・goal無しはnull */
+export function escalateEntryRoute(root: string): ActiveLoop | null {
+  const active = getActive(root);
+  if (!active) return null;
+  if (active.state.entry_route !== "B") return null;
+  const r = mutateActive(root, () => ({
+    state: {
+      entry_route: "A" as EntryRoute,
+      escalated_at: new Date().toISOString(),
+      phase: "designing" as Phase,
+      ...phaseResetFields(),
+      last_verifier: null,
+    },
+  }));
+  if (r) {
+    recordEvent(root, {
+      type: "escalated",
+      goal: r.goal.id,
+      from: "B",
+      at: r.state.escalated_at ?? "",
+    });
+  }
+  return r;
+}
+
 /* 遷移合法性表（takt workflow doctorの発想の機械版）。
  * - 同一phaseは許可（notes更新等の無遷移呼び出しのため）
  * - polish→implementingのみ巻き戻し可（verifier driftの行き先）
+ * - implementing/polish→designingはB→A昇格専用経路（escalateEntryRoute経由。
+ *   濫用時はhistoryのentry_route/escalated/escalated_atで監査可）
  * - *→doneは不可: doneはcompleteGoal（verifier cleanガード付き）のみ。
  *   clearActiveGoalはstate直書きのためこの表の対象外 */
 export const LEGAL_TRANSITIONS: Record<Phase, Phase[]> = {
   designing: ["designing", "implementing"],
-  implementing: ["implementing", "polish"],
-  polish: ["polish", "implementing", "done"],
+  implementing: ["implementing", "polish", "designing"],
+  polish: ["polish", "implementing", "done", "designing"],
   done: ["done"],
 };
 
 export function isLegalPhaseTransition(from: Phase, to: Phase): boolean {
   return (LEGAL_TRANSITIONS[from] ?? []).includes(to);
+}
+
+/* phase遷移時のカウンタリセット集合（setPhaseとescalateEntryRouteで共有。
+ * 巻き戻し直後のstuck早期発火・fail引き継ぎを防ぐ） */
+function phaseResetFields(): Partial<LoopState> {
+  return {
+    fail_streak: 0,
+    edit_file: null,
+    edit_streak: 0,
+    last_diff_lines: null,
+    diff_stall: 0,
+    last_stuck_reasons: [],
+  };
 }
 
 export function setPhase(
@@ -829,12 +969,7 @@ export function setPhase(
     // （implementingに戻ってきた時も0から数え直す。巻き戻し直後のインフレ防止）
     state: {
       phase,
-      fail_streak: 0,
-      edit_file: null,
-      edit_streak: 0,
-      last_diff_lines: null,
-      diff_stall: 0,
-      last_stuck_reasons: [],
+      ...phaseResetFields(),
       ...(notes !== undefined ? { notes } : {}),
     },
   }));
@@ -1043,9 +1178,12 @@ export interface VerifierResult {
 }
 
 /** verifier_set 入力の検証。通れば null、ダメならエラー文（tool がそのまま返す）。
- * self-graded 完了防止の機械ゲート（旧 lens 空拒否の後継）。 */
+ * self-graded 完了防止の機械ゲート（旧 lens 空拒否の後継）。
+ * opts.entryRoute: B非昇格はgeneral×1のみ可、昇格後は3lens必須。
+ * null/Aは現行通り（legacy互換・Aフルはprose＋router運用）。 */
 export function checkVerifierResults(
   results: VerifierResult[] | null | undefined,
+  opts?: { entryRoute?: EntryRoute | null; escalated?: boolean },
 ): string | null {
   if (!Array.isArray(results) || results.length === 0) {
     return "error: results が空です。graphhopper_verifier_set は task(subagent_type: 'graphhopper-verifier') を実際に呼んだ後にしか記録できません（self-graded完了を防ぐための機械的ゲート）。route=advisorでも最低1回、'general'charterで呼んでください。";
@@ -1080,6 +1218,23 @@ export function checkVerifierResults(
     }
     if (r.level === "drift" && !r.target) {
       return `error: drift には target が必要です (lens: ${r.lens})`;
+    }
+  }
+  // entry route×lens照合（B非昇格はgeneral×1のみ、昇格後は3lens必須。
+  // 昇格後はentry_route自体がAに戻るためescalated旗で判定する。
+  // null/A非昇格は現行通り＝legacy互換・Aフルはprose＋router運用）
+  if (opts?.escalated) {
+    if (
+      !seen.has("requirement") ||
+      !seen.has("behavior") ||
+      !seen.has("progress")
+    ) {
+      return "error: 昇格後（B→A）の verifier は requirement/behavior/progress の3lens必須";
+    }
+  } else if (opts?.entryRoute === "B") {
+    const lenses = [...seen];
+    if (lenses.length !== 1 || lenses[0] !== "general") {
+      return "error: entry_route=B（非昇格）の verifier は general×1 のみ可。fan-outが必要なら graphhopper_escalate でB→A昇格してから3lensで記録せよ";
     }
   }
   return null;

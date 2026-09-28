@@ -1081,9 +1081,11 @@ describe("遷移合法性（program-side flow gate）", () => {
   test("非法遷移（*→done直指定・逆行）は拒否", () => {
     expect(isLegalPhaseTransition("designing", "done")).toBe(false);
     expect(isLegalPhaseTransition("implementing", "done")).toBe(false);
-    expect(isLegalPhaseTransition("implementing", "designing")).toBe(false);
     expect(isLegalPhaseTransition("done", "implementing")).toBe(false);
-    expect(isLegalPhaseTransition("polish", "designing")).toBe(false);
+    expect(isLegalPhaseTransition("done", "designing")).toBe(false);
+    // implementing/polish→designingはB→A昇格専用経路として許可（濫用はhistory監査）
+    expect(isLegalPhaseTransition("implementing", "designing")).toBe(true);
+    expect(isLegalPhaseTransition("polish", "designing")).toBe(true);
   });
 
   test("setPhaseは非法遷移を拒否する（done抜け穴封じ）", () => {
@@ -1092,7 +1094,6 @@ describe("遷移合法性（program-side flow gate）", () => {
     expect(setPhase(root, "done")).toBeNull();
     expect(setPhase(root, "polish")).toBeNull();
     expect(setPhase(root, "implementing")?.state.phase).toBe("implementing");
-    expect(setPhase(root, "designing")).toBeNull();
     expect(setPhase(root, "polish")?.state.phase).toBe("polish");
     expect(setPhase(root, "implementing")?.state.phase).toBe("implementing");
   });
@@ -1397,5 +1398,138 @@ describe("退避diff掃除（complete/clear）", () => {
     writeFileSync(stashedDiffPath(activeId2), "diff\n", "utf8");
     clearActiveGoal(root);
     expect(existsSync(stashedDiffPath(activeId2))).toBe(false);
+  });
+});
+
+describe("entry_route（jevトリアージ）", () => {
+  test("pendingはgoal startで消費される（B）", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.writePendingRoute(root, "B", "test");
+    expect(s.readPendingRoute(root)?.route).toBe("B");
+    const { goal } = s.startGoal(root, "t", "s1");
+    expect(s.getActive(root)!.state.entry_route).toBe("B");
+    expect(s.readPendingRoute(root)).toBeNull();
+    expect(
+      s.readHistory(root).some((h) => h.type === "entry_route" && (h as { route?: string }).route === "B" && (h as { goal?: string }).goal === goal.id),
+    ).toBe(true);
+  });
+
+  test("pending無しはnull＝A", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    expect(s.getActive(root)!.state.entry_route).toBeNull();
+  });
+
+  test("bindEntryRouteは未記録にのみbindする", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    expect(s.bindEntryRoute(root, "B", "r")!.state.entry_route).toBe("B");
+    expect(s.bindEntryRoute(root, "A", "r")).toBeNull();
+    expect(s.getActive(root)!.state.entry_route).toBe("B");
+  });
+
+  test("escalateはB→Aのみ（designing巻き戻し＋escalated_at）", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    expect(s.escalateEntryRoute(root)).toBeNull();
+    s.bindEntryRoute(root, "B");
+    s.setPhase(root, "implementing");
+    const r = s.escalateEntryRoute(root)!;
+    expect(r.state.entry_route).toBe("A");
+    expect(r.state.phase).toBe("designing");
+    expect(r.state.escalated_at).not.toBeNull();
+    expect(s.escalateEntryRoute(root)).toBeNull();
+  });
+
+  test("verifier_setのroute×lens照合", () => {
+    const g = { lens: "general", level: "clean" } as const;
+    const three = [
+      { lens: "requirement", level: "clean" },
+      { lens: "behavior", level: "clean" },
+      { lens: "progress", level: "clean" },
+    ] as Parameters<typeof checkVerifierResults>[0];
+    expect(checkVerifierResults([g], { entryRoute: "B" })).toBeNull();
+    expect(checkVerifierResults(three, { entryRoute: "B" })).not.toBeNull();
+    expect(checkVerifierResults(three, { entryRoute: "B", escalated: true })).toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "B", escalated: true })).not.toBeNull();
+    expect(checkVerifierResults([g], { entryRoute: "A" })).toBeNull();
+    expect(checkVerifierResults([g], {})).toBeNull();
+    expect(checkVerifierResults([g])).toBeNull();
+  });
+});
+
+describe("B designing巻き戻しのescalate強制", () => {
+  test("B未昇格の素の巻き戻しはescalate誘導エラー", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "B");
+    s.setPhase(root, "implementing");
+    const err = checkPhaseMove(root, "designing");
+    expect(err).toContain("graphhopper_escalate");
+    // Aは素の巻き戻し可
+    const root2 = tmpRoot();
+    s.startGoal(root2, "t", "s1");
+    s.setPhase(root2, "implementing");
+    expect(checkPhaseMove(root2, "designing")).toBeNull();
+    // polish起点もBはescalate強制
+    const root3 = tmpRoot();
+    s.startGoal(root3, "t", "s1");
+    s.bindEntryRoute(root3, "B");
+    s.setPhase(root3, "implementing");
+    s.setPhase(root3, "polish");
+    expect(checkPhaseMove(root3, "designing")).toContain("graphhopper_escalate");
+  });
+
+  test("escalateはpolishからも可（last_verifierリセット）", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "B");
+    s.setPhase(root, "implementing");
+    s.setPhase(root, "polish");
+    s.setVerifierVerdict(root, {
+      level: "clean",
+      reason: "x",
+      target: null,
+      lens: ["general"],
+    });
+    expect(s.getActive(root)!.state.last_verifier).not.toBeNull();
+    const r = s.escalateEntryRoute(root)!;
+    expect(r.state.phase).toBe("designing");
+    expect(r.state.last_verifier).toBeNull();
+    expect(r.state.entry_route).toBe("A");
+  });
+});
+
+describe("昇格後critic必須＋stuck自動昇格", () => {
+  test("escalated後はcritic無しでimplementingに進めない", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "B");
+    s.setPhase(root, "implementing");
+    s.escalateEntryRoute(root);
+    expect(checkPhaseMove(root, "implementing")).toContain("critic_review");
+    s.setCriticVerdict(root, { level: "clean", reason: "ok" });
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+  });
+
+  test("autoEscalateOnStuckはB未昇格のみ昇格", async () => {
+    const s = await import("./state");
+    const g = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    expect(g.autoEscalateOnStuck(root)).toBeNull();
+    s.bindEntryRoute(root, "B");
+    s.setPhase(root, "implementing");
+    expect(g.autoEscalateOnStuck(root)!.state.entry_route).toBe("A");
+    expect(g.autoEscalateOnStuck(root)).toBeNull();
   });
 });

@@ -25,7 +25,7 @@ function freshRoot(): string {
 }
 
 describe("graphhopper-mcp tool一覧", () => {
-  test("17 toolが登録される", async () => {
+  test("20 toolが登録される", async () => {
     const client = await linked();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
@@ -39,10 +39,13 @@ describe("graphhopper-mcp tool一覧", () => {
         "graphhopper_diff_stash",
         "graphhopper_edit",
         "graphhopper_eval",
+        "graphhopper_escalate",
         "graphhopper_goal",
         "graphhopper_hash",
         "graphhopper_invoke",
         "graphhopper_phase",
+        "graphhopper_route",
+        "graphhopper_route_set",
         "graphhopper_router_check",
         "graphhopper_scoreboard",
         "graphhopper_set_eval",
@@ -571,6 +574,89 @@ describe("評価機能A/B", () => {
     // fail1・verdict1のため 100-5-0=95
     const st = await call("graphhopper_status", {});
     expect(st).toContain("score: 95");
+    await client.close();
+  });
+});
+
+describe("graphhopper-mcp route系tool（統合）", () => {
+  test("route_set B→bind→verifier×1可・3lens拒否→escalate", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    // prompt発行
+    expect(await call("graphhopper_route", { request: "typo修正" })).toContain("route");
+    // 不正値はAに倒す（別rootで。pendingはgoalが消費するため）
+    {
+      const client2 = await linked();
+      const root2 = freshRoot();
+      const r2 = await client2.callTool({
+        name: "graphhopper_route_set",
+        arguments: { root: root2, route: "zzz" },
+      });
+      const c2 = r2.content as { type: string; text: string }[];
+      expect(c2[0]?.text ?? "").toContain("entry_route=A");
+      await client2.close();
+    }
+    await call("graphhopper_goal", { action: "start", title: "route test" });
+    // goal先行のbind
+    expect(await call("graphhopper_route_set", { route: "B" })).toContain("bind");
+    // B＋general×1は可
+    expect(
+      await call("graphhopper_verifier_set", {
+        results: [{ lens: "general", level: "clean" }],
+        reason: "ok",
+      }),
+    ).toContain("verifier verdict: clean");
+    // B＋3lensは拒否
+    expect(
+      await call("graphhopper_verifier_set", {
+        results: [
+          { lens: "requirement", level: "clean" },
+          { lens: "behavior", level: "clean" },
+          { lens: "progress", level: "clean" },
+        ],
+        reason: "ok",
+      }),
+    ).toContain("general×1");
+    // escalateでA＋designing
+    expect(await call("graphhopper_escalate", {})).toContain("escalated: B -> A");
+    // 昇格後は3lens必須（general×1は拒否）
+    expect(
+      await call("graphhopper_verifier_set", {
+        results: [{ lens: "general", level: "clean" }],
+        reason: "ok",
+      }),
+    ).toContain("3lens必須");
+    await client.close();
+  });
+
+  test("router_check B＋大diffで自動昇格", async () => {
+    const { execSync } = await import("node:child_process");
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const st = await import("./state");
+    const client = await linked();
+    const root = freshRoot();
+    execSync(`git init -q "${root}" && git -C "${root}" config user.email t@t && git -C "${root}" config user.name t`);
+    writeFileSync(join(root, "a.txt"), "x\n");
+    execSync(`git -C "${root}" add -A && git -C "${root}" commit -qm init`);
+    writeFileSync(join(root, "a.txt"), Array(450).fill("y").join("\n") + "\n");
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    await call("graphhopper_goal", { action: "start", title: "auto esc" });
+    st.bindEntryRoute(root, "B");
+    await call("graphhopper_phase", { phase: "implementing" });
+    const out = await call("graphhopper_router_check", {});
+    expect(out).toContain("自動昇格");
+    expect(st.getActive(root)!.state.phase).toBe("designing");
+    expect(st.getActive(root)!.state.entry_route).toBe("A");
     await client.close();
   });
 });

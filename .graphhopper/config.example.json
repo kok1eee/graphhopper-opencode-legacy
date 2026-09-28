@@ -7,7 +7,8 @@
     "graphhopper-critic": "anthropic/claude-sonnet-5",
     "graphhopper-simplify": "anthropic/claude-sonnet-5",
     "graphhopper-librarian": "opencode/deepseek-v4-flash",
-    "graphhopper-oracle": "anthropic/claude-opus-5"
+    "graphhopper-oracle": "anthropic/claude-opus-5",
+    "graphhopper-jev": "opencode-go/longcat-2.5-preview-free"
   },
   "stuck_threshold": 3,
   "max_eval_fails": 6,

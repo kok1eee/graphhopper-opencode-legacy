@@ -32,11 +32,11 @@ Claude Codeのshell hook（PreToolUse/Stop）に相当する仕組みが無い�
 ```
 graphhopper-opencode/
 ├── src/
-│   ├── index.ts   — プラグイン本体（tool.execute.before + event + 15 tool）
+│   ├── index.ts   — プラグイン本体（tool.execute.before + event + 18 tool）
 │   ├── state.ts   — .graphhopper/ 配下の state 管理（atomic write）
 │   ├── gate.ts    — helper・定数の単一源泉（entryは関数exportのみの制約対応）
-│   ├── mcp.ts     — MCPブリッジ（17 tool＋resources/prompts。API経由セッション用）
-│   ├── agents.ts  — 6 subagent 定義（config hook で注入）
+│   ├── mcp.ts     — MCPブリッジ（20 tool＋resources/prompts。API経由セッション用）
+│   ├── agents.ts  — 7 subagent 定義（config hook で注入。入口トリアージ用graphhopper-jev含む）
 │   ├── prompts.ts — MCP prompts charter定型文の単一源泉（8件）
 │   ├── invoke.ts  — graphhopper_invoke（opencode run spawn・中断伝播・heartbeat）
 │   ├── watch.ts   — outbox監視（--notifyでmacOS通知）
@@ -64,6 +64,8 @@ graphhopper-opencode/
 | `graphhopper_phase` | フェーズ遷移（designing → implementing → polish → done） |
 | `graphhopper_router_check` | diffサイズを機械測定し advisor(verifier×1)/polish(verifier×3) に分岐（loop-driver.sh相当） |
 | `graphhopper_diff_stash` | verifier fan-out用にdiffを/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
+| `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（A/B/C。不正値はAに倒す。Cはhistory 1行のみ） |
+| `graphhopper_escalate` | B→A昇格（designing巻き戻し＋critic1回＋fan-out×3。A→B禁止のラチェット） |
 | `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート） |
 | `graphhopper_set_eval` | implementingの合否判定コマンド（本体のeval_cmd相当）を設定。設定後はターン終了ごと自動実行され、pass=polish自動遷移／fail=fail_streak機械カウント |
 | `graphhopper_attempt` | 実装試行の成否を記録（eval_cmd未設定時の自己申告フォールバック。連続失敗でescalate→oracle相談） |
@@ -79,6 +81,7 @@ graphhopper-opencode/
 | subagent | phase | 対象artifact | 用途 | tier |
 |---|---|---|---|---|
 | `graphhopper-researcher` | 任意 | コードベース/外部doc | 事実収集・調査専用。高頻度なので最安モデル | 最下層コスト |
+| `graphhopper-jev` | goal開始前 | やる内容テキスト | 入口トリアージ（route A/B/Cの1行JSON判定。ollaya型typed choice相当） | 最下層コスト |
 | `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 上位品質・別ベンダー推奨 |
 | `graphhopper-oracle` | implementing（詰まった時。`graphhopper_attempt`のfail_streakがstuck_threshold到達） | 失敗試行の文脈 | 手詰まり打開の相談役 | 上位品質 |
 | `graphhopper-simplify` | polish（実装後・post-hoc。大diffのみ） | コードdiff | simplify提案（3レンズ: 再利用・品質・効率） | 中位 |
@@ -157,7 +160,7 @@ plugin tool は opencode ランタイム内のセッションにしか配膳さ�
 セッション（`default.*` toolset）には届かない。MCP だけが両方に届く実証済みの道のため、
 `src/mcp.ts` が state 操作を MCP tool（stdio）として公開する:
 
-- plugin と同名・同-semantics の 17 tool（`graphhopper_handoff` は opencode SDK client が必要なため対象外。
+- plugin と同名・同-semantics の 20 tool（`graphhopper_handoff` は opencode SDK client が必要なため対象外。
   代わりにMCPのみの `graphhopper_eval`・`graphhopper_invoke`・`graphhopper_scoreboard` を含む）
 - `root`（対象プロジェクト）・`session_id`（bind 先）を明示指定する。
   MCP には `session.idle` 駆動が無いため、`graphhopper_set_eval` 後に
@@ -219,7 +222,7 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - `root` 省略時は client roots の先頭（file://）→プロセス cwd の順で解決する
 - tool annotations: `status`/`hash` は readOnly、`edit` は destructive、
   `eval`/`invoke`/`router_check` は openWorld の hint を付与
-- 全17 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
+- 全20 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
 - tool 実行後に logging 通知を転送（state 遷移系は info、それ以外は debug）。
   client 未対応でも tool 結果は壊さない
 

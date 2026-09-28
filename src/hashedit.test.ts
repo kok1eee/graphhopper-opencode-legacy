@@ -425,3 +425,45 @@ describe("continuationText 3段階文面", () => {
     expect(out.length).toBeLessThan(900);
   });
 });
+
+describe("jev判定parse・thin gate（gate.ts）", () => {
+  test("parseEntryRoute: 正常系とfail-safe", async () => {
+    const g = await import("./gate");
+    expect(g.parseEntryRoute('{"route":"B"}').route).toBe("B");
+    expect(g.parseEntryRoute('前置き\n{"route": "c"}\n後書き').route).toBe("C");
+    expect(g.parseEntryRoute("garbage").route).toBe("A");
+    expect(g.parseEntryRoute("").route).toBe("A");
+    expect(g.parseEntryRoute(null).route).toBe("A");
+    expect(g.parseEntryRoute('{"route":"Z"}').route).toBe("A");
+    // bare入力（route_set schemaが素のA/B/Cを受ける。simplify指摘のcritical回帰）
+    expect(g.parseEntryRoute("B").route).toBe("B");
+    expect(g.parseEntryRoute("b").route).toBe("B");
+    expect(g.parseEntryRoute("  c  ").route).toBe("C");
+    expect(g.parseEntryRoute("B\n").route).toBe("B");
+    expect(g.parseEntryRoute(" A ").route).toBe("A");
+    expect(g.parseEntryRoute("a").route).toBe("A");
+  });
+
+  test("checkDesignDocThin: task列のみ見る", async () => {
+    const g = await import("./gate");
+    const s = await import("./state");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "gh-thin-"));
+    expect(g.checkDesignDocThin(root, "g-x")).toEqual(["design doc自体が無い"]);
+    const { goal } = s.startGoal(root, "t", "s1");
+    // scaffoldは骨格あり→thinはtask列（scaffoldに含まれる）で通過
+    expect(g.checkDesignDocThin(root, goal.id)).toEqual([]);
+  });
+
+  test("effectivePhaseAction: Bのみ注記", async () => {
+    const g = await import("./gate");
+    expect(g.effectivePhaseAction("designing", null)).toBe(g.PHASE_ACTION["designing"]);
+    expect(g.effectivePhaseAction("designing", "A")).toBe(g.PHASE_ACTION["designing"]);
+    const b = g.effectivePhaseAction("designing", "B");
+    expect(b).toContain("thin doc");
+    expect(b).toContain("critic省略");
+    expect(g.effectivePhaseAction("polish", "B")).toContain("general×1");
+  });
+});

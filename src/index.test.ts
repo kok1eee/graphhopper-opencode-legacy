@@ -87,3 +87,58 @@ describe("system注入節約", () => {
     expect(back.some((s) => s.includes("（詳細）"))).toBe(false);
   });
 });
+
+describe("plugin route系tool", () => {
+  async function tools(root: string) {
+    const plugin = (await Graphhopper({
+      client: {},
+      $: {},
+      directory: root,
+    } as never)) as Record<string, any>;
+    const raw = plugin.tool as Record<string, { execute: (a: any, ctx?: any) => Promise<string> }>;
+    const bound: Record<string, (a: any) => Promise<string>> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      bound[k] = (a: any) => v.execute(a, { sessionID: "s-test" });
+    }
+    return bound;
+  }
+
+  test("route prompt発行＋route_set bare B→pending→goal消費", async () => {
+    const { getActive, readPendingRoute } = await import("./state");
+    const root = tmpRoot();
+    const t = await tools(root);
+    const prompt = await t.graphhopper_route({ request: "typo修正" });
+    expect(prompt).toContain("route");
+    expect(await t.graphhopper_route_set({ route: "B" })).toContain("pending");
+    expect(readPendingRoute(root)?.route).toBe("B");
+    await t.graphhopper_goal({ action: "start", title: "t" });
+    expect(getActive(root)!.state.entry_route).toBe("B");
+    expect(readPendingRoute(root)).toBeNull();
+  });
+
+  test("route_set不正→A・escalate→A＋designing", async () => {
+    const { getActive, bindEntryRoute, setPhase } = await import("./state");
+    const root = tmpRoot();
+    const t = await tools(root);
+    expect(await t.graphhopper_route_set({ route: "zzz" })).toContain("entry_route=A");
+    await t.graphhopper_goal({ action: "start", title: "t" });
+    expect(getActive(root)!.state.entry_route).toBe("A");
+    expect(await t.graphhopper_escalate({})).toContain("昇格不可");
+    // Bにしてからescalate
+    const root2 = tmpRoot();
+    const t2 = await tools(root2);
+    await t2.graphhopper_goal({ action: "start", title: "t" });
+    bindEntryRoute(root2, "B");
+    setPhase(root2, "implementing");
+    expect(await t2.graphhopper_escalate({})).toContain("escalated: B -> A");
+    expect(getActive(root2)!.state.phase).toBe("designing");
+  });
+
+  test("goal start応答はentry route別指示（B注記）", async () => {
+    const root = tmpRoot();
+    const t = await tools(root);
+    await t.graphhopper_route_set({ route: "B" });
+    const started = await t.graphhopper_goal({ action: "start", title: "t" });
+    expect(started).toContain("entry_route=B");
+  });
+});

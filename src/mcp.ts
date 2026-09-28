@@ -43,8 +43,13 @@ import {
   designDocLockedRefusal,
   designGateRefusal,
   EVAL_MANAGED_NOTE,
+  effectivePhaseAction,
+  ESCALATE_NEXT,
+  autoEscalateOnStuck,
+  buildJevPrompt,
   extractTasks,
   foreignBoundNote,
+  parseEntryRoute,
 } from "./gate";
 import { readGraphhopperHash, runGraphhopperEdit } from "./gate";
 import * as state from "./state";
@@ -186,7 +191,7 @@ async function goalAction(
       const unbound =
         !sessionID &&
         "\n(note: session_id 未指定のため未バインド。継続注入・stuck計数を有効にするには session_id を指定して resume で bind せよ)";
-      return `goal started: "${a.goal.title}" (${a.goal.id})\nphase: designing\n次: ${PHASE_ACTION.designing}${unbound ?? ""}`;
+      return `goal started: "${a.goal.title}" (${a.goal.id})\nphase: designing\n次: ${effectivePhaseAction("designing", a.state.entry_route)}${unbound ?? ""}`;
     }
     case "pause": {
       const a = state.pauseGoal(root);
@@ -314,6 +319,20 @@ function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
   }
   const stuck = state.checkStuck(root);
   if (stuck.escalate && state.noteStuckNotified(root, stuck.reasons)) {
+    const esc = autoEscalateOnStuck(root);
+    if (esc) {
+      return {
+        text: [
+          `attempt recorded: fail (fail_streak=${r.fail_streak})`,
+          `stuck: ${stuck.reasons.join(", ")} → B→A自動昇格（designingに巻き戻し）。`,
+          ESCALATE_NEXT,
+          managed,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        data: { ok: false, failStreak: r.fail_streak, escalate: true, giveUp: false },
+      };
+    }
     return {
       text: [
         `attempt recorded: fail (fail_streak=${r.fail_streak})`,
@@ -400,7 +419,10 @@ async function evalOnce(root: string): Promise<string> {
   } else {
     const stuck = state.checkStuck(root);
     if (stuck.escalate && state.noteStuckNotified(root, stuck.reasons)) {
-      stuckLine = `stuck: ${stuck.reasons.join(", ")} — task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。`;
+      const esc = autoEscalateOnStuck(root);
+      stuckLine = esc
+        ? `stuck: ${stuck.reasons.join(", ")} → B→A自動昇格（designingに巻き戻し）。${ESCALATE_NEXT}`
+        : `stuck: ${stuck.reasons.join(", ")} — task(subagent_type: 'graphhopper-oracle') に相談せよ。これまでの失敗試行・編集履歴を渡すこと。`;
     }
   }
   return [
@@ -423,6 +445,18 @@ async function routerCheck(root: string): Promise<ToolOut> {
   const route: state.RouterRoute =
     diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
   state.recordRouterCheck(root, baseline, diffLines, route);
+  const pre = state.getActive(root);
+  if (pre?.state.entry_route === "B" && route === "polish") {
+    state.escalateEntryRoute(root);
+    return {
+      text: [
+        `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
+        "route: polish + B→A自動昇格（designingに巻き戻し）。",
+        ESCALATE_NEXT,
+      ].join("\n"),
+      data: { diffLines, route, threshold: cfg.router_threshold_lines, escalated: true },
+    };
+  }
   return {
     text: [
       `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
@@ -441,7 +475,11 @@ function verifierSet(
   reason: string,
   model?: string,
 ): ToolOut {
-  const rejected = state.checkVerifierResults(results);
+  const active = state.getActive(root);
+  const rejected = state.checkVerifierResults(results, {
+    entryRoute: active?.state.entry_route ?? null,
+    escalated: !!active?.state.escalated_at,
+  });
   if (rejected) return { text: rejected };
   const decided = state.aggregateVerdicts(results);
   const result = state.setVerifierVerdict(root, {
@@ -525,6 +563,8 @@ const LOG_TOOLS = new Set([
   "graphhopper_eval",
   "graphhopper_attempt",
   "graphhopper_router_check",
+  "graphhopper_route_set",
+  "graphhopper_escalate",
 ]);
 
 const ROOT_PROP = { type: "string", description: ROOT_DESC } as const;
@@ -701,7 +741,7 @@ const TOOL_DEFS: ToolDef[] = [
       const r = state.setPhase(ctx.root, a.phase, a.notes);
       if (!r) return { text: "error: no active goal or invalid phase" };
       return {
-        text: `phase -> ${r.state.phase}\n次: ${PHASE_ACTION[r.state.phase]}${driverNote(ctx.root, sessionOf(a.session_id))}`,
+        text: `phase -> ${r.state.phase}\n次: ${effectivePhaseAction(r.state.phase, r.state.entry_route)}${driverNote(ctx.root, sessionOf(a.session_id))}`,
         data: { ok: true, phase: r.state.phase },
       };
     },
@@ -848,6 +888,109 @@ const TOOL_DEFS: ToolDef[] = [
           "各lensにはpathを渡し、inline展開禁止。読むのは差分範囲＋疑義点のみに留めよ。",
         ].join("\n"),
         data: { path: stashed.path, lines: stashed.lines, baseline: stashed.baseline },
+      };
+    },
+  },
+  {
+    name: "graphhopper_route",
+    description:
+      "jev入口トリアージの判定promptを発行する。LLM呼び出しはtool外: graphhopper_invoke(agent: 'graphhopper-jev')で判定しgraphhopper_route_setで記録せよ",
+    inputSchema: {
+      type: "object",
+      properties: {
+        root: ROOT_PROP,
+        request: { type: "string", description: "これからやる内容のテキスト" },
+      },
+      required: ["request"],
+    },
+    schema: z.object({ root: rootZ, request: z.string() }),
+    outputSchema: {
+      type: "object",
+      properties: { prompt: { type: "string" } },
+      required: ["prompt"],
+    },
+    run: (a) => {
+      const prompt = buildJevPrompt(a.request as string);
+      return {
+        text: [
+          prompt,
+          "",
+          "次: graphhopper_invoke(agent: 'graphhopper-jev') に上記を渡し、返却JSONを graphhopper_route_set で記録せよ。",
+        ].join("\n"),
+        data: { prompt },
+      };
+    },
+  },
+  {
+    name: "graphhopper_route_set",
+    description:
+      "jev判定の記録。不正値はAに倒す。A/Bは次回goal start時に消費。Cはhistoryに1行残すのみ",
+    inputSchema: {
+      type: "object",
+      properties: {
+        root: ROOT_PROP,
+        route: { type: "string", description: "jev返却のroute（A/B/C。不正値はAに倒す）" },
+        reason: { type: "string", description: "判定理由の要旨（任意）" },
+      },
+      required: ["route"],
+    },
+    schema: z.object({ root: rootZ, route: z.string(), reason: z.string().optional() }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        route: { type: "string" },
+        bound: { type: "boolean" },
+      },
+      required: ["route", "bound"],
+    },
+    run: (a, ctx) => {
+      const parsed = parseEntryRoute(a.route as string);
+      const reason = (a.reason as string | undefined) ?? parsed.reason;
+      if (parsed.route === "C") {
+        const active = state.getActive(ctx.root);
+        state.recordEvent(ctx.root, {
+          type: "entry_route",
+          ...(active?.goal.id ? { goal: active.goal.id } : {}),
+          route: "C",
+          reason,
+        });
+        return {
+          text: "entry_route=C を記録（historyのみ）。loopなしで直接対応せよ。",
+          data: { route: "C", bound: false },
+        };
+      }
+      state.writePendingRoute(ctx.root, parsed.route, reason);
+      const bound = state.bindEntryRoute(ctx.root, parsed.route, reason);
+      if (bound) state.clearPendingRoute(ctx.root);
+      return {
+        text: bound
+          ? `pending entry_route=${parsed.route} を記録しactive goalにbindした（pendingは消去）。`
+          : `pending entry_route=${parsed.route} を記録。graphhopper_goal(start) で消費される。`,
+        data: { route: parsed.route, bound: !!bound },
+      };
+    },
+  },
+  {
+    name: "graphhopper_escalate",
+    description:
+      "B→A昇格。designingに巻き戻しdesign肉付け＋critic1回＋fan-outに格上げ。A→B・未設定・Cは拒否",
+    inputSchema: { type: "object", properties: { root: ROOT_PROP } },
+    schema: z.object({ root: rootZ }),
+    outputSchema: {
+      type: "object",
+      properties: { escalated: { type: "boolean" } },
+      required: ["escalated"],
+    },
+    run: (a, ctx) => {
+      const r = state.escalateEntryRoute(ctx.root);
+      if (!r)
+        return {
+          text: "error: 昇格不可（active goalなし、または entry_route=B ではない）",
+          data: { escalated: false },
+        };
+      return {
+        text: "escalated: B -> A（designingに巻き戻し）。design肉付け＋critic1回＋fan-out×3が必須。",
+        data: { escalated: true },
       };
     },
   },
