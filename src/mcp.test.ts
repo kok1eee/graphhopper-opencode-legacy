@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, lineageEnriched, parseSkeletonSymbols, resolveRoot } from "./mcp";
@@ -25,13 +26,14 @@ function freshRoot(): string {
 }
 
 describe("graphhopper-mcp tool一覧", () => {
-  test("21 toolが登録される", async () => {
+  test("22 toolが登録される", async () => {
     const client = await linked();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
       [
         "graphhopper_attempt",
+        "graphhopper_consult_set",
         "graphhopper_critic_set",
         "graphhopper_discover_clear",
         "graphhopper_discover_start",
@@ -123,6 +125,126 @@ describe("graphhopper-mcp goal往復", () => {
     expect(
       (raw as { structuredContent?: { ok?: boolean } }).structuredContent?.ok,
     ).toBe(false);
+    await client.close();
+  });
+
+  test("consult_setはgoal必須・記録後はdata付き", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    // goal無しは拒否＋data付き（欠くとMCP -32600で真因マスク）
+    const raw0 = await client.callTool({
+      name: "graphhopper_consult_set",
+      arguments: { root, kind: "advisor", summary: "x" },
+    });
+    const c0 = raw0.content as { type: string; text: string }[];
+    expect(c0[0]?.text).toContain("error: no active goal");
+    expect(
+      (raw0 as { structuredContent?: { recorded?: boolean } })
+        .structuredContent?.recorded,
+    ).toBe(false);
+    await client.callTool({
+      name: "graphhopper_goal",
+      arguments: { root, action: "start", title: "consult test", session_id: "sess-c" },
+    });
+    const raw1 = await client.callTool({
+      name: "graphhopper_consult_set",
+      arguments: { root, kind: "advisor", summary: "asked x got y" },
+    });
+    const c1 = raw1.content as { type: string; text: string }[];
+    expect(c1[0]?.text).toContain("consult recorded: advisor");
+    expect(
+      (raw1 as { structuredContent?: { recorded?: boolean } })
+        .structuredContent?.recorded,
+    ).toBe(true);
+    const st = await client.callTool({
+      name: "graphhopper_status",
+      arguments: { root },
+    });
+    const stText = (st.content as { type: string; text: string }[])[0]?.text ?? "";
+    expect(stText).toContain("advisor_consult: asked x got y");
+    await client.close();
+  });
+
+  test("verifier_setのper-lens modelはstatusに表示される", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    await client.callTool({
+      name: "graphhopper_goal",
+      arguments: { root, action: "start", title: "mixed test", session_id: "sess-m" },
+    });
+    const raw = await client.callTool({
+      name: "graphhopper_verifier_set",
+      arguments: {
+        root,
+        reason: "deep trial",
+        results: [{ lens: "general", level: "clean", model: "t/deep" }],
+      },
+    });
+    const c = raw.content as { type: string; text: string }[];
+    expect(c[0]?.text).toContain("verifier verdict: clean");
+    const st = await client.callTool({
+      name: "graphhopper_status",
+      arguments: { root },
+    });
+    const stText = (st.content as { type: string; text: string }[])[0]?.text ?? "";
+    expect(stText).toContain("models=general@t/deep");
+    await client.close();
+  });
+
+  test("router_checkはRISK接触でdeep標示＋consult連携（git repo経由）", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    // git repoを用意し、baseline起点を作る
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "src", "state.ts"), "v1\n");
+    execSync("git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init", { cwd: root });
+    // advisedでgoal開始（pending消費→entry bind）
+    await call("graphhopper_route_set", { route: "advised", reason: "test" });
+    await call("graphhopper_goal", { action: "start", title: "deep chain", session_id: "sess-d" });
+    // risk fileに触れる（staged＝git diff可視）
+    writeFileSync(join(root, "src", "gate.ts"), "v1\n");
+    execSync("git add -A", { cwd: root });
+    const rc = await call("graphhopper_router_check", {});
+    expect(rc).toContain("route: advisor");
+    expect(rc).toContain("deep: risk files touched: src/gate.ts");
+    // 相談なしではimplementingに進めない（直交）
+    expect(await call("graphhopper_phase", { phase: "implementing", session_id: "sess-d" })).toContain(
+      "graphhopper_consult_set",
+    );
+    await call("graphhopper_consult_set", { kind: "advisor", summary: "asked, ok" });
+    expect(await call("graphhopper_phase", { phase: "implementing", session_id: "sess-d" })).toContain(
+      "phase -> implementing",
+    );
+    await client.close();
+  });
+
+  test("混成runはscoreboardに個別行で載る（MCP経由）", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      return r as { content: { type: string; text: string }[]; structuredContent?: Record<string, unknown> };
+    };
+    await call("graphhopper_goal", { action: "start", title: "mixed sb", session_id: "sess-m2" });
+    await call("graphhopper_verifier_set", {
+      reason: "mixed trial",
+      results: [
+        { lens: "requirement", level: "clean" },
+        { lens: "behavior", level: "clean", model: "t/deep" },
+        { lens: "progress", level: "clean" },
+      ],
+    });
+    const sb = await call("graphhopper_scoreboard", {});
+    const models = sb.structuredContent?.["models"] as { model: string; mixed: number }[];
+    const deep = models.find((m) => m.model === "t/deep");
+    expect(deep?.mixed).toBe(1);
+    const sbText = (sb.content[0]?.text ?? "") as string;
+    expect(sbText).toContain("混成");
     await client.close();
   });
 
@@ -554,9 +676,9 @@ describe("評価機能A/B", () => {
       model: "test/verifier-1",
     });
     const sb = await call("graphhopper_scoreboard", {});
-    const models = sb.structuredContent?.["models"] as { model: string; role: string; verdicts: number; clean: number; drift: number }[];
-    expect(models).toContainEqual({ model: "test/critic-1", role: "critic", verdicts: 1, clean: 1, drift: 0 });
-    expect(models).toContainEqual({ model: "test/verifier-1", role: "verifier", verdicts: 1, clean: 1, drift: 0 });
+    const models = sb.structuredContent?.["models"] as { model: string; role: string; verdicts: number; clean: number; drift: number; mixed: number }[];
+    expect(models).toContainEqual({ model: "test/critic-1", role: "critic", verdicts: 1, clean: 1, drift: 0, mixed: 0 });
+    expect(models).toContainEqual({ model: "test/verifier-1", role: "verifier", verdicts: 1, clean: 1, drift: 0, mixed: 0 });
     await client.close();
   });
 

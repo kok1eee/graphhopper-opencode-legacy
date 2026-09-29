@@ -1267,7 +1267,7 @@ describe("評価機能（state層）", () => {
     setVerifierVerdict(root, { level: "drift", reason: "r", target: "implementing", lens: ["general"], model: "m/a" });
     setVerifierVerdict(root, { level: "clean", reason: "r", target: null, lens: ["general"], model: "m/a" });
     const sb = buildScoreboard(root);
-    expect(sb.models).toContainEqual({ model: "m/a", role: "verifier", verdicts: 2, clean: 1, drift: 1 });
+    expect(sb.models).toContainEqual({ model: "m/a", role: "verifier", verdicts: 2, clean: 1, drift: 1, mixed: 0 });
     expect(sb.goals.length).toBe(1);
   });
 });
@@ -1301,6 +1301,264 @@ describe("scoreboard hints（提案のみ・ガード付き）", () => {
     expect(sb.hints.some((h) => h.includes("要振り返り"))).toBe(true);
     expect(sb.hints.some((h) => h.includes("巻き戻し2回"))).toBe(true);
     void g;
+  });
+});
+
+describe("deep検知（RISK_PATHS×自goal差分）", () => {
+  // bun $ 形の最小fake（template呼び→cwd→nothrow→quiet）。jj/gitで応答を分ける
+  const fakeShell = (
+    jj: { code: number; out: string },
+    git: { code: number; out: string },
+  ) =>
+    ((strings: TemplateStringsArray) => {
+      const cmd = strings.join(" ");
+      const r = cmd.includes("jj diff") ? jj : git;
+      return {
+        cwd: () => ({
+          nothrow: () => ({
+            quiet: () =>
+              Promise.resolve({
+                exitCode: r.code,
+                stdout: { toString: () => r.out },
+              }),
+          }),
+        }),
+      };
+    }) as unknown as Parameters<
+      typeof import("./state").measureChangedFiles
+    >[0];
+
+  test("detectDeepRisk: 自goalのrisk接触のみtrue", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    expect(s.detectDeepRisk(root, ["src/state.ts"], [])).toEqual({
+      deep: true,
+      reason: "risk files touched: src/state.ts",
+    });
+    // 初期脏れは除外
+    expect(
+      s.detectDeepRisk(root, ["src/state.ts"], ["src/state.ts"]),
+    ).toEqual({ deep: false, reason: null });
+    expect(s.detectDeepRisk(root, ["README.md"], [])).toEqual({
+      deep: false,
+      reason: null,
+    });
+    // legacy（初期集合null）はfalse
+    expect(s.detectDeepRisk(root, ["src/state.ts"], null)).toEqual({
+      deep: false,
+      reason: null,
+    });
+    expect(s.detectDeepRisk(root, ["src/state.ts"], undefined)).toEqual({
+      deep: false,
+      reason: null,
+    });
+    // 正規化: 絶対パス・./prefix
+    expect(s.detectDeepRisk(root, [join(root, "src/gate.ts")], []).deep).toBe(
+      true,
+    );
+    expect(s.detectDeepRisk(root, ["./src/gate.ts"], []).deep).toBe(true);
+  });
+
+  test("measureChangedFiles: jj→git→空", async () => {
+    const s = await import("./state");
+    const noShell = undefined as unknown as Parameters<
+      typeof import("./state").measureChangedFiles
+    >[0];
+    expect(await s.measureChangedFiles(noShell, tmpRoot(), null)).toEqual([]);
+    expect(await s.measureChangedFiles(noShell, tmpRoot(), "zzz")).toEqual([]);
+    const jjOk = fakeShell(
+      { code: 0, out: "src/state.ts\nREADME.md\n" },
+      { code: 0, out: "" },
+    );
+    expect(await s.measureChangedFiles(jjOk, "/r", "abc123")).toEqual([
+      "src/state.ts",
+      "README.md",
+    ]);
+    const jjFail = fakeShell({ code: 1, out: "" }, { code: 0, out: "src/gate.ts\n" });
+    expect(await s.measureChangedFiles(jjFail, "/r", "abc123")).toEqual([
+      "src/gate.ts",
+    ]);
+    const both = fakeShell({ code: 1, out: "" }, { code: 1, out: "" });
+    expect(await s.measureChangedFiles(both, "/r", "abc123")).toEqual([]);
+  });
+
+  test("snapshotInitialDiffFiles: 設定・null無視・pause/resume保持", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    const g1 = s.startGoal(root, "first", "s1").goal;
+    expect(s.getActive(root)!.state.initial_diff_files).toBeNull();
+    s.snapshotInitialDiffFiles(root, ["src/state.ts"]);
+    expect(s.getActive(root)!.state.initial_diff_files).toEqual([
+      "src/state.ts",
+    ]);
+    s.snapshotInitialDiffFiles(root, null);
+    expect(s.getActive(root)!.state.initial_diff_files).toEqual([
+      "src/state.ts",
+    ]);
+    s.pauseGoal(root);
+    s.startGoal(root, "second", "s2");
+    expect(s.getActive(root)!.state.initial_diff_files).toBeNull();
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const p = join(root, ".graphhopper", "goals.json");
+    const gj = JSON.parse(readFileSync(p, "utf8"));
+    gj.active = g1.id;
+    writeFileSync(p, JSON.stringify(gj));
+    s.resumeGoal(root, "s1");
+    expect(s.getActive(root)!.state.initial_diff_files).toEqual([
+      "src/state.ts",
+    ]);
+  });
+
+  test("recordRouterCheckWithRisk: deep反映とhistory記録", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.snapshotInitialDiffFiles(root, []);
+    const shell = fakeShell({ code: 0, out: "src/gate.ts\n" }, { code: 0, out: "" });
+    const st = await s.recordRouterCheckWithRisk(shell, root, "abc123", 10, "advisor");
+    expect(st.router.deep).toBe(true);
+    expect(st.router.deep_reason).toContain("src/gate.ts");
+    const ev = s
+      .readHistory(root)
+      .find((h) => h.type === "router_check");
+    expect(ev?.deep).toBe(true);
+    const root2 = tmpRoot();
+    s.startGoal(root2, "t", "s1");
+    s.snapshotInitialDiffFiles(root2, []);
+    const shell2 = fakeShell({ code: 0, out: "README.md\n" }, { code: 0, out: "" });
+    const st2 = await s.recordRouterCheckWithRisk(shell2, root2, "abc123", 5, "advisor");
+    expect(st2.router.deep).toBe(false);
+    expect(st2.router.deep_reason).toBeNull();
+  });
+
+  test("deepはconsult gateと直交する", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "advised");
+    s.snapshotInitialDiffFiles(root, []);
+    const shell = fakeShell({ code: 0, out: "src/state.ts\n" }, { code: 0, out: "" });
+    await s.recordRouterCheckWithRisk(shell, root, "abc123", 10, "advisor");
+    // deepでも相談なしでは通らない
+    expect(checkPhaseMove(root, "implementing")).toContain(
+      "graphhopper_consult_set",
+    );
+    s.setConsult(root, "advisor", { summary: "ok" });
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+    // full entry＋deepは相談なしで通る
+    const root2 = tmpRoot();
+    s.startGoal(root2, "t", "s1");
+    s.snapshotInitialDiffFiles(root2, []);
+    await s.recordRouterCheckWithRisk(shell, root2, "abc123", 10, "advisor");
+    expect(checkPhaseMove(root2, "implementing")).toBeNull();
+  });
+
+  test("shell例外時はfail-open（deepなし）", async () => {
+    const s = await import("./state");
+    const throwing = (() => {
+      throw new Error("boom");
+    }) as unknown as Parameters<
+      typeof import("./state").measureChangedFiles
+    >[0];
+    expect(await s.measureChangedFiles(throwing, "/r", "abc123")).toEqual([]);
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.snapshotInitialDiffFiles(root, []);
+    const st = await s.recordRouterCheckWithRisk(throwing, root, "abc123", 10, "advisor");
+    expect(st.router.deep).toBe(false);
+    expect(st.router.deep_reason).toBeNull();
+  });
+});
+
+describe("混成帰属（per-lens model）", () => {
+  test("checkVerifierResultsはmodelの型のみ検証（lens規則不変）", async () => {
+    const { checkVerifierResults } = await import("./state");
+    expect(
+      checkVerifierResults([{ lens: "general", level: "clean", model: 123 as unknown as string }]),
+    ).toContain("model");
+    expect(
+      checkVerifierResults([{ lens: "general", level: "clean", model: "  " }]),
+    ).toContain("model");
+    expect(
+      checkVerifierResults([{ lens: "general", level: "clean", model: "m/a" }]),
+    ).toBeNull();
+    // lens規則は不変（light/advisedはgeneral×1のみ）
+    expect(
+      checkVerifierResults(
+        [
+          { lens: "requirement", level: "clean", model: "m/a" },
+          { lens: "behavior", level: "clean", model: "m/b" },
+        ],
+        { entryRoute: "advised" },
+      ),
+    ).toContain("general");
+  });
+
+  test("setVerifierVerdictはmodelsをlens長に揃える", async () => {
+    const { setVerifierVerdict } = await import("./state");
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    const v = setVerifierVerdict(root, {
+      level: "clean",
+      reason: "r",
+      target: null,
+      lens: ["requirement", "behavior"],
+      model: "m/a",
+      models: ["m/a"],
+    });
+    expect(v.last_verifier?.models).toEqual(["m/a", "m/a"]);
+    const v2 = setVerifierVerdict(root, {
+      level: "clean",
+      reason: "r",
+      target: null,
+      lens: ["requirement", "behavior"],
+      model: "m/a",
+      models: ["m/a", "m/b", "m/c"],
+    });
+    expect(v2.last_verifier?.models).toEqual(["m/a", "m/b"]);
+  });
+
+  test("混成runはdistinct modelに行bump＋hints注記", async () => {
+    const { buildScoreboard, setVerifierVerdict } = await import("./state");
+    const root = tmpRoot();
+    startGoal(root, "t", "s");
+    setVerifierVerdict(root, {
+      level: "clean",
+      reason: "r",
+      target: null,
+      lens: ["requirement", "behavior"],
+      model: "m/a",
+      models: ["m/a", "m/b"],
+    });
+    const sb = buildScoreboard(root);
+    expect(sb.models).toContainEqual({
+      model: "m/a",
+      role: "verifier",
+      verdicts: 1,
+      clean: 1,
+      drift: 0,
+      mixed: 1,
+    });
+    expect(sb.models).toContainEqual({
+      model: "m/b",
+      role: "verifier",
+      verdicts: 1,
+      clean: 1,
+      drift: 0,
+      mixed: 1,
+    });
+    expect(sb.hints.some((h) => h.includes("混成"))).toBe(true);
+  });
+
+  test("formatLensModelsは差分のみ表示", async () => {
+    const { formatLensModels } = await import("./state");
+    expect(
+      formatLensModels(["behavior", "requirement"], ["m/b", "m/a"], "m/a"),
+    ).toBe("behavior@m/b");
+    expect(formatLensModels(["general"], ["m/a"], "m/a")).toBe("");
+    expect(formatLensModels(["general"], undefined, "m/a")).toBe("");
   });
 });
 
@@ -1370,6 +1628,107 @@ describe("stashDiff（verifier用diff退避）", () => {
     expect(stashed!.path).toContain("g-abc123");
     const { existsSync } = await import("node:fs");
     expect(existsSync(stashed!.path)).toBe(true);
+  });
+
+  test("初期脏れを除外した実効diffだけ退避する", async () => {
+    const s = await import("./state");
+    type Shell = Parameters<typeof s.stashDiff>[0];
+    // name-only列＋per-file差分＋全文を振る舞い分けるfake
+    const stashFake = (files: string[], perFile: Record<string, string>, full: string) =>
+      ((strings: TemplateStringsArray, ...vals: unknown[]) => {
+        const joined = strings.join("#");
+        const ok = (out: string) => ({
+          cwd: () => ({
+            nothrow: () => ({
+              quiet: () =>
+                Promise.resolve({
+                  exitCode: 0,
+                  stdout: { toString: () => out },
+                }),
+            }),
+          }),
+        });
+        if (joined.includes("--name-only")) return ok(files.join("\n") + "\n");
+        if (vals.length >= 2) {
+          const f = s.normalizeForGate("/r", String(vals[1]));
+          return ok(perFile[f] ?? "");
+        }
+        return ok(full);
+      }) as unknown as Shell;
+    const shell = stashFake(
+      ["old.txt", "new.txt"],
+      { "old.txt": "OLD DIFF\n", "new.txt": "NEW DIFF\n" },
+      "FULL DIFF\n",
+    );
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.snapshotInitialDiffFiles(root, ["old.txt"]);
+    const stashed = await s.stashDiff(shell, root, "abc123", "g-abc123");
+    expect(stashed).not.toBeNull();
+    const { readFileSync } = await import("node:fs");
+    const body = readFileSync(stashed!.path, "utf8");
+    expect(body).toContain("NEW DIFF");
+    expect(body).not.toContain("OLD DIFF");
+    expect(body).not.toContain("FULL DIFF");
+  });
+
+  test("legacy（初期集合null）は全文退避に倒す", async () => {
+    const s = await import("./state");
+    type Shell = Parameters<typeof s.stashDiff>[0];
+    const shell = ((strings: TemplateStringsArray, ...vals: unknown[]) => {
+      const joined = strings.join("#");
+      const ok = (out: string) => ({
+        cwd: () => ({
+          nothrow: () => ({
+            quiet: () =>
+              Promise.resolve({
+                exitCode: 0,
+                stdout: { toString: () => out },
+              }),
+          }),
+        }),
+      });
+      if (joined.includes("--name-only"))
+        return ok("old.txt\nnew.txt\n");
+      if (vals.length >= 2) return ok("PER-FILE\n");
+      return ok("FULL DIFF\n");
+    }) as unknown as Shell;
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    // snapshotなし＝initial_diff_files null
+    const stashed = await s.stashDiff(shell, root, "abc123", "g-abc123");
+    expect(stashed).not.toBeNull();
+    const { readFileSync } = await import("node:fs");
+    expect(readFileSync(stashed!.path, "utf8")).toContain("FULL DIFF");
+  });
+
+  test("自goal変更なし（全除外）は空退避", async () => {
+    const s = await import("./state");
+    type Shell = Parameters<typeof s.stashDiff>[0];
+    const shell = ((strings: TemplateStringsArray) => {
+      const joined = strings.join("#");
+      const ok = (out: string) => ({
+        cwd: () => ({
+          nothrow: () => ({
+            quiet: () =>
+              Promise.resolve({
+                exitCode: 0,
+                stdout: { toString: () => out },
+              }),
+          }),
+        }),
+      });
+      if (joined.includes("--name-only")) return ok("old.txt\n");
+      return ok("SHOULD NOT APPEAR\n");
+    }) as unknown as Shell;
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.snapshotInitialDiffFiles(root, ["old.txt"]);
+    const stashed = await s.stashDiff(shell, root, "abc123", "g-abc123");
+    expect(stashed).not.toBeNull();
+    expect(stashed!.lines).toBe(0);
+    const { readFileSync } = await import("node:fs");
+    expect(readFileSync(stashed!.path, "utf8")).toBe("");
   });
 });
 
@@ -1583,6 +1942,101 @@ describe("昇格後critic必須＋stuck自動昇格", () => {
     s.setPhase(root, "implementing");
     expect(g.autoEscalateOnStuck(root)!.state.entry_route).toBe("full");
     expect(g.autoEscalateOnStuck(root)).toBeNull();
+  });
+});
+
+describe("entry相談ゲート（advised/oracle）", () => {
+  test("advisedはadvisor相談なしでimplementingに進めない", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "advised");
+    expect(checkPhaseMove(root, "implementing")).toContain(
+      "graphhopper_consult_set",
+    );
+    s.setConsult(root, "advisor", { summary: "asked x, got y" });
+    expect(s.getActive(root)!.state.advisor_consult?.summary).toBe(
+      "asked x, got y",
+    );
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+  });
+
+  test("oracleはoracle相談が必要（advisor相談では不可）", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "oracle");
+    expect(checkPhaseMove(root, "implementing")).toContain(
+      "graphhopper_consult_set",
+    );
+    s.setConsult(root, "advisor", { summary: "wrong kind" });
+    expect(checkPhaseMove(root, "implementing")).toContain(
+      "graphhopper_consult_set",
+    );
+    s.setConsult(root, "oracle", { summary: "asked o, got p" });
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+  });
+
+  test("full/light/nullは相談なしで通る", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    for (const route of ["full", "light"] as const) {
+      const root = tmpRoot();
+      s.startGoal(root, "t", "s1");
+      s.bindEntryRoute(root, route);
+      expect(checkPhaseMove(root, "implementing")).toBeNull();
+    }
+    const rootNull = tmpRoot();
+    s.startGoal(rootNull, "t", "s1");
+    expect(checkPhaseMove(rootNull, "implementing")).toBeNull();
+  });
+
+  test("昇格後はcriticのみ（advisor相談不要）", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    s.bindEntryRoute(root, "advised");
+    s.setPhase(root, "implementing");
+    s.escalateEntryRoute(root);
+    // 相談ゲートではなくcritic gateが効く
+    expect(checkPhaseMove(root, "implementing")).toContain("critic_review");
+    s.setCriticVerdict(root, { level: "clean", reason: "ok" });
+    expect(checkPhaseMove(root, "implementing")).toBeNull();
+  });
+
+  test("pause→別goal→resumeで相談記録が漏れない／失われない", async () => {
+    const s = await import("./state");
+    const { checkPhaseMove } = await import("./gate");
+    const root = tmpRoot();
+    const g1 = s.startGoal(root, "first", "s1").goal;
+    s.bindEntryRoute(root, "advised");
+    s.setConsult(root, "advisor", { summary: "g1 consult" });
+    s.pauseGoal(root);
+    // 別goalが走る（stateは上書きされる）
+    s.startGoal(root, "second", "s2");
+    s.bindEntryRoute(root, "advised");
+    // g2は未相談→ゲートが効く（g1の記録を継承していない＝リークなし）
+    expect(checkPhaseMove(root, "implementing")).toContain(
+      "graphhopper_consult_set",
+    );
+    s.setConsult(root, "advisor", { summary: "g2 consult" });
+    s.pauseGoal(root);
+    // g1に戻す
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const p = join(root, ".graphhopper", "goals.json");
+    const gj = JSON.parse(readFileSync(p, "utf8"));
+    gj.active = g1.id;
+    writeFileSync(p, JSON.stringify(gj));
+    const r = s.resumeGoal(root, "s1");
+    expect(r?.goal.id).toBe(g1.id);
+    // g1の記録が復帰（喪失なし・g2の記録で上書きなし）
+    expect(s.getActive(root)!.state.advisor_consult?.summary).toBe(
+      "g1 consult",
+    );
   });
 });
 

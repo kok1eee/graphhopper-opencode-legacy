@@ -330,6 +330,10 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
                     root,
                     await state.measureDiffLines($, root, rev),
                   );
+                  state.snapshotInitialDiffFiles(
+                    root,
+                    await state.measureChangedFiles($, root, rev),
+                  );
                 }
               } catch {
                 // 測定不能は無視（initial null＝旧挙動）
@@ -389,24 +393,34 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         async execute() {
           const a = state.getActive(root);
           if (!a) return "no active goal";
+          const v = a.state.last_verifier;
+          const lensModels = v
+            ? state.formatLensModels(v.lens, v.models, v.model)
+            : "";
           return [
             `goal: "${a.goal.title}" (${a.goal.id}) [${a.goal.status}]`,
             `phase: ${a.state.phase}`,
             `session: ${a.state.session_id ?? "unbound"}`,
             `entry_route: ${a.state.entry_route ?? "full（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にlight/advised→full昇格）` : ""}`,
             a.state.router.route
-              ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}`
+              ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}${a.state.router.deep ? ` deep (${a.state.router.deep_reason})` : ""}`
               : "router: (not checked)",
             a.state.initial_diff_lines !== null &&
             a.state.initial_diff_lines !== undefined
               ? `initial_dirt: ${a.state.initial_diff_lines} lines（goal start時の未コミット分。実効diffから除外）`
               : null,
             a.state.last_verifier
-              ? `last_verifier: level=${a.state.last_verifier.level} target=${a.state.last_verifier.target ?? "-"} lens=${a.state.last_verifier.lens.join(",") || "-"} reason=${a.state.last_verifier.reason}`
+              ? `last_verifier: level=${a.state.last_verifier.level} target=${a.state.last_verifier.target ?? "-"} lens=${a.state.last_verifier.lens.join(",") || "-"}${lensModels ? ` models=${lensModels}` : ""} reason=${a.state.last_verifier.reason}`
               : "last_verifier: (none)",
             a.state.critic_review
               ? `critic_review: level=${a.state.critic_review.level} reason=${a.state.critic_review.reason}`
               : "critic_review: (none, opt-in)",
+            a.state.advisor_consult
+              ? `advisor_consult: ${a.state.advisor_consult.summary.slice(0, 100)}`
+              : "advisor_consult: (none)",
+            a.state.oracle_consult
+              ? `oracle_consult: ${a.state.oracle_consult.summary.slice(0, 100)}`
+              : "oracle_consult: (none)",
             `fail_streak: ${a.state.fail_streak}`,
             `loop: stop_count=${a.state.loop_stop_count}/${state.readConfig(root).loop_stop_max} resume_blocked=${state.isResumeBlocked(root)} streak=${a.state.loop_streak}`,
             a.state.notes ? `notes: ${a.state.notes}` : null,
@@ -666,7 +680,13 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           );
           const route: state.RouterRoute =
             diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
-          state.recordRouterCheck(root, baseline, diffLines, route);
+          const recorded = await state.recordRouterCheckWithRisk(
+            $,
+            root,
+            baseline,
+            diffLines,
+            route,
+          );
           // light/advisedの想定外（大diff）は自動昇格: designingに戻し肉付け＋critic＋fan-outへ
           const pre = state.getActive(root);
           if (
@@ -684,10 +704,15 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           return [
             `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
             `route: ${route}`,
+            recorded.router.deep
+              ? `deep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を agents["graphhopper-oracle"] 枠の上位モデルで走らせ、verifier_set の該当 results に model を付けて記録せよ（無視してもstandardとして記録される。追従／無視はhistoryに残る）`
+              : null,
             route === "polish"
               ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
               : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(results: [{lens: 'general', level}])で記録する（自己レビューだけでの完了は不可）",
-          ].join("\n");
+          ]
+            .filter(Boolean)
+            .join("\n");
         },
       }),
 
@@ -730,6 +755,12 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
                   .describe(
                     "drift時の巻き戻し先（level=drift なら必須）。clean時は不要",
                   ),
+                model: tool.schema
+                  .string()
+                  .optional()
+                  .describe(
+                    "このlensを実行したモデル（deep時の上位モデル等。省略時はトップレベルmodel→config既定）",
+                  ),
               }),
             )
             .describe(
@@ -762,6 +793,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             target: decided.target,
             lens: results.map((r) => r.lens),
             model: args.model,
+            models: results.map((r) => r.model ?? args.model ?? null),
           });
           if (result.last_verifier?.level === "clean") {
             return "verifier verdict: clean\ngraphhopper_phase(phase: 'done') で完了に進める。";
@@ -808,6 +840,37 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             model: args.model,
           });
           return `critic review recorded: ${args.level}. phase: ${result.phase}`;
+        },
+      }),
+
+      /* ============================================================ *
+       * entry相談（advised/oracle）の記録。存在記録であり相談の実在は
+       * 検証しない（critic_setと同型）。designing→implementingの機械ゲート
+       * （checkPhaseMove）の入力になる。相談自体はtask/invokeで別途行う。
+       * ============================================================ */
+      graphhopper_consult_set: tool({
+        description:
+          "entry相談の記録。kind=advisorはadvised入口の第二意見、kind=oracleはoracle入口の開始時相談。相談自体はtask(graphhopper-advisor/oracle)／graphhopper_invokeで別途行い、ここでは記録のみする（実在は検証しない）。designing→implementingの機械ゲートの入力になる",
+        args: {
+          kind: tool.schema.enum(["advisor", "oracle"]),
+          summary: tool.schema
+            .string()
+            .describe("相談の要旨（1〜3文。何を聞いて何を得たか）"),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "相談を実行したモデル（省略時はconfig agents表からkind別に補完）",
+            ),
+        },
+        async execute(args) {
+          const active = state.getActive(root);
+          if (!active) return "error: no active goal";
+          state.setConsult(root, args.kind, {
+            summary: args.summary,
+            model: args.model,
+          });
+          return `consult recorded: ${args.kind}`;
         },
       }),
 
@@ -1009,7 +1072,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             `- loop: stop_count=${s.loop_stop_count}/${state.readConfig(root).loop_stop_max} resume_blocked=${state.isResumeBlocked(root)}`,
             `- eval_cmd: ${s.eval_cmd || "(none)"}`,
             s.router.route
-              ? `- router: route=${s.router.route} diff_lines=${s.router.diff_lines}`
+              ? `- router: route=${s.router.route} diff_lines=${s.router.diff_lines}${s.router.deep ? " deep" : ""}`
               : null,
             s.last_verifier
               ? `- last_verifier: ${s.last_verifier.level} (${s.last_verifier.reason})`
@@ -1395,7 +1458,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               // baseline 取得失敗（jj/git エラー）: diff 0 として advisor route で polish へ進む。
               // simplify の入力 diff は空になるが整理対象が無いのでスキップ扱いになる
               // （実装未着手の diff=0 とは区別して滞留させない）
-              state.recordRouterCheck(root, baseline, 0, "advisor");
+              await state.recordRouterCheckWithRisk($, root, baseline, 0, "advisor");
               state.setPhase(root, "polish");
               evalNote = `eval_cmd passed but baseline not captured — polishへ進む（simplifyはスキップ、verifierで検証）: ${cmd}`;
             } else if (diffLines > 0) {
@@ -1404,11 +1467,20 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               const cfg = state.readConfig(root);
               const route: state.RouterRoute =
                 diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
-              state.recordRouterCheck(root, baseline, diffLines, route);
+              const recorded = await state.recordRouterCheckWithRisk(
+                $,
+                root,
+                baseline,
+                diffLines,
+                route,
+              );
               state.setPhase(root, "polish");
               evalNote = `eval_cmd passed (diff ${diffLines} lines since baseline): ${cmd}`;
+              if (recorded.router.deep) {
+                evalNote += `\ndeep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を上位モデルで走らせ、verifier_set の該当 results に model を付けよ`;
+              }
             } else {
-              state.recordRouterCheck(root, baseline, 0, "advisor");
+              await state.recordRouterCheckWithRisk($, root, baseline, 0, "advisor");
               evalNote = `eval_cmd passed but effective diff_lines=0 since baseline — 実装なしか前goal残骸との相殺のいずれか。実装を進めるか、router_check で手動確認せよ: ${cmd}`;
             }
           } else if (r.giveUp) {

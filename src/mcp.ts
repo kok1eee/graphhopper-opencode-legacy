@@ -146,24 +146,32 @@ function statusData(root: string): Record<string, unknown> {
 function statusText(root: string): string {
   const a = state.getActive(root);
   if (!a) return "no active goal";
+  const v = a.state.last_verifier;
+  const lensModels = v ? state.formatLensModels(v.lens, v.models, v.model) : "";
   return [
     `goal: "${a.goal.title}" (${a.goal.id}) [${a.goal.status}]`,
     `phase: ${a.state.phase}`,
     `session: ${a.state.session_id ?? "unbound"}`,
     `entry_route: ${a.state.entry_route ?? "full（未判定・legacy）"}${a.state.escalated_at ? `（${a.state.escalated_at}にlight/advised→full昇格）` : ""}`,
     a.state.router.route
-      ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}`
+      ? `router: route=${a.state.router.route} diff_lines=${a.state.router.diff_lines} checked_at=${a.state.router.checked_at}${a.state.router.deep ? ` deep (${a.state.router.deep_reason})` : ""}`
       : "router: (not checked)",
     a.state.initial_diff_lines !== null &&
     a.state.initial_diff_lines !== undefined
       ? `initial_dirt: ${a.state.initial_diff_lines} lines（goal start時の未コミット分。実効diffから除外）`
       : null,
     a.state.last_verifier
-      ? `last_verifier: level=${a.state.last_verifier.level} target=${a.state.last_verifier.target ?? "-"} lens=${a.state.last_verifier.lens.join(",") || "-"} reason=${a.state.last_verifier.reason}`
+      ? `last_verifier: level=${a.state.last_verifier.level} target=${a.state.last_verifier.target ?? "-"} lens=${a.state.last_verifier.lens.join(",") || "-"}${lensModels ? ` models=${lensModels}` : ""} reason=${a.state.last_verifier.reason}`
       : "last_verifier: (none)",
     a.state.critic_review
       ? `critic_review: level=${a.state.critic_review.level} reason=${a.state.critic_review.reason}`
       : "critic_review: (none, opt-in)",
+    a.state.advisor_consult
+      ? `advisor_consult: ${a.state.advisor_consult.summary.slice(0, 100)}`
+      : "advisor_consult: (none)",
+    a.state.oracle_consult
+      ? `oracle_consult: ${a.state.oracle_consult.summary.slice(0, 100)}`
+      : "oracle_consult: (none)",
     `fail_streak: ${a.state.fail_streak}`,
     a.goal.score ? `score: ${a.goal.score.value} ${JSON.stringify(a.goal.score.breakdown)}` : null,
     `loop: stop_count=${a.state.loop_stop_count}/${state.readConfig(root).loop_stop_max} resume_blocked=${state.isResumeBlocked(root)} streak=${a.state.loop_streak}`,
@@ -200,6 +208,10 @@ async function goalAction(
           state.snapshotInitialDirt(
             root,
             await state.measureDiffLines($, root, rev),
+          );
+          state.snapshotInitialDiffFiles(
+            root,
+            await state.measureChangedFiles($, root, rev),
           );
         }
       } catch {
@@ -294,7 +306,11 @@ function driverNote(root: string, sessionID: string): string {
 
 function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
   const active = state.getActive(root);
-  if (!active) return { text: "error: no active goal" };
+  if (!active)
+    return {
+      text: "error: no active goal",
+      data: { ok: false, failStreak: 0, escalate: false, giveUp: false, recorded: false },
+    };
   const r = state.recordAttempt(root, ok, note);
   const managed = !ok && active.state.eval_cmd ? `\n${EVAL_MANAGED_NOTE}` : "";
   if (ok)
@@ -405,18 +421,27 @@ async function evalOnce(root: string): Promise<string> {
       state.getActive(root)?.state.initial_diff_lines,
     );
     if (baseline === null) {
-      state.recordRouterCheck(root, baseline, 0, "advisor");
+      await state.recordRouterCheckWithRisk($, root, baseline, 0, "advisor");
       state.setPhase(root, "polish");
       return `eval_cmd passed but baseline not captured — polishへ進む（simplifyはスキップ、verifierで検証）: ${cmd}\n${tail}`;
     } else if (diffLines > 0) {
       const cfg = state.readConfig(root);
       const route: state.RouterRoute =
         diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
-      state.recordRouterCheck(root, baseline, diffLines, route);
+      const recorded = await state.recordRouterCheckWithRisk(
+        $,
+        root,
+        baseline,
+        diffLines,
+        route,
+      );
       state.setPhase(root, "polish");
-      return `eval_cmd passed (diff ${diffLines} lines since baseline): ${cmd}\n${tail}`;
+      const deepLine = recorded.router.deep
+        ? `\ndeep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を上位モデルで走らせ、verifier_set の該当 results に model を付けよ`
+        : "";
+      return `eval_cmd passed (diff ${diffLines} lines since baseline): ${cmd}${deepLine}\n${tail}`;
     } else {
-      state.recordRouterCheck(root, baseline, 0, "advisor");
+      await state.recordRouterCheckWithRisk($, root, baseline, 0, "advisor");
       return `eval_cmd passed but effective diff_lines=0 since baseline — 実装なしか前goal残骸との相殺のいずれか。実装を進めるか、router_check で手動確認せよ: ${cmd}\n${tail}`;
     }
   }
@@ -458,7 +483,13 @@ async function evalOnce(root: string): Promise<string> {
 
 async function routerCheck(root: string): Promise<ToolOut> {
   const active = state.getActive(root);
-  if (!active) return { text: "error: no active goal" };
+  if (!active) {
+    const threshold = state.readConfig(root).router_threshold_lines;
+    return {
+      text: "error: no active goal",
+      data: { diffLines: 0, route: "error", threshold },
+    };
+  }
   const cfg = state.readConfig(root);
   const baseline =
     active.state.router.baseline_rev ??
@@ -470,7 +501,13 @@ async function routerCheck(root: string): Promise<ToolOut> {
   );
   const route: state.RouterRoute =
     diffLines > cfg.router_threshold_lines ? "polish" : "advisor";
-  state.recordRouterCheck(root, baseline, diffLines, route);
+  const recorded = await state.recordRouterCheckWithRisk(
+    $,
+    root,
+    baseline,
+    diffLines,
+    route,
+  );
   const pre = state.getActive(root);
   if (
     (pre?.state.entry_route === "light" ||
@@ -491,10 +528,15 @@ async function routerCheck(root: string): Promise<ToolOut> {
     text: [
       `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
       `route: ${route}`,
+      recorded.router.deep
+        ? `deep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を agents["graphhopper-oracle"] 枠の上位モデルで走らせ、verifier_set の該当 results に model を付けて記録せよ（無視してもstandardとして記録される。追従／無視はhistoryに残る）`
+        : null,
       route === "polish"
         ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
         : "次: task(subagent_type: 'graphhopper-verifier') を1回、'general'charter（3観点を統合したレビュー）で呼び、graphhopper_verifier_set(results: [{lens: 'general', level}])で記録する（自己レビューだけでの完了は不可）",
-    ].join("\n"),
+    ]
+      .filter(Boolean)
+      .join("\n"),
     data: { diffLines, route, threshold: cfg.router_threshold_lines },
   };
 }
@@ -510,7 +552,7 @@ function verifierSet(
     entryRoute: active?.state.entry_route ?? null,
     escalated: !!active?.state.escalated_at,
   });
-  if (rejected) return { text: rejected };
+  if (rejected) return { text: rejected, data: { level: "error" } };
   const decided = state.aggregateVerdicts(results);
   const result = state.setVerifierVerdict(root, {
     level: decided.level,
@@ -518,6 +560,7 @@ function verifierSet(
     target: decided.target,
     lens: results.map((r) => r.lens),
     model,
+    models: results.map((r) => r.model ?? model ?? null),
   });
   const data = {
     level: decided.level,
@@ -590,6 +633,7 @@ const LOG_TOOLS = new Set([
   "graphhopper_phase",
   "graphhopper_verifier_set",
   "graphhopper_critic_set",
+  "graphhopper_consult_set",
   "graphhopper_eval",
   "graphhopper_attempt",
   "graphhopper_router_check",
@@ -691,8 +735,9 @@ const TOOL_DEFS: ToolDef[] = [
               verdicts: { type: "number" },
               clean: { type: "number" },
               drift: { type: "number" },
+              mixed: { type: "number" },
             },
-            required: ["model", "role", "verdicts", "clean", "drift"],
+            required: ["model", "role", "verdicts", "clean", "drift", "mixed"],
           },
         },
         goals: {
@@ -720,7 +765,7 @@ const TOOL_DEFS: ToolDef[] = [
       const lines = [
         "## models",
         ...sb.models.map(
-          (m) => `- ${m.role} ${m.model}: ${m.verdicts}件 (clean ${m.clean} / drift ${m.drift})`,
+          (m) => `- ${m.role} ${m.model}: ${m.verdicts}件 (clean ${m.clean} / drift ${m.drift}${m.mixed > 0 ? ` / mixed ${m.mixed}` : ""})`,
         ),
         "## goals",
         ...sb.goals.map(
@@ -799,7 +844,7 @@ const TOOL_DEFS: ToolDef[] = [
     run: (a, ctx) => {
       const root = ctx.root;
       const active = state.getActive(root);
-      if (!active) return { text: "error: no active goal" };
+      if (!active) return { text: "error: no active goal", data: { cmd: "", cleared: false } };
       state.setEvalCmd(root, a.cmd);
       return {
         text: a.cmd
@@ -908,12 +953,20 @@ const TOOL_DEFS: ToolDef[] = [
     },
     run: async (a, ctx) => {
       const active = state.getActive(ctx.root);
-      if (!active) return { text: "error: no active goal" };
+      if (!active)
+        return {
+          text: "error: no active goal",
+          data: { path: "", lines: 0, baseline: "" },
+        };
       const baseline =
         active.state.router.baseline_rev ??
         (await state.captureBaselineRev($, ctx.root));
       const stashed = await state.stashDiff($, ctx.root, baseline, active.goal.id);
-      if (!stashed) return { text: "error: diff取得失敗（VCS不在またはbaseline不正）" };
+      if (!stashed)
+        return {
+          text: "error: diff取得失敗（VCS不在またはbaseline不正）",
+          data: { path: "", lines: 0, baseline: "" },
+        };
       return {
         text: [
           `diff stashed: ${stashed.path} (${stashed.lines} lines)`,
@@ -1076,6 +1129,7 @@ const TOOL_DEFS: ToolDef[] = [
               lens: { type: "string", enum: ["requirement", "behavior", "progress", "general"] },
               level: { type: "string", enum: ["clean", "drift"] },
               target: { type: "string", enum: ["implementing", "design", "requirements"] },
+              model: { type: "string", description: "このlensを実行したモデル（deep時の上位モデル等。省略時はトップレベルmodel→config既定）" },
             },
             required: ["lens", "level"],
           },
@@ -1092,6 +1146,7 @@ const TOOL_DEFS: ToolDef[] = [
           lens: z.enum(["requirement", "behavior", "progress", "general"]),
           level: z.enum(["clean", "drift"]),
           target: z.enum(["implementing", "design", "requirements"]).optional(),
+          model: z.string().optional(),
         }),
       ),
       reason: z.string(),
@@ -1151,6 +1206,59 @@ const TOOL_DEFS: ToolDef[] = [
           level: a.level,
           phase: result.phase,
           model: result.critic_review?.model ?? undefined,
+        },
+      };
+    },
+  },
+  {
+    name: "graphhopper_consult_set",
+    description:
+      "entry相談の記録。kind=advisorはadvised入口の第二意見、kind=oracleはoracle入口の開始時相談。相談自体はtask/invokeで別途行い、ここでは記録のみする（実在は検証しない）。designing→implementingの機械ゲートの入力になる",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["advisor", "oracle"] },
+        summary: { type: "string", description: "相談の要旨（1〜3文。何を聞いて何を得たか）" },
+        model: { type: "string", description: "相談を実行したモデル（省略時はconfig agents表からkind別に補完）" },
+        root: ROOT_PROP,
+      },
+      required: ["kind", "summary"],
+    },
+    schema: z.object({
+      kind: z.enum(["advisor", "oracle"]),
+      summary: z.string(),
+      model: z.string().optional(),
+      root: rootZ,
+    }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string" },
+        recorded: { type: "boolean" },
+        model: { type: "string" },
+      },
+      required: ["kind", "recorded"],
+    },
+    run: (a, ctx) => {
+      const active = state.getActive(ctx.root);
+      // 拒否時もdataを返す（欠くとMCP -32600で真因がマスクされる）
+      if (!active)
+        return {
+          text: "error: no active goal",
+          data: { kind: a.kind as string, recorded: false },
+        };
+      const result = state.setConsult(ctx.root, a.kind as state.ConsultKind, {
+        summary: a.summary,
+        model: a.model,
+      });
+      const rec =
+        a.kind === "advisor" ? result.advisor_consult : result.oracle_consult;
+      return {
+        text: `consult recorded: ${a.kind}`,
+        data: {
+          kind: a.kind as string,
+          recorded: true,
+          model: rec?.model ?? undefined,
         },
       };
     },

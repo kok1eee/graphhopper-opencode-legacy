@@ -180,6 +180,7 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
      `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
      伝播してkillされる（取り消し後の裏回りなし）。
      推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
+- **deep推奨**（routerの `deep` 標示時）: 状態遷移核（`src/state.ts`・`src/gate.ts`）に触れたgoalは、該当lensだけ上位モデルで走らせる。route=polishならbehavior、route=advisorならgeneralを `graphhopper_invoke` のmodel上書き（`agents["graphhopper-oracle"]` 枠）で実行し、`graphhopper_verifier_set` の該当 results 要素に `model` を付けて記録する（他lensは既定のまま。lens構成は変えない）。selectorとの住分け：selector→lens選択、deep→model選択（直交）。無視してもstandardとして記録される（fail-safe。追従／無視はhistoryに残り事後集計可）。判断者は増やさない（集約は1本のまま）
 - **モデル割当（2026-09-28改定・Bedrock配線後）**: criticは `amazon-bedrock/grok-4.6`
   （Bedrock cross-region `global.xai.grok-4.6`。1回/goalのため約$0.14と誤差。系列多様性も確保）。
   verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。

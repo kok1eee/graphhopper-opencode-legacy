@@ -46,16 +46,34 @@ export interface Goal {
   paused_snapshot?: GoalSnapshot | null;
 }
 
+/** entry相談の種別。advisor＝advised入口の第二意見、oracle＝oracle入口の開始時相談。
+ * stuck時のoracle相談とは区別しない（entry gateは遷移時点の存在だけ見る） */
+export type ConsultKind = "advisor" | "oracle";
+
+/** entry相談の記録。判定ではなく存在記録のためlevelを持たない（scoreboard汚染防止）。
+ * 相談の実在は検証しない（critic_setと同型の既知トレードオフ） */
+export interface ConsultRecord {
+  summary: string;
+  /** 相談を実行したモデル（未指定時はconfig agents表からkind別に補完） */
+  model?: string | null;
+  at: string;
+}
+
 /** pause時に退避するgoal固有文脈（単一LoopStateの使い回しによる漏れ対策） */
 export interface GoalSnapshot {
   phase: Phase;
   router: RouterState;
   last_verifier: VerifierVerdict | null;
   critic_review: CriticVerdict | null;
+  /** entry相談記録。別goal走行後のresumeで他goalの記録を継承（リーク）／自記録を喪失しないよう退避する */
+  advisor_consult: ConsultRecord | null;
+  oracle_consult: ConsultRecord | null;
   eval_cmd: string | null;
   notes: string;
   /** goal start時の脏れ。resume後も自goal基準を維持するため退避する */
   initial_diff_lines: number | null;
+  /** goal start時の脏れファイル集合。deep判定の差分基準として退避する */
+  initial_diff_files: string[] | null;
 }
 
 /** goal出来栄えの機械採点。式はv1で固定し、breakdownで透明化する（調整は式ごと変える） */
@@ -102,6 +120,9 @@ export interface VerifierVerdict {
   lens: VerifierLens[];
   /** 判定を実行したモデル（未指定時はconfig既定で補完）。評価機能の成績表素材 */
   model?: string | null;
+  /** lens並列の実行モデル（混成run用。欠測・旧eventは [model] fallback）。
+   * 長さは lens と一致させる（setVerifierVerdict がpad/truncateする） */
+  models?: (string | null)[];
   at: string;
 }
 
@@ -123,6 +144,10 @@ export interface RouterState {
   diff_lines: number | null;
   route: RouterRoute | null;
   checked_at: string | null;
+  /** deep推奨。同一goalの変更がRISK_PATHSに触れたか（recordRouterCheckWithRiskが判定） */
+  deep: boolean;
+  /** deep=trueの理由（触れたriskファイル列）。false時はnull */
+  deep_reason: string | null;
 }
 
 export interface LoopState {
@@ -138,6 +163,10 @@ export interface LoopState {
   last_verifier: VerifierVerdict | null;
   /** designing終了前のcritic review結果。null = 未実行（opt-in、setPhaseの前提条件にはしない） */
   critic_review: CriticVerdict | null;
+  /** advised入口のadvisor相談記録。null = 未相談（designing→implementingの機械ゲート） */
+  advisor_consult: ConsultRecord | null;
+  /** oracle入口の開始時相談記録。null = 未相談（designing→implementingの機械ゲート） */
+  oracle_consult: ConsultRecord | null;
   /**
    * implementing での連続失敗数（graphhopper_attempt が機械カウント）。
    * stuck_threshold に達したら graphhopper-oracle への相談を促す。
@@ -193,6 +222,9 @@ export interface LoopState {
   /** goal start時の未コミット脏れ行数（baseline rev基準）。実効diff＝測定－初期値。
    * null＝legacy/未測定→0扱い。designing中はsource編集不可のためstart時測定で安定 */
   initial_diff_lines: number | null;
+  /** goal start時の未コミット脏れファイル集合（正規化済み）。deep判定の差分基準。
+   * null＝legacy/未測定→deepなし。snapshotInitialDiffFilesがstart時に記録する */
+  initial_diff_files: string[] | null;
   /** jev入口判定のroute。null＝full（未呼び出し・legacy）。light/advised→full昇格のみ可 */
   entry_route: EntryRoute | null;
   /** light/advised→full昇格の実施時刻。null＝未昇格 */
@@ -357,6 +389,8 @@ export type HistoryEvent =
       goal: string;
       diff_lines: number;
       route: RouterRoute;
+      deep?: boolean;
+      deep_reason?: string | null;
     }
   | {
       type: "verifier_verdict";
@@ -365,6 +399,8 @@ export type HistoryEvent =
       target: DriftTarget | null;
       lens: VerifierLens[];
       model?: string | null;
+      /** lens並列の実行モデル（混成run用。旧eventは欠測→[model] fallback） */
+      models?: (string | null)[];
     }
   | { type: "design_gate_block"; goal: string; tool: string; path: string }
   | {
@@ -377,6 +413,14 @@ export type HistoryEvent =
       type: "critic_review_set";
       goal: string;
       level: VerdictLevel;
+      model?: string | null;
+    }
+  | {
+      /* entry相談の記録。判定ではなく存在記録のためlevelを持たない
+       *（scoreboard汚染防止。switchはdefaultのまま） */
+      type: "consult_set";
+      goal: string;
+      kind: ConsultKind;
       model?: string | null;
     }
   | {
@@ -570,9 +614,13 @@ function emptyState(): LoopState {
       diff_lines: null,
       route: null,
       checked_at: null,
+      deep: false,
+      deep_reason: null,
     },
     last_verifier: null,
     critic_review: null,
+    advisor_consult: null,
+    oracle_consult: null,
     fail_streak: 0,
     eval_cmd: null,
     last_continuation_marker: null,
@@ -588,6 +636,7 @@ function emptyState(): LoopState {
     entry_route: null,
     escalated_at: null,
     initial_diff_lines: null,
+    initial_diff_files: null,
     updated_at: new Date().toISOString(),
   };
 }
@@ -715,9 +764,12 @@ export function pauseGoal(root: string): ActiveLoop | null {
         router: state.router,
         last_verifier: state.last_verifier,
         critic_review: state.critic_review,
+        advisor_consult: state.advisor_consult,
+        oracle_consult: state.oracle_consult,
         eval_cmd: state.eval_cmd,
         notes: state.notes,
         initial_diff_lines: state.initial_diff_lines,
+        initial_diff_files: state.initial_diff_files,
       },
     },
     // 人間による明示的な操作なのでloop停止フラグも解除（pause自体が駆動を止める）
@@ -759,10 +811,14 @@ export function resumeGoal(
               router: snap.router,
               last_verifier: snap.last_verifier,
               critic_review: snap.critic_review,
+              // 旧snapshot（field無し）→null＝legacy扱い
+              advisor_consult: snap.advisor_consult ?? null,
+              oracle_consult: snap.oracle_consult ?? null,
               eval_cmd: snap.eval_cmd,
               notes: snap.notes,
               // 旧snapshot（field無し）→null＝legacy扱い
               initial_diff_lines: snap.initial_diff_lines ?? null,
+              initial_diff_files: snap.initial_diff_files ?? null,
             }
           : {}),
       },
@@ -1235,6 +1291,61 @@ export function isValidBaselineRev(baseline: string): boolean {
   return /^[0-9a-fA-F]+$/.test(baseline);
 }
 
+/** deep検知の対象（状態遷移核）。repo相対・正規化済みパスで照合する。
+ * 他repoでは一致せずfail-open（deepなし）。判断はstate/gateに閉じる——
+ * index/mcpに判断を足したらRISKを見直すこと（不変条件） */
+export const RISK_PATHS: readonly string[] = ["src/state.ts", "src/gate.ts"];
+
+/** baseline からの変更ファイル列を測定する（jj → git fallback）。
+ * deep検知用。取得不能時は []（fail-open＝deepなし）。 */
+export async function measureChangedFiles(
+  shell: Shell,
+  root: string,
+  baseline: string | null,
+): Promise<string[]> {
+  if (!baseline || !isValidBaselineRev(baseline)) return [];
+  const collect = (out: string): string[] =>
+    out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+  try {
+    const r = await shell`jj diff --from ${baseline} --name-only`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) return collect(r.stdout.toString());
+  } catch {
+    // ignore → gitへ
+  }
+  try {
+    const r = await shell`git diff --name-only ${baseline}`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) return collect(r.stdout.toString());
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+/** deep判定＝(現行集合 − 初期集合) ∩ RISK_PATHS（effectiveDiffLinesのファイル版。
+ * 前goal残骸を除外する）。初期集合null（legacy）時はfalse（帰属不能のため）。 */
+export function detectDeepRisk(
+  root: string,
+  currentFiles: string[],
+  initialFiles: string[] | null | undefined,
+): { deep: boolean; reason: string | null } {
+  if (!initialFiles) return { deep: false, reason: null };
+  const initial = new Set(initialFiles.map((f) => normalizeForGate(root, f)));
+  const touched = currentFiles
+    .map((f) => normalizeForGate(root, f))
+    .filter((f) => !initial.has(f) && (RISK_PATHS as readonly string[]).includes(f));
+  if (touched.length === 0) return { deep: false, reason: null };
+  return { deep: true, reason: `risk files touched: ${touched.join(", ")}` };
+}
+
 /** `--stat` / `--shortstat` 末行（"N files changed, M insertions(+), K deletions(-)"）
  * をパースして挿入+削除行数を返す。insert-only / delete-only 対応。
  * どちらも無ければ null（diff無しとパース不能を区別せず、呼び出し側で0扱い）。 */
@@ -1305,6 +1416,20 @@ export function snapshotInitialDirt(root: string, lines: number | null): void {
   writeState(root, { ...state, initial_diff_lines: lines });
 }
 
+/* goal start直後の初期脏れファイル集合snapshot（行数のsnapshotInitialDirt同型。
+ * deep判定の差分基準。nullは書かない（legacy＝deepなし扱いを維持） */
+export function snapshotInitialDiffFiles(
+  root: string,
+  files: string[] | null,
+): void {
+  if (!files) return;
+  const state = readState(root);
+  writeState(root, {
+    ...state,
+    initial_diff_files: files.map((f) => normalizeForGate(root, f)),
+  });
+}
+
 /** 退避diffのpath（stashDiffと単一源泉。complete/clear時の掃除と共有）。
  * 子セッションのexternal_directory権限で読めるようrepo内（gitignore済み）に置く。
  * /tmpは子から読めない実証済みのため使わない */
@@ -1322,9 +1447,39 @@ export function removeStashedDiff(root: string, goalId: string): void {
   }
 }
 
-/* verifier fan-out用のdiff退避: baselineからの全文diffを1回だけ取得し、
+/** 単一ファイルのdiffを取得する（stashDiffの実効diff用）。
+ * 失敗時は null（呼び出し側が全文退避に倒す）。 */
+export async function diffOneFile(
+  shell: Shell,
+  root: string,
+  baseline: string,
+  file: string,
+): Promise<string | null> {
+  try {
+    const r = await shell`jj diff --from ${baseline} -- ${file}`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) return r.stdout.toString();
+  } catch {
+    // gitへ
+  }
+  try {
+    const r = await shell`git diff ${baseline} -- ${file}`
+      .cwd(root)
+      .nothrow()
+      .quiet();
+    if (r.exitCode === 0) return r.stdout.toString();
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/* verifier fan-out用のdiff退避: 実効diff（初期脏れ除外）を1回だけ取得し、
  * repo内（.graphhopper/tmp）に置いてpathで渡す（3 lensへのinline 3重展開を防ぐ。
  * /tmpは子権限で読めないため使わない。ファイル名にgoalを含め並列goalの衝突を避ける）。
+ * 初期集合null（legacy）・測定不能時は全文退避に倒す（fail-safe＝読み過ぎ側）。
  * 失敗時は null */
 export async function stashDiff(
   shell: Shell,
@@ -1344,6 +1499,36 @@ export async function stashDiff(
       baseline,
     };
   };
+  // 実効diff: 現行集合−初期集合の対象ファイルのみ退避する
+  const initial = getActive(root)?.state.initial_diff_files;
+  if (initial) {
+    let current: string[] = [];
+    try {
+      current = await measureChangedFiles(shell, root, baseline);
+    } catch {
+      current = [];
+    }
+    if (current.length > 0) {
+      const initialSet = new Set(
+        initial.map((f) => normalizeForGate(root, f)),
+      );
+      const effective = [
+        ...new Set(current.map((f) => normalizeForGate(root, f))),
+      ].filter((f) => !initialSet.has(f));
+      if (effective.length === 0) return write("");
+      try {
+        const parts: string[] = [];
+        for (const f of effective) {
+          const part = await diffOneFile(shell, root, baseline, f);
+          if (part === null) throw new Error(`per-file diff failed: ${f}`);
+          parts.push(part);
+        }
+        return write(parts.join("\n"));
+      } catch {
+        // 下の全文退避へ（読み過ぎ側に倒す）
+      }
+    }
+  }
   try {
     const r = await shell`jj diff --from ${baseline}`
       .cwd(root)
@@ -1370,6 +1555,7 @@ export function recordRouterCheck(
   baseline: string | null,
   diffLines: number,
   route: RouterRoute,
+  deep?: { deep: boolean; reason: string | null },
 ): LoopState {
   const state = readState(root);
   const next: LoopState = {
@@ -1379,6 +1565,8 @@ export function recordRouterCheck(
       diff_lines: diffLines,
       route,
       checked_at: new Date().toISOString(),
+      deep: deep?.deep ?? false,
+      deep_reason: deep?.reason ?? null,
     },
   };
   writeState(root, next);
@@ -1388,15 +1576,40 @@ export function recordRouterCheck(
       goal: state.goal_id,
       diff_lines: diffLines,
       route,
+      deep: next.router.deep,
+      deep_reason: next.router.deep_reason,
     });
   return next;
 }
 
-/** verifier fan-out の1レンズ分の結果（verifier_set の results 要素） */
+/** router記録のchoke point（検知＋記録）。既存のrecordRouterCheck呼出は
+ * こちらに置換する（eval経路含む。deep検知の抜けを作らない）。 */
+export async function recordRouterCheckWithRisk(
+  shell: Shell,
+  root: string,
+  baseline: string | null,
+  diffLines: number,
+  route: RouterRoute,
+): Promise<LoopState> {
+  const active = getActive(root);
+  // measureChangedFiles は内部で例外を握り潰し [] を返すためここではthrowしない
+  const files = await measureChangedFiles(shell, root, baseline);
+  const { deep, reason } = detectDeepRisk(
+    root,
+    files,
+    active?.state.initial_diff_files ?? null,
+  );
+  return recordRouterCheck(root, baseline, diffLines, route, { deep, reason });
+}
+
+/** verifier fan-out の1レンズ分の結果（verifier_set の results 要素）。
+ * model は per-lens上書き（deep時の上位モデル等）。省略時はトップレベルmodel→config既定。
+ * 申告値であり実在は検証しない（critic_set／consult_set同型の既知トレードオフ） */
 export interface VerifierResult {
   lens: VerifierLens;
   level: VerdictLevel;
   target?: DriftTarget | null;
+  model?: string | null;
 }
 
 /** verifier_set 入力の検証。通れば null、ダメならエラー文（tool がそのまま返す）。
@@ -1440,6 +1653,13 @@ export function checkVerifierResults(
     }
     if (r.level === "drift" && !r.target) {
       return `error: drift には target が必要です (lens: ${r.lens})`;
+    }
+    if (
+      r.model !== undefined &&
+      r.model !== null &&
+      (typeof r.model !== "string" || r.model.trim().length === 0)
+    ) {
+      return `error: 不正な model です (lens: ${r.lens})`;
     }
   }
   // entry route×lens照合（light/advised非昇格はgeneral×1のみ、昇格後は3lens必須。
@@ -1489,9 +1709,13 @@ export function setVerifierVerdict(
   const state = readState(root);
   const model =
     verdict.model ?? readConfig(root).agents["graphhopper-verifier"] ?? null;
+  // lens並列モデルを lens 長に揃える（不足は既定でpad、過剰はtruncate。fail-safe）
+  const models = verdict.lens.map(
+    (_, i) => verdict.models?.[i] ?? model,
+  );
   const next: LoopState = {
     ...state,
-    last_verifier: { ...verdict, model, at: new Date().toISOString() },
+    last_verifier: { ...verdict, model, models, at: new Date().toISOString() },
   };
   writeState(root, next);
   if (state.goal_id) {
@@ -1502,9 +1726,27 @@ export function setVerifierVerdict(
       target: verdict.target,
       lens: verdict.lens,
       model,
+      models,
     });
   }
   return next;
+}
+
+/** status表示用：既定と異なるlensのみ `lens@model` 式で列挙する（差分表示）。
+ * 全一致・欠測時は ""（行自体は呼び出し側で省略可）。 */
+export function formatLensModels(
+  lens: VerifierLens[],
+  models: (string | null)[] | undefined,
+  fallback: string | null | undefined,
+): string {
+  if (!models) return "";
+  return lens
+    .map((l, i) => {
+      const m = models[i] ?? fallback ?? null;
+      return m && m !== fallback ? `${l}@${m}` : null;
+    })
+    .filter((x): x is string => x !== null)
+    .join(",");
 }
 
 /** design.md質レビュー（graphhopper-critic）の結果を記録する。opt-inでありphase遷移の
@@ -1526,6 +1768,41 @@ export function setCriticVerdict(
       type: "critic_review_set",
       goal: state.goal_id,
       level: verdict.level,
+      model,
+    });
+  }
+  return next;
+}
+
+/** entry相談（graphhopper-advisor／graphhopper-oracle）の記録。存在記録であり
+ * 相談の実在は検証しない（critic_setと同型の既知トレードオフ）。
+ * designing→implementingの機械ゲート（checkPhaseMove）の入力になる。 */
+export function setConsult(
+  root: string,
+  kind: ConsultKind,
+  consult: Omit<ConsultRecord, "at">,
+): LoopState {
+  const state = readState(root);
+  const agentKey =
+    kind === "advisor" ? "graphhopper-advisor" : "graphhopper-oracle";
+  const model = consult.model ?? readConfig(root).agents[agentKey] ?? null;
+  const record: ConsultRecord = {
+    ...consult,
+    model,
+    at: new Date().toISOString(),
+  };
+  const next: LoopState = {
+    ...state,
+    ...(kind === "advisor"
+      ? { advisor_consult: record }
+      : { oracle_consult: record }),
+  };
+  writeState(root, next);
+  if (state.goal_id) {
+    recordEvent(root, {
+      type: "consult_set",
+      goal: state.goal_id,
+      kind,
       model,
     });
   }
@@ -2118,8 +2395,9 @@ export function noteStuckNotified(root: string, reasons: string[]): boolean {
 import { isAbsolute, normalize, relative, sep } from "node:path";
 
 /** gate判定用に filePath を root 相対・正規化する（`..` 解消・区切り統一）。
- * root 外の絶対パスは `..` 始まりになり、許可prefixに一致しない（fail-closed）。 */
-function normalizeForGate(root: string, filePath: string): string {
+ * root 外の絶対パスは `..` 始まりになり、許可prefixに一致しない（fail-closed）。
+ * deep検知のパス照合でも使うためexportする（純関数）。 */
+export function normalizeForGate(root: string, filePath: string): string {
   const rel = isAbsolute(filePath) ? relative(root, filePath) : filePath;
   return normalize(rel).split(sep).join("/");
 }
@@ -2404,6 +2682,8 @@ export interface ModelRoleStats {
   verdicts: number;
   clean: number;
   drift: number;
+  /** 混成fan-outへの参加数（単一model eventは0。hints注記用） */
+  mixed: number;
 }
 
 export interface GoalOutcome {
@@ -2430,20 +2710,41 @@ const HINT_MANY_REWINDS = 2;
 
 export function buildScoreboard(root: string): Scoreboard {
   const byModel = new Map<string, ModelRoleStats>();
-  const bump = (model: string | null | undefined, role: "verifier" | "critic", level: VerdictLevel) => {
+  const bump = (
+    model: string | null | undefined,
+    role: "verifier" | "critic",
+    level: VerdictLevel,
+    mixed: boolean,
+  ) => {
     const key = `${role}\0${model ?? "(unknown)"}`;
     let s = byModel.get(key);
     if (!s) {
-      s = { model: model ?? "(unknown)", role, verdicts: 0, clean: 0, drift: 0 };
+      s = {
+        model: model ?? "(unknown)",
+        role,
+        verdicts: 0,
+        clean: 0,
+        drift: 0,
+        mixed: 0,
+      };
       byModel.set(key, s);
     }
     s.verdicts += 1;
     if (level === "clean") s.clean += 1;
     else s.drift += 1;
+    if (mixed) s.mixed += 1;
   };
   for (const h of readHistory(root)) {
-    if (h.type === "verifier_verdict") bump(h.model, "verifier", h.level);
-    else if (h.type === "critic_review_set") bump(h.model, "critic", h.level);
+    if (h.type === "verifier_verdict") {
+      // 混成runはdistinct modelごとに行bump（単一modelは従来通り1 bump）。
+      // levelは集約値（行内clean/drift整合は保たれる。hintsはper-row）。
+      const models = h.models ?? [h.model];
+      const distinct = [...new Set(models.map((m) => m ?? "(unknown)"))];
+      const mixed = distinct.length > 1;
+      for (const m of distinct) {
+        bump(m === "(unknown)" ? null : m, "verifier", h.level, mixed);
+      }
+    } else if (h.type === "critic_review_set") bump(h.model, "critic", h.level, false);
   }
   const lin = buildLineage(root);
   const goals: GoalOutcome[] = lin.goals.map((g) => ({
@@ -2465,6 +2766,11 @@ export function buildScoreboard(root: string): Scoreboard {
 function buildHints(models: ModelRoleStats[], goals: GoalOutcome[]): string[] {
   const hints: string[] = [];
   for (const m of models) {
+    if (m.mixed > 0) {
+      hints.push(
+        `${m.role} ${m.model}: 混成run ${m.mixed}件含む（帰属は集約level。lens別内訳はhistory参照）`,
+      );
+    }
     if (m.verdicts < HINT_MIN_MODEL_SAMPLES) {
       hints.push(
         `${m.role} ${m.model}: データ不足（${m.verdicts}件 < ${HINT_MIN_MODEL_SAMPLES}件）。判断保留`,

@@ -108,7 +108,7 @@ export function effectivePhaseAction(
   if (entryRoute === "light" || entryRoute === "advised") {
     const advisor =
       entryRoute === "advised"
-        ? "implementing前にtask(graphhopper-advisor)／graphhopper_invoke(agent: 'graphhopper-advisor')で相談1回。"
+        ? "implementing前にtask(graphhopper-advisor)／graphhopper_invoke(agent: 'graphhopper-advisor')で相談1回し、graphhopper_consult_set(kind: 'advisor')で記録（機械ゲート）。"
         : "";
     const note =
       `（entry_route=${entryRoute}軽量: designingはthin doc＋task列のみで可、critic省略、` +
@@ -120,7 +120,7 @@ export function effectivePhaseAction(
   if (entryRoute === "oracle") {
     return (
       `${base}（entry_route=oracle多角: 開始時にtask(graphhopper-oracle)／` +
-      "graphhopper_invoke(agent: 'graphhopper-oracle')で相談1回（stuck時は同session継続））"
+      "graphhopper_invoke(agent: 'graphhopper-oracle')で相談1回し、graphhopper_consult_set(kind: 'oracle')で記録（機械ゲート）。stuck時は同session継続）"
     );
   }
   return base;
@@ -500,6 +500,32 @@ export function checkPhaseMove(
       "task(graphhopper-critic)／graphhopper_invoke(agent: 'graphhopper-critic')で肉付けdesignを1回レビューし、graphhopper_critic_set で記録してから遷移せよ。"
     );
   }
+  // entry相談ゲート（D/E実効化。proseだけだと素通りするため機械化。
+  // 昇格済みはfull扱い＝critic gateのみ。legacy（entry_route null）・full/lightには影響なし）
+  if (
+    to === "implementing" &&
+    active.state.phase === "designing" &&
+    !active.state.escalated_at &&
+    active.state.entry_route === "advised" &&
+    !active.state.advisor_consult
+  ) {
+    return (
+      "error: entry_route=advised の designing→implementing には advisor相談の記録が必要。" +
+      "task(graphhopper-advisor)／graphhopper_invoke(agent: 'graphhopper-advisor')で相談1回し、graphhopper_consult_set(kind: 'advisor')で記録してから遷移せよ。"
+    );
+  }
+  if (
+    to === "implementing" &&
+    active.state.phase === "designing" &&
+    !active.state.escalated_at &&
+    active.state.entry_route === "oracle" &&
+    !active.state.oracle_consult
+  ) {
+    return (
+      "error: entry_route=oracle の designing→implementing には oracle相談の記録が必要。" +
+      "task(graphhopper-oracle)／graphhopper_invoke(agent: 'graphhopper-oracle')で相談1回し、graphhopper_consult_set(kind: 'oracle')で記録してから遷移せよ。"
+    );
+  }
   // scaffoldが自動生成するため、失敗するのは骨格を削った場合のみ。
   // entry_route=light/advisedはthin gate（task列のみ。薄いspecで回し昇格時に肉付けする）
   if (to === "implementing" && active.state.phase === "designing") {
@@ -562,7 +588,7 @@ export function continuationText(goal: state.Goal, s: state.LoopState): string {
     notes,
     s.eval_cmd ? `eval_cmd: ${trunc(s.eval_cmd, TRUNC_EVAL_CMD)}` : null,
     s.router.route
-      ? `router: route=${s.router.route} diff_lines=${s.router.diff_lines}`
+      ? `router: route=${s.router.route} diff_lines=${s.router.diff_lines}${s.router.deep ? " deep" : ""}`
       : null,
     v ? `last_verifier: ${v.level} (${trunc(v.reason, TRUNC_REASON)})` : null,
     s.fail_streak > 0 ? `fail_streak: ${s.fail_streak}` : null,
