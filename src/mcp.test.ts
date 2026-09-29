@@ -658,7 +658,7 @@ describe("graft連携（skeleton enrich）", () => {
   });
 });
 
-describe("評価機能A/B", () => {
+describe("評価機能（成績表・採点）", () => {
   test("verdict/criticにmodelが記録されscoreboardに載る", async () => {
     const client = await linked();
     const root = freshRoot();

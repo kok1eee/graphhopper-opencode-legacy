@@ -71,7 +71,7 @@ graphhopper-opencode/
 | `graphhopper_attempt` | 実装試行の成否を記録（eval_cmd未設定時の自己申告フォールバック。連続失敗でescalate→oracle相談） |
 | `graphhopper_eval` | eval_cmdを明示実行（MCPのみ。pluginはsession.idleで自動実行） |
 | `graphhopper_hash` / `graphhopper_edit` | hash検証付きedit（goal中のsource編集用。read→sha1検証→単一箇所exact-match） |
-| `graphhopper_scoreboard` | モデル別verdict集計＋goal転帰＋hints（評価機能A） |
+| `graphhopper_scoreboard` | モデル別verdict集計＋goal転帰＋hints（評価機能の成績表） |
 | `graphhopper_discover_start` / `_tick` / `_clear` | loop-until-dry 探索（round cap/dedupeをtool側で強制） |
 | `graphhopper_critic_set` | designing終了前のdesign.md質レビュー結果（clean/drift）を記録する。opt-in・ハードゲート無し（`graphhopper_phase`の前提条件にはしない） |
 | `graphhopper_handoff` | 現在の goal 状態を要約して別の opencode セッションへ引き継ぎ送信。送信後は送信側が goal から解放（pause + unbind）。`session_id` 未指定なら候補セッションを列挙（送信しない）。受け手は `graphhopper_resume` で引き継ぐ |
@@ -261,9 +261,9 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
   `--notify -- <command>` で併用可
 - MCP logging は live補助線として継続（best-effort）。durable が outbox、live が logging の二層
 
-### 評価機能（A: 成績表／B: 採点）
+### 評価機能（成績表／採点）
 
-- **A モデル×役割の成績表**：verdict/critic記録に実行モデルを記録（省略時はconfig既定で補完）。
+- **モデル×役割の成績表**：verdict/critic記録に実行モデルを記録（省略時はconfig既定で補完）。
   `graphhopper_scoreboard` でモデル別 verdict 集計（clean/drift）とgoal転帰
   （巻き戻し・eval・採点）を返す。マッピング判断の素材。
   注意：導入前のhistory分は現configで補完されるため帰属が不正確な場合がある（今後の記録から正確化）

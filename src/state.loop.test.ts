@@ -2218,4 +2218,35 @@ describe("goal_summary telemetry", () => {
     expect(tele[0]!.entry_route).toBe("light");
     expect(tele[0]!.duration_s).toBe(120);
   });
+
+  test("lineageのentry_routeは正規化済みfirst-seen（telemetry同型）", async () => {
+    const { buildLineage } = await import("./state");
+    const root = tmpRoot();
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "history.jsonl"),
+      [
+        JSON.stringify({ ts: "2026-01-01T00:00:00.000Z", type: "goal_start", goal: "g-leg", title: "l" }),
+        JSON.stringify({ ts: "2026-01-01T00:01:00.000Z", type: "entry_route", goal: "g-leg", route: "B" }),
+        JSON.stringify({ ts: "2026-01-01T00:02:00.000Z", type: "entry_route", goal: "g-leg", route: "full" }),
+      ].join("\n") + "\n",
+    );
+    const lin = buildLineage(root);
+    expect(lin.goals.find((g) => g.id === "g-leg")?.entry_route).toBe("light");
+    // 欠測はnull
+    const root2 = tmpRoot();
+    const g2 = startGoal(root2, "t", "s").goal;
+    expect(buildLineage(root2).goals.find((g) => g.id === g2.id)?.entry_route).toBeNull();
+  });
+
+  test("goal_summaryはoutboxに投下される（watcherのreflect素材）", async () => {
+    const { completeGoal } = await import("./state");
+    const root = tmpRoot();
+    const g = startGoal(root, "t", "s").goal;
+    completeGoal(root);
+    const files = readdirSync(join(root, ".graphhopper", "outbox"));
+    expect(files.some((f) => f.includes("goal_complete"))).toBe(true);
+    expect(files.some((f) => f.includes("goal_summary"))).toBe(true);
+    void g;
+  });
 });

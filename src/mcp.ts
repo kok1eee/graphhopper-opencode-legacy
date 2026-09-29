@@ -719,7 +719,7 @@ const TOOL_DEFS: ToolDef[] = [
   {
     name: "graphhopper_scoreboard",
     description:
-      "評価機能A: モデル×役割の成績表（verdict集計）とgoal転帰（巻き戻し・eval・採点）。マッピング判断の素材",
+      "評価機能（成績表）: モデル×役割の成績表（verdict集計）とgoal転帰（巻き戻し・eval・採点）。マッピング判断の素材",
     inputSchema: { type: "object", properties: { root: ROOT_PROP } },
     schema: z.object({ root: rootZ }),
     outputSchema: {

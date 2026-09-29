@@ -503,9 +503,10 @@ export function recordEvent(root: string, event: HistoryEvent): void {
 
 const OUTBOX_KEEP = 100;
 
-/** outboxに投下する種別（完了・drift・諦め・停止のみ。attempt等の高頻度は対象外） */
+/** outboxに投下する種別（完了・集計・drift・諦め・停止のみ。attempt等の高頻度は対象外） */
 const OUTBOX_EVENTS: ReadonlySet<string> = new Set([
   "goal_complete",
+  "goal_summary",
   "verifier_verdict",
   "eval_gave_up",
   "loop_stopped",
@@ -2583,6 +2584,8 @@ export interface GoalLineage {
   gateBlocks: number;
   editedFiles: string[];
   routerChecks: { diff_lines: number; route: RouterRoute }[];
+  /** 入口route（first-seen・正規化済み。telemetryのbuildGoalSummaryと同型。欠測null） */
+  entry_route: EntryRoute | null;
   /** complete時の機械採点（未completeは null） */
   score: GoalScore | null;
 }
@@ -2607,6 +2610,7 @@ export function buildLineage(root: string): {
       gateBlocks: 0,
       editedFiles: [],
       routerChecks: [],
+      entry_route: null,
       score: g.score ?? null,
     });
   }
@@ -2627,6 +2631,7 @@ export function buildLineage(root: string): {
         gateBlocks: 0,
         editedFiles: [],
         routerChecks: [],
+        entry_route: null,
         score: null,
       };
       byId.set(goalId, l);
@@ -2666,6 +2671,14 @@ export function buildLineage(root: string): {
       case "router_check":
         l.routerChecks.push({ diff_lines: h.diff_lines, route: h.route });
         break;
+      case "entry_route":
+        // telemetry（buildGoalSummary）と同型：first-seen＋旧A/B/C正規化
+        if (l.entry_route === null) {
+          l.entry_route = normalizeEntryRoute(
+            (h as { route?: unknown }).route,
+          ) ?? "full";
+        }
+        break;
       default:
         break;
     }
@@ -2674,7 +2687,7 @@ export function buildLineage(root: string): {
 }
 
 /* ================================================================== *
- * 評価機能A: モデル×役割の成績表。verdict/criticイベントの model 欄を
+ * 評価機能（成績表）: モデル×役割の成績表。verdict/criticイベントの model 欄を
  * 集計する。帰属は記録値のみ（推測で紐付けない）。goal転帰は lineage 由来。
  * ================================================================== */
 
