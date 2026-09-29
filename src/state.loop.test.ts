@@ -1818,6 +1818,27 @@ describe("entry_route（jevトリアージ）", () => {
     expect(s.getActive(root2)!.state.entry_route).toBeNull();
   });
 
+  test("bindEntryRouteはdone/pausedにbindしない（live実証の欠測防止）", async () => {
+    const s = await import("./state");
+    const root = tmpRoot();
+    s.startGoal(root, "t", "s1");
+    // done＋null（completeはentry_routeを消さない）にbindしない
+    s.completeGoal(root);
+    expect(s.getActive(root)!.goal.status).toBe("done");
+    expect(s.bindEntryRoute(root, "advised", "r")).toBeNull();
+    expect(s.getActive(root)!.state.entry_route).toBeNull();
+    // pausedにもbindしない
+    const root2 = tmpRoot();
+    s.startGoal(root2, "t", "s1");
+    s.pauseGoal(root2);
+    expect(s.bindEntryRoute(root2, "advised", "r")).toBeNull();
+    expect(s.getActive(root2)!.state.entry_route).toBeNull();
+    // activeには従来通りbindする
+    const root3 = tmpRoot();
+    s.startGoal(root3, "t", "s1");
+    expect(s.bindEntryRoute(root3, "advised", "r")!.state.entry_route).toBe("advised");
+  });
+
   test("escalateはlight/advised→fullのみ（designing巻き戻し＋escalated_at）", async () => {
     const s = await import("./state");
     const root = tmpRoot();

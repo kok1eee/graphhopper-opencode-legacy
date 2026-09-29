@@ -1128,14 +1128,16 @@ export function clearPendingRoute(root: string): void {
 }
 
 /** route_set→goal先行の救済: entry未記録のactive goalに直接bindする。
- * 記録済み・goal無し・directはnull（pendingのみ残る／directはhistoryのみ） */
+ * 記録済み・goal無し・非active（done/paused）・directはnull（pendingのみ残る／directはhistoryのみ）。
+ * done＋nullにbindするとpendingが消えて次回startが欠測になる（live実証済み）ため塞ぐ。
+ * pausedも塞ぐ（resumeがentry_routeを復元しない既存穴と複合するため） */
 export function bindEntryRoute(
   root: string,
   route: EntryRoute,
   reason?: string,
 ): ActiveLoop | null {
   const active = getActive(root);
-  if (!active || active.state.entry_route) return null;
+  if (!active || active.goal.status !== "active" || active.state.entry_route) return null;
   if (route === "direct") return null;
   const r = mutateActive(root, () => ({ state: { entry_route: route } }));
   if (r) {
