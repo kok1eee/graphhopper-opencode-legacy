@@ -100,6 +100,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - **実装試行のたびに `graphhopper_attempt(ok, note)` を呼ぶ**（成否をコード側で機械カウントする）。
   ただし **eval_cmd設定中はattemptを呼ばない**（idle/MCP-evalが自動記録するため二重計数になる。
   手動の進捗メモが必要ならnoteに残す）。eval未設定時のみ自己申告フォールバックとして使う
+- **evalのskip切り分け**: `graphhopper_eval` のskip文面は条件別（phase行／eval_cmd行の両出し＋root表記）。`phase=designing`なら遷移が先、`eval_cmd未設定`なら再設定が先。goal切替でeval_cmdは消える（start白紙が仕様）。`error: no active goal（root=...）`が出たらset時と解決rootが違う（明示rootで揃えよ）。evalはsessionを見ないため未bindは無関係
   - `ok: false` が続き `fail_streak` が `stuck_threshold`（既定3）に達すると `escalate: true` が返る
   - `escalate: true` が返ったら `task(subagent_type: "graphhopper-oracle")` に相談する。これまでの
     失敗試行（何を試して何が起きたか）を渡し、助言を受けて別のアプローチで再試行する

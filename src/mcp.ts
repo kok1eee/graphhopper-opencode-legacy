@@ -389,9 +389,19 @@ function attemptRecord(root: string, ok: boolean, note: string): ToolOut {
  * continuation dedupe を除く。MCP には idle 駆動が無いため明示実行する）。 */
 async function evalOnce(root: string): Promise<string> {
   const active = state.getActive(root);
-  if (!active) return "error: no active goal";
+  if (!active) return `error: no active goal（root=${root}。別rootのstateを見ている可能性）`;
   if (active.state.phase !== "implementing" || !active.state.eval_cmd) {
-    return "skip: eval は implementing 中かつ eval_cmd 設定時のみ実行する（graphhopper_set_eval で設定せよ）";
+    // 条件別に分けて返す（両真では両行。どちらが欠けているか自己診断できるように。
+    // root表記付き＝別state疑惑の切り分け用。接頭辞skip:はgraphhopper_evalの判定と互換）
+    const lines = [
+      active.state.phase !== "implementing"
+        ? `phase=${active.state.phase}（implementingでないため実行しない）`
+        : null,
+      !active.state.eval_cmd
+        ? "eval_cmd未設定（graphhopper_set_evalで設定せよ。goal切替で消える）"
+        : null,
+    ].filter((l): l is string => l !== null);
+    return `skip: ${lines.join("／")}（root=${root}）`;
   }
   const cmd = active.state.eval_cmd;
   const result = await state.runEval($, root, cmd);

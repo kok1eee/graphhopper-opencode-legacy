@@ -315,6 +315,53 @@ describe("graphhopper-mcp goal往復", () => {
     expect(await call("graphhopper_status", {})).toContain("phase: implementing");
     await client.close();
   });
+
+  test("eval skipは条件別文面（phase／未設定／切替／空／無goal）", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      const c = r.content as { type: string; text: string }[];
+      return c[0]?.text ?? "";
+    };
+    // goal無し→error＋root表記
+    const noGoal = await call("graphhopper_eval", {});
+    expect(noGoal).toContain("error: no active goal");
+    expect(noGoal).toContain(`root=${root}`);
+    await call("graphhopper_goal", { action: "start", title: "skip matrix" });
+    // designing＋未設定→両行
+    const both = await call("graphhopper_eval", {});
+    expect(both.startsWith("skip:")).toBe(true);
+    expect(both).toContain("phase=designing");
+    expect(both).toContain("eval_cmd未設定");
+    expect(both).toContain(`root=${root}`);
+    // designing＋設定済み→phase行のみ（最短経路）
+    await call("graphhopper_set_eval", { cmd: "true" });
+    const designing = await call("graphhopper_eval", {});
+    expect(designing).toContain("phase=designing");
+    expect(designing).not.toContain("eval_cmd未設定");
+    // polish＋設定済み→phase行のみ（eval_cmdは残る。旧文面の「設定せよ」誤誘導なし）
+    await call("graphhopper_phase", { phase: "implementing" });
+    await call("graphhopper_phase", { phase: "polish" });
+    const polished = await call("graphhopper_eval", {});
+    expect(polished).toContain("phase=polish");
+    expect(polished).not.toContain("eval_cmd未設定");
+    // implementing＋設定済み→実行される（正例）
+    await call("graphhopper_phase", { phase: "implementing" });
+    const ran = await call("graphhopper_eval", {});
+    expect(ran).toContain("eval_cmd passed");
+    // goal切替→eval_cmd消滅→eval行
+    await call("graphhopper_goal", { action: "pause" });
+    await call("graphhopper_goal", { action: "start", title: "skip matrix 2" });
+    const switched = await call("graphhopper_eval", {});
+    expect(switched).toContain("eval_cmd未設定");
+    // 空cmdはclear扱い→eval行
+    await call("graphhopper_set_eval", { cmd: "true" });
+    await call("graphhopper_set_eval", { cmd: "" });
+    const cleared = await call("graphhopper_eval", {});
+    expect(cleared).toContain("eval_cmd未設定");
+    await client.close();
+  });
 });
 
 describe("graphhopper-mcp edit gate（plugin hook と同型）", () => {
