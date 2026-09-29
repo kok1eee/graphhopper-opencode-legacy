@@ -32,10 +32,10 @@ Claude Codeのshell hook（PreToolUse/Stop）に相当する仕組みが無い�
 ```
 graphhopper-opencode/
 ├── src/
-│   ├── index.ts   — プラグイン本体（tool.execute.before + event + 18 tool）
+│   ├── index.ts   — プラグイン本体（tool.execute.before + event + 20 tool）
 │   ├── state.ts   — .graphhopper/ 配下の state 管理（atomic write）
 │   ├── gate.ts    — helper・定数の単一源泉（entryは関数exportのみの制約対応）
-│   ├── mcp.ts     — MCPブリッジ（20 tool＋resources/prompts。API経由セッション用）
+│   ├── mcp.ts     — MCPブリッジ（22 tool＋resources/prompts。API経由セッション用）
 │   ├── agents.ts  — 8 subagent 定義（config hook で注入。入口トリアージ用graphhopper-jev・相談判定用graphhopper-advisor含む）
 │   ├── prompts.ts — MCP prompts charter定型文の単一源泉（8件）
 │   ├── invoke.ts  — graphhopper_invoke（opencode run spawn・中断伝播・heartbeat）
@@ -63,13 +63,13 @@ graphhopper-opencode/
 | `graphhopper_status` | 現在 goal + フェーズ + router + verifier 表示 |
 | `graphhopper_phase` | フェーズ遷移（designing → implementing → polish → done） |
 | `graphhopper_router_check` | diffサイズを機械測定し advisor(verifier×1)/polish(verifier×3) に分岐（loop-driver.sh相当） |
-| `graphhopper_diff_stash` | verifier fan-out用にdiffを.graphhopper/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
-| `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す。directはhistory 1行のみ） |
+| `graphhopper_diff_stash` | verifier fan-out用に実効diff（初期脏れ除外）を.graphhopper/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
+| `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す。directはhistory 1行のみ）。done/paused goalへのbindは拒否（pending維持） |
+| `graphhopper_consult_set` | advised/oracle入口の相談記録（kind=advisor/oracle＋要旨。実在は検証しない。designing→implementingの機械ゲート入力） |
 | `graphhopper_escalate` | light/advised→full昇格（designing巻き戻し＋critic1回＋fan-out×3。full→light禁止のラチェット） |
-| `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート） |
-| `graphhopper_set_eval` | implementingの合否判定コマンド（本体のeval_cmd相当）を設定。設定後はターン終了ごと自動実行され、pass=polish自動遷移／fail=fail_streak機械カウント |
-| `graphhopper_attempt` | 実装試行の成否を記録（eval_cmd未設定時の自己申告フォールバック。連続失敗でescalate→oracle相談） |
-| `graphhopper_eval` | eval_cmdを明示実行（MCPのみ。pluginはsession.idleで自動実行） |
+| `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート）。results要素の`model`でper-lens上書き可（deep時の上位モデル等） |
+| `graphhopper_set_eval` | implementingの合否判定コマンド（本体のeval_cmd相当）を設定。設定後はターン終了ごと自動実行され、pass=polish自動遷移／fail=fail_streak機械カウント。goal切替で消える（start白紙が仕様） |
+| `graphhopper_eval` | eval_cmdを明示実行（MCPのみ。pluginはsession.idleで自動実行）。skip時は条件別文面（phase行／eval_cmd行＋root表記） |
 | `graphhopper_hash` / `graphhopper_edit` | hash検証付きedit（goal中のsource編集用。read→sha1検証→単一箇所exact-match） |
 | `graphhopper_scoreboard` | モデル別verdict集計＋goal転帰＋hints（評価機能の成績表） |
 | `graphhopper_discover_start` / `_tick` / `_clear` | loop-until-dry 探索（round cap/dedupeをtool側で強制） |
@@ -81,6 +81,7 @@ graphhopper-opencode/
 | subagent | phase | 対象artifact | 用途 | tier |
 |---|---|---|---|---|
 | `graphhopper-researcher` | 任意 | コードベース/外部doc | 事実収集・調査専用。高頻度なので最安モデル | 最下層コスト |
+| `graphhopper-librarian` | 任意 | 外部公式doc | 公式doc・仕様調査専用（URL・引用付き。判断なし） | 最下層コスト |
 | `graphhopper-jev` | goal開始前 | やる内容テキスト | 入口トリアージ（route 5択の1行JSON判定。ollaya型typed choice相当） | 最下層コスト |
 | `graphhopper-advisor` | 任意 | 問い・判定材料テキスト | selector判定・セカンドオピニオン（stuck時はoracle。出力は非拘束） | 最下層コスト |
 | `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 上位品質・別ベンダー推奨 |
@@ -124,6 +125,12 @@ router gate側は**advisorでも第三者チェックそのものは省略でき
 lens空を拒否するため、diffサイズに関わらず最低1回のverifier呼び出しが機械的に必須。self-graded
 完了を防ぐ）。fan-out数（1 or 3）だけがdiffサイズで変わる。
 
+**deep修飾子**（light+deep／standard+deep）：自goalの変更が状態遷移核（`src/state.ts`・
+`src/gate.ts`）に触れたら、`router_check`が`deep`を標示する。該当lens（polish時はbehavior、
+advisor時はgeneral）だけ上位モデルで走らせ、`verifier_set`の該当resultsに`model`を付ける。
+無視してもstandardとして記録される（fail-safe。追従／無視はhistoryに残り事後集計可）。
+判断者は増やさない（集約は1本のまま）。selectorとの住分け：selector→lens選択、deep→model選択。
+
 いずれも「無条件で毎回opusを呼ぶ」のではなく、コード側で機械測定・機械カウントした
 タイミングでだけ上位モデルのコストを払う設計。
 
@@ -161,7 +168,7 @@ plugin tool は opencode ランタイム内のセッションにしか配膳さ�
 セッション（`default.*` toolset）には届かない。MCP だけが両方に届く実証済みの道のため、
 `src/mcp.ts` が state 操作を MCP tool（stdio）として公開する:
 
-- plugin と同名・同-semantics の 20 tool（`graphhopper_handoff` は opencode SDK client が必要なため対象外。
+- plugin と同名・同-semantics の 22 tool（`graphhopper_handoff` は opencode SDK client が必要なため対象外。
   代わりにMCPのみの `graphhopper_eval`・`graphhopper_invoke`・`graphhopper_scoreboard` を含む）
 - `root`（対象プロジェクト）・`session_id`（bind 先）を明示指定する。
   MCP には `session.idle` 駆動が無いため、`graphhopper_set_eval` 後に
@@ -197,7 +204,7 @@ tool 呼び出しより安い読み取り用。URI 形式は
 | `goals.json` | 目標キュー＋active指定 |
 | `history.jsonl` | 監査ログ（末尾200行に丸め） |
 | `plans/<goalId>.md` / `plans/<goalId>.log.md` | design doc・log |
-| `lineage.json` | goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル＋graft symbol・designタスク進捗。作業グラフのedge素材。仮想resource） |
+| `lineage.json` | goalごとの系譜（phase遷移・verifier・巻き戻し・編集ファイル＋graft symbol・designタスク進捗・entry_route（正規化済み）。作業グラフのedge素材。仮想resource） |
 
 `ListResources` は空（root が呼出側依存で列挙不能）、templates 5件で発見可能にする。
 rel は allowlist＋containment 検査で traversal を拒否する。
@@ -223,7 +230,7 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - `root` 省略時は client roots の先頭（file://）→プロセス cwd の順で解決する
 - tool annotations: `status`/`hash` は readOnly、`edit` は destructive、
   `eval`/`invoke`/`router_check` は openWorld の hint を付与
-- 全20 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
+- 全22 tool が `outputSchema`＋`structuredContent` を返す（text 応答は不変）
 - tool 実行後に logging 通知を転送（state 遷移系は info、それ以外は debug）。
   client 未対応でも tool 結果は壊さない
 
@@ -235,6 +242,8 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 - **critic gate**：`require_critic: true` で designing→implementing に critic 記録を要求。
   既定 false（opt-in維持。ゲート化の是非未決のためflag両対応）
 - **attempt一本化**：eval_cmd設定中のattempt(fail)には二重計数の注意を付与（拒否ではなく注意）
+- **entry相談ゲート**：advised/oracle入口は designing→implementing に相談記録（`graphhopper_consult_set`）を要求。prose注記だけだと素通りするため機械化。昇格済みはfull扱い（criticのみ）
+- **bind guard**：`route_set`はactive goalにのみbind（done/pausedへのbindは拒否しpending維持。done＋未記録への誤bindで次回startが欠測になる事故の対策）
 - **単一driver警告**：bind中goalへの別session操作に警告（拒否ではなく警告。handoff正規フローのため）
 - **discover紐付け**：開始時点のactive goalを記録し、lineageに載せる
 
@@ -252,7 +261,7 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 
 会話上の「終わったよ」ではなくプログラムが受け取れる通知：
 
-- `recordEvent` が curated種別（goal_complete / verifier_verdict / eval_gave_up /
+- `recordEvent` が curated種別（goal_complete / goal_summary / verifier_verdict / eval_gave_up /
   loop_stopped）を `.graphhopper/outbox/<時刻>-<種別>-<goal>.json` に投下（上限100・古いものから刈る）
 - `bun src/watch.ts <root> -- <command>` で監視し、イベントごとにコマンド実行
   （`GH_EVENT` / `GH_GOAL` / `GH_FILE` / `GH_ROOT` を環境変数で渡す）
@@ -265,12 +274,13 @@ critic/verifier系には言語版ガード（PEP 758 等の誤検知止め）を
 
 - **モデル×役割の成績表**：verdict/critic記録に実行モデルを記録（省略時はconfig既定で補完）。
   `graphhopper_scoreboard` でモデル別 verdict 集計（clean/drift）とgoal転帰
-  （巻き戻し・eval・採点）を返す。マッピング判断の素材。
+  （巻き戻し・eval・採点）を返す。混成fan-outはモデルごとに行bump（`mixed`計数＋hints注記）。
+  マッピング判断の素材。
   注意：導入前のhistory分は現configで補完されるため帰属が不正確な場合がある（今後の記録から正確化）
 - scoreboardには`hints`が付く（提案のみ・自動適用なし）。
   ガード付き：モデル別は5件未満で判断保留、drift検出率≧60%・全clean継続・score<70・
   巻き戻し≧2を人手検討事項として挙げる。drift率の高低は厳格さと実装荒れの両義性があるため断定しない
-- **B goal出来栄えの機械採点**：complete時に機械事実のみで採点しgoalに保存。
+- **goal出来栄えの機械採点**：complete時に機械事実のみで採点しgoalに保存。
   式v1: `100 - 15*巻き戻し - 5*最大fail - 3*gate阻止 - 5*(verifier追加round)`（下限0）。
   内訳付きで透明化。status/lineage/scoreboardに表示
 
