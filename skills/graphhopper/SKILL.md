@@ -219,6 +219,18 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
   受け手は許可なしで自動処理するため）
 - 受け手は `graphhopper_resume` → `graphhopper_status` で引き継ぐ
 
+## compact運用（handoffの代替・推奨）
+
+別セッションを作らず `/compact` で回す場合、handoffは不要。compactは同一セッションの
+圧縮でありsessionIDは維持されるため、goalのbindは継続する。復帰手順:
+
+1. `graphhopper_status` でgoal・phase・router・verifierを確認する
+2. `.graphhopper/plans/<goal-id>.md`（design）と`.log.md`（決定経緯・進捗）を読み直す
+3. そのまま続行する（bindし直し不要。`unbound`と出たら`resume`でbindし直す）
+
+compact前に `.log.md` へ決定事項・途中経過を書いておくこと（圧縮要約に落とせない詳細の保全。
+state・design・historyはdiskにあり圧縮の影響を受けない）。
+
 ## Gotchas
 
 - **live-docs-first**: 版依存の主張（SDK API・MCP仕様・外部CLI挙動・言語仕様の版差）は

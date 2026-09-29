@@ -162,6 +162,19 @@ advisor時はgeneral）だけ上位モデルで走らせ、`verifier_set`の該�
 勝手に自動送信はしない設計（明示呼び出しのみ）。受け手は「handoff received」応答で受領を示し、
 `graphhopper_resume` で引き継ぐ。
 
+### compact運用（handoffの代替）
+
+別セッションを作らず `/compact` で回す場合、handoffは不要。compactは同一セッションの
+圧縮でありsessionIDは維持されるため、goalのbindは継続する。失われるのは文脈だけなので、
+復帰は再読で足りる：
+
+1. `graphhopper_status` でgoal・phase・router・verifierを確認する
+2. `.graphhopper/plans/<goal-id>.md`（design）と`.log.md`（決定経緯・進捗）を読み直す
+3. そのまま続行する（bindし直し不要。`unbound`と出たら`resume`でbindし直す）
+
+compact前に `.log.md` へ決定事項・途中経過を書いておくと、圧縮要約に落とせない詳細が残る
+（state・design・historyはdiskにあり圧縮の影響を受けない）。
+
 ## MCP ブリッジ（API 経由セッション用）
 
 plugin tool は opencode ランタイム内のセッションにしか配膳されず、API 経由の
