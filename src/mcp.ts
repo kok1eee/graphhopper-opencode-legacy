@@ -218,10 +218,17 @@ async function goalAction(
         // 測定不能は無視（initial null＝旧挙動）
       }
       const started = state.getActive(root) ?? a;
+      // 消費結果はstarted.state.entry_routeで判定する（startGoalがpending消去後に
+      // 文面を組むため再読不可。null＝pending無し→full扱い）
+      const consumed =
+        started.state.entry_route !== null &&
+        started.state.entry_route !== undefined
+          ? `pending entry_route=${started.state.entry_route} を消費`
+          : "pending無し→full（未判定・legacy）扱い";
       const unbound =
         !sessionID &&
         "\n(note: session_id 未指定のため未バインド。継続注入・stuck計数を有効にするには session_id を指定して resume で bind せよ)";
-      return `goal started: "${started.goal.title}" (${started.goal.id})\nphase: designing\n次: ${effectivePhaseAction("designing", started.state.entry_route)}${unbound ?? ""}`;
+      return `goal started: "${started.goal.title}" (${started.goal.id})\n${consumed}\nphase: designing\n次: ${effectivePhaseAction("designing", started.state.entry_route)}${unbound ?? ""}`;
     }
     case "pause": {
       const a = state.pauseGoal(root);
@@ -1035,6 +1042,7 @@ const TOOL_DEFS: ToolDef[] = [
       properties: {
         route: { type: "string" },
         bound: { type: "boolean" },
+        goalId: { type: "string" },
       },
       required: ["route", "bound"],
     },
@@ -1057,11 +1065,14 @@ const TOOL_DEFS: ToolDef[] = [
       state.writePendingRoute(ctx.root, parsed.route, reason);
       const bound = state.bindEntryRoute(ctx.root, parsed.route, reason);
       if (bound) state.clearPendingRoute(ctx.root);
+      // goalIdはbind成功時のみ（required不変・null禁止。client検証の慣例）
       return {
         text: bound
-          ? `pending entry_route=${parsed.route} を記録しactive goalにbindした（pendingは消去）。`
+          ? `pending entry_route=${parsed.route} を記録しactive goal（${bound.goal.id}）にbindした（pendingは消去）。`
           : `pending entry_route=${parsed.route} を記録。graphhopper_goal(start) で消費される。`,
-        data: { route: parsed.route, bound: !!bound },
+        data: bound
+          ? { route: parsed.route, bound: true, goalId: bound.goal.id }
+          : { route: parsed.route, bound: false },
       };
     },
   },

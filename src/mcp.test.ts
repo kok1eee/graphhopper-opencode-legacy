@@ -891,4 +891,56 @@ describe("graphhopper-mcp route系tool（統合）", () => {
     expect(out).toContain("route: advisor");
     await client.close();
   });
+
+  test("route_set→startの対応付けは文面で突合可能", async () => {
+    const client = await linked();
+    const root = freshRoot();
+    const callRaw = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: { ...args, root } });
+      return r as { content: { type: string; text: string }[]; structuredContent?: Record<string, unknown> };
+    };
+    const call = async (name: string, args: Record<string, unknown>) =>
+      (await callRaw(name, args)).content[0]?.text ?? "";
+    // pending先行→start消費：文面に消費route、イベントgoal＝新goal
+    await call("graphhopper_route_set", { route: "light", reason: "trace test" });
+    const started = await call("graphhopper_goal", { action: "start", title: "trace test" });
+    expect(started).toContain("pending entry_route=light を消費");
+    const st = await import("./state");
+    const gid = st.getActive(root)!.goal.id;
+    const ev = st.readHistory(root).find((h) => h.type === "entry_route" && (h as { route?: unknown }).route === "light");
+    expect((ev as { goal?: string } | undefined)?.goal).toBe(gid);
+    expect((ev as { reason?: string } | undefined)?.reason).toBe("trace test");
+    await client.close();
+    // goal先行のbind：文面＋dataにgoal id
+    const client2 = await linked();
+    const root2 = freshRoot();
+    const call2 = async (name: string, args: Record<string, unknown>) => {
+      const r = await client2.callTool({ name, arguments: { ...args, root: root2 } });
+      return r as { content: { type: string; text: string }[]; structuredContent?: Record<string, unknown> };
+    };
+    await call2("graphhopper_goal", { action: "start", title: "bind trace" });
+    const gid2 = (await import("./state")).getActive(root2)!.goal.id;
+    const bound = await call2("graphhopper_route_set", { route: "advised", reason: "bind trace" });
+    expect(bound.content[0]?.text ?? "").toContain(gid2);
+    expect(bound.structuredContent?.["goalId"]).toBe(gid2);
+    expect(bound.structuredContent?.["bound"]).toBe(true);
+    // pending無しstart：null→full扱い文面
+    const client3 = await linked();
+    const root3 = freshRoot();
+    const r3 = await client3.callTool({
+      name: "graphhopper_goal",
+      arguments: { root: root3, action: "start", title: "legacy trace" },
+    });
+    const t3 = (r3.content as { type: string; text: string }[])[0]?.text ?? "";
+    expect(t3).toContain("pending無し→full（未判定・legacy）扱い");
+    // direct後start：directはpendingを書換えないためnull固定
+    await client3.callTool({
+      name: "graphhopper_route_set",
+      arguments: { root: root3, route: "direct", reason: "detour" },
+    });
+    expect((await import("./state")).getActive(root3)!.state.entry_route).toBeNull();
+    await client.close();
+    await client2.close();
+    await client3.close();
+  });
 });

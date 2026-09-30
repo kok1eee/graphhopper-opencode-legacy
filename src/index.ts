@@ -339,7 +339,12 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
                 // 測定不能は無視（initial null＝旧挙動）
               }
               const started = state.getActive(root) ?? a;
-              return `goal started: "${started.goal.title}" (${started.goal.id})\nphase: designing\n次: ${effectivePhaseAction("designing", started.state.entry_route)}`;
+              const consumed =
+                started.state.entry_route !== null &&
+                started.state.entry_route !== undefined
+                  ? `pending entry_route=${started.state.entry_route} を消費`
+                  : "pending無し→full（未判定・legacy）扱い";
+              return `goal started: "${started.goal.title}" (${started.goal.id})\n${consumed}\nphase: designing\n次: ${effectivePhaseAction("designing", started.state.entry_route)}`;
             }
             case "pause": {
               const a = state.pauseGoal(root);
