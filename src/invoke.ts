@@ -135,13 +135,15 @@ export function runChild(
       opts.signal?.removeEventListener("abort", onAbort);
       const fallbackWarning = /Falling back to default agent/.test(stderr);
       let output = truncate(stdout, STDOUT_MAX_CHARS);
+      const errTail = stderr.split("\n").slice(-20).join("\n").trim();
       if (cancelled) {
         output += `\nerror: invoke cancelled by client (killed)`;
       } else if (timedOut) {
         output += `\nerror: invoke timeout after ${opts.timeoutMs}ms (killed; orphaned child may continue billing)`;
+        // timeout時も子のstderr末尾を添付する（何に時間を食ったかの切り分け用。空なら省略）
+        if (errTail) output += `\nstderr tail:\n${errTail}`;
       } else if (code !== 0) {
-        const tail = stderr.split("\n").slice(-20).join("\n");
-        output += `\nerror: opencode run exited with code ${code}\n${tail}`;
+        output += `\nerror: opencode run exited with code ${code}\n${errTail}`;
       }
       if (fallbackWarning) {
         output += `\nwarning: agent fell back to default (read-only not enforced by agent def)`;

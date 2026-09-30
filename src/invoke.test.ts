@@ -160,6 +160,43 @@ describe("runChild", () => {
     expect(r.output).toMatch("timeout");
     expect(killed).toBe("SIGKILL");
   }, 15000);
+  test("timeout時もstderr末尾が付く・空なら省略", async () => {
+    const hangWithErr: SpawnFn = ((_cmd: string, _args: string[], _opts: unknown) => {
+      const p = new EventEmitter() as FakeProc;
+      p.pid = 999997;
+      p.stdout = new EventEmitter();
+      p.stderr = new EventEmitter();
+      // runChildのdataリスナ装着後に届くよう遅延させる（同期emitは取りこぼす）
+      setTimeout(() => p.stderr.emit("data", Buffer.from("still working on file X\n", "utf8")), 10);
+      (p as unknown as { kill: (s: string) => boolean }).kill = (_s: string) => true;
+      return p as unknown as ChildProcess;
+    }) as SpawnFn;
+    const r = await runChild(
+      "opencode",
+      ["run"],
+      { timeoutMs: 100, cwd: "/tmp", childEnv: {} },
+      hangWithErr,
+    );
+    expect(r.timedOut).toBe(true);
+    expect(r.output).toMatch("stderr tail:");
+    expect(r.output).toMatch("still working on file X");
+    const hangSilent: SpawnFn = ((_cmd: string, _args: string[], _opts: unknown) => {
+      const p = new EventEmitter() as FakeProc;
+      p.pid = 999996;
+      p.stdout = new EventEmitter();
+      p.stderr = new EventEmitter();
+      (p as unknown as { kill: (s: string) => boolean }).kill = (_s: string) => true;
+      return p as unknown as ChildProcess;
+    }) as SpawnFn;
+    const r2 = await runChild(
+      "opencode",
+      ["run"],
+      { timeoutMs: 100, cwd: "/tmp", childEnv: {} },
+      hangSilent,
+    );
+    expect(r2.timedOut).toBe(true);
+    expect(r2.output).not.toMatch("stderr tail:");
+  }, 15000);
 });
 
 describe("invoke 並列安全（中断・heartbeat・ずらし）", () => {
