@@ -36,7 +36,6 @@ import {
   EVAL_MANAGED_NOTE,
   ESCALATE_NEXT,
   autoEscalateOnStuck,
-  buildSelectorPrompt,
   effectivePhaseAction,
   isGateTargetTool,
   parseEntryRoute,
@@ -48,7 +47,12 @@ import {
   runGraphhopperEdit,
 } from "./gate";
 import { PONYTAIL_RULES } from "./ponytail-rules";
-import { decideRoute } from "./decision";
+import {
+  decideRoute,
+  formatSelectorResult,
+  SELECTOR_TOOL_DESCRIPTION,
+  selectLenses,
+} from "./decision";
 import * as state from "./state";
 /* LSP読取subset（design g-mu5atclj・自前実装）。Manager singletonは
  * src/lsp/ 内に閉じ込め、entryには関数以外の値を置かない（index.ts:110-113の制約）。 */
@@ -534,8 +538,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       }),
 
       graphhopper_selector: tool({
-        description:
-          "verifier編成selectorの判定promptを発行する（advisory-only。現行routerは維持）。design抜粋とdiff統計を渡すとlens選択の判定手順を返す（LLM呼び出しはtool外。出力不正時は従来routerを継続）",
+        description: SELECTOR_TOOL_DESCRIPTION,
         args: {
           design_excerpt: tool.schema
             .string()
@@ -545,15 +548,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             .describe("diff統計（ファイル数・行数・対象領域）"),
         },
         async execute(args) {
-          return [
-            "## selector判定手順（advisory-only）",
-            "1. task(subagent_type: 'graphhopper-advisor') または graphhopper_invoke(agent: 'graphhopper-advisor') に以下を渡す:",
-            "",
-            buildSelectorPrompt(args.design_excerpt, args.diff_stat),
-            "",
-            "2. 返却JSONのlenses（1-3件・既知IDのみ）を参考にverifier編成を決める。",
-            "3. 不正・空の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）。",
-          ].join("\n");
+          return formatSelectorResult(
+            await selectLenses(args.design_excerpt, args.diff_stat),
+          );
         },
       }),
 

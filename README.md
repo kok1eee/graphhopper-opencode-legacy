@@ -83,7 +83,7 @@ graphhopper-opencode/
 | `graphhopper-researcher` | 任意 | コードベース/外部doc | 事実収集・調査専用。高頻度なので最安モデル | 最下層コスト |
 | `graphhopper-librarian` | 任意 | 外部公式doc | 公式doc・仕様調査専用（URL・引用付き。判断なし） | 最下層コスト |
 | `graphhopper_decide`（tool。agentではない） | goal開始前 | やる内容テキスト | 入口トリアージ（d1 decision-modelのChoice型でroute 5択判定＋confidence。低confidence・障害時はfull） | $0（d1:free） |
-| `graphhopper-advisor` | 任意 | 問い・判定材料テキスト | selector判定・セカンドオピニオン（stuck時はoracle。出力は非拘束） | 最下層コスト |
+| `graphhopper-advisor` | 任意 | 問い・判定材料テキスト | セカンドオピニオン・advised入口の相談（stuck時はoracle。出力は非拘束）。selector判定は `graphhopper_selector`（d1）に移管 | 中位（grok-4.7） |
 | `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 安価・高速（haiku級。見逃し率はscoreboardで監視） |
 | `graphhopper-oracle` | implementing（詰まった時。`graphhopper_attempt`のfail_streakがstuck_threshold到達） | 失敗試行の文脈 | 手詰まり打開の相談役 | 上位品質 |
 | `graphhopper-simplify` | polish（実装後・post-hoc。大diffのみ） | コードdiff | simplify提案（3レンズ: 再利用・品質・効率） | 中位 |

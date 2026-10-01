@@ -116,15 +116,21 @@ describe("plugin route系tool", () => {
     expect(readPendingRoute(root)).toBeNull();
   });
 
-  test("selector prompt発行（advisory-only・goal不要）", async () => {
-    const root = tmpRoot();
-    const t = await tools(root);
-    const prompt = await t.graphhopper_selector({
-      design_excerpt: "doneの定義",
-      diff_stat: "1 file +10 -2",
-    });
-    expect(prompt).toContain("lens");
-    expect(prompt).toContain("従来router");
+  test("selector d1判定（advisory-only・goal不要）: key無しはfallback", async () => {
+    const saved = process.env.LIQUID_API_KEY;
+    delete process.env.LIQUID_API_KEY;
+    try {
+      const root = tmpRoot();
+      const t = await tools(root);
+      const out = await t.graphhopper_selector({
+        design_excerpt: "doneの定義",
+        diff_stat: "1 file +10 -2",
+      });
+      expect(out).toContain("判定不能");
+      expect(out).toContain("従来router");
+    } finally {
+      if (saved !== undefined) process.env.LIQUID_API_KEY = saved;
+    }
   });
 
   test("route_set不正→full・escalate→full＋designing", async () => {

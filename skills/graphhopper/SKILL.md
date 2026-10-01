@@ -18,7 +18,7 @@ graphhopper本体（Claude Code版）の3相グラフをopencodeに移植した�
 | 計画の敵対検証 | critic（designingで1回） | 要件漏れ・設計の穴・スコープ逸脱。質はここ |
 | 実装後のdrift検出 | verifier（polishでfan-out） | requirement/behavior/progressの3lens |
 | 手詰まり打開 | oracle（escalate時のみ） | 失敗文脈を渡して助言のみ受け取る |
-| 気軽な相談・判定 | `graphhopper-advisor` | selector判定・セカンドオピニオン。stuck時はoracle（advisorで代替しない）。出力は非拘束 |
+| 気軽な相談 | `graphhopper-advisor` | セカンドオピニオン・advised入口の相談。stuck時はoracle（advisorで代替しない）。出力は非拘束。selector判定はd1 tool（`graphhopper_selector`）に移管 |
 | repo内事実収集 | researcher（read-only） | graft-first。判断を含めない |
 | repo外公式doc | librarian（read-only） | URL・引用付き。判断を含めない |
 | 大diff整理 | simplify（route=polishのみ） | 提案のみ。適用はメイン |
@@ -141,12 +141,14 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 #### selector（任意・advisory-only）
 
-polish前にlens編成の助言が欲しい場合のみ使う（現行routerは維持。省略可）:
+polish前にlens編成の助言が欲しい場合のみ使う（現行routerは維持。省略可）。
+判定は d1 decision-model（`LIQUID_API_KEY` 必須。約0.7秒・$0・決定的）:
 
-1. `graphhopper_selector(design_excerpt, diff_stat)` で判定promptを発行する
-   （design抜粋＋diff統計のみ。blast radiusは渡さない）
-2. `task(subagent_type: 'graphhopper-advisor')`／`graphhopper_invoke(agent: 'graphhopper-advisor')` に渡し、返却JSONのlenses（1-3件・既知IDのみ採用）を参考にする
-3. 不正・空の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）
+1. `graphhopper_selector(design_excerpt, diff_stat)` を呼ぶ（design抜粋＋diff統計のみ。blast radiusは渡さない）
+2. 返却の `lenses`（1-3件）を参考にする。3観点のNoulを各0.5閾値で判定し、全て未満なら「該当なし→general」。
+   design抜粋が契約変更系キーワード（契約/migration/互換/breaking/schema）に当たるとrequirementを強制追加する
+3. `fallback=true`（key未設定・API失敗等＝判定不能）の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）。
+   採否の決定はmain。toolは判定を返すだけ（advisory-only）
 
 #### verifier（drift 検出）
 
@@ -184,7 +186,7 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
 - **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `claude-oauth/claude-haiku-4-5`
   （OAuth定額内で$0・最速。見逃し率はscoreboardのper-model集計で監視し、悪化したら昇格）。
   verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。
-  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはminimax-M3、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
+  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはmuse-spark-1.3-contributor（Go経由。学習利用を許諾済みのため個人用途のみ。他repoはglobal既定のdeepseek-v4.1-flash）、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
   `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
   `env -u AWS_BEARER_TOKEN_BEDROCK` を付ける

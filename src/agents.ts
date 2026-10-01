@@ -206,7 +206,7 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
 
   "graphhopper-advisor": {
     description:
-      "気軽な相談・判定専用。selector判定とセカンドオピニオンに使う（モデルは .graphhopper/config.json の agents で設定）。入口トリアージはgraphhopper_decide toolに移管（agent不要）。stuck時はgraphhopper-oracle（advisorで代替しない）。最終決定は呼び出し側",
+      "気軽な相談専用。セカンドオピニオン・advised入口の相談に使う（モデルは .graphhopper/config.json の agents で設定）。入口トリアージ（graphhopper_decide）とselector判定（graphhopper_selector）はd1 toolに移管済み（agent不要）。stuck時はgraphhopper-oracle（advisorで代替しない）。最終決定は呼び出し側",
     mode: "all",
     temperature: 0.2,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },

@@ -465,32 +465,6 @@ describe("continuationText 3段階文面", () => {
     expect(g.parseEntryRoute("  ADVISED  ").route).toBe("advised");
   });
 
-  test("parseSelectorOutput: 正常系とfail-safe（従来router継続）", async () => {
-    const g = await import("./gate");
-    const ok = g.parseSelectorOutput(
-      '{"lenses":["requirement","behavior"],"reason":"契約変更あり"}',
-    );
-    expect(ok.lenses).toEqual(["requirement", "behavior"]);
-    expect(ok.fallback).toBe(false);
-    // 未知IDは落とし既知のみ採用、重複除去、3件cap
-    const mixed = g.parseSelectorOutput(
-      '{"lenses":["progress","zzz","progress","general","behavior","requirement"]}',
-    );
-    expect(mixed.lenses).toEqual(["progress", "general", "behavior"]);
-    expect(mixed.fallback).toBe(false);
-    // 不正・空はfallback（general倒しはしない）
-    for (const bad of ["garbage", "", null, '{"lenses":[]}', '{"lenses":["zzz"]}']) {
-      const r = g.parseSelectorOutput(bad);
-      expect(r.fallback).toBe(true);
-      expect(r.lenses).toEqual([]);
-    }
-    // prompt組立はdesign抜粋＋diff統計を含む
-    const p = g.buildSelectorPrompt("doneの定義", "3 files +120 -40");
-    expect(p).toContain("design抜粋:");
-    expect(p).toContain("doneの定義");
-    expect(p).toContain("3 files +120 -40");
-  });
-
   test("checkDesignDocThin: task列のみ見る", async () => {
     const g = await import("./gate");
     const s = await import("./state");

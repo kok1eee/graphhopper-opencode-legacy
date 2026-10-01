@@ -768,14 +768,20 @@ describe("graphhopper-mcp route系tool（統合）", () => {
     };
     // prompt発行
     expect(await call("graphhopper_route", { request: "typo修正" })).toContain("route");
-    // selector prompt発行（advisory-only。active goal不要）
+    // selector d1判定（advisory-only。active goal不要）。key無しはfallback
     {
-      const sel = await call("graphhopper_selector", {
-        design_excerpt: "doneの定義",
-        diff_stat: "3 files +120 -40",
-      });
-      expect(sel).toContain("lens");
-      expect(sel).toContain("doneの定義");
+      const saved = process.env.LIQUID_API_KEY;
+      delete process.env.LIQUID_API_KEY;
+      try {
+        const sel = await call("graphhopper_selector", {
+          design_excerpt: "doneの定義",
+          diff_stat: "3 files +120 -40",
+        });
+        expect(sel).toContain("判定不能");
+        expect(sel).toContain("従来router");
+      } finally {
+        if (saved !== undefined) process.env.LIQUID_API_KEY = saved;
+      }
     }
     // graphhopper_editの軟質returnはマスクせずそのまま返す（goal無しroot）
     {
