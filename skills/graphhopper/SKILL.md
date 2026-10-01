@@ -87,35 +87,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   素のedit/writeはフォールバック。拒否（throw）はhash再取得の合図
 - 詰まったら `task(subagent_type: "graphhopper-researcher")` で並列調査。
   外部公式doc裏付けが必要なら `task(subagent_type: "graphhopper-librarian")` を使う
-- researcher / librarian の使い分け（調査の内外分離。両方とも最安tier・read-only）:
-  - researcher = repo**内**（定義・構造・呼び出し関係をgraft-firstで）。librarian = repo**外**
-    （公式doc・仕様・実装例を webfetch / context7 で。URLと引用付き、判断なし。
-    context7に無い一般web（issue・blog・changelog）はwebsearch MCP（Exa）、
-    コード例はgrep.app MCPにフォールバック）
-  - 独立した問いなら `task()` で2体を**並列**に呼び、メインが統合する（discover fan-outと同型）
-  - 外部問いが内部findingsに依存するなら**直列**にする（researcherで対象ライブラリ・版を
-    特定してからlibrarianにdocを引かせる。逆順・同時投げは版ズレの温床）
-  - researcherは外部調査を自分でやらずlibrarian委譲を提案し、librarianは判断を含めない（境界の二重化）
-- **実装試行のたびに `graphhopper_attempt(ok, note)` を呼ぶ**（成否をコード側で機械カウントする）。
-  ただし **eval_cmd設定中はattemptを呼ばない**（idle/MCP-evalが自動記録するため二重計数になる。
-  手動の進捗メモが必要ならnoteに残す）。eval未設定時のみ自己申告フォールバックとして使う
-- **evalのskip切り分け**: `graphhopper_eval` のskip文面は条件別（phase行／eval_cmd行の両出し＋root表記）。`phase=designing`なら遷移が先、`eval_cmd未設定`なら再設定が先。goal切替でeval_cmdは消える（start白紙が仕様）。`error: no active goal（root=...）`が出たらset時と解決rootが違う（明示rootで揃えよ）。evalはsessionを見ないため未bindは無関係
-  - `ok: false` が続き `fail_streak` が `stuck_threshold`（既定3）に達すると `escalate: true` が返る
-  - `escalate: true` が返ったら `task(subagent_type: "graphhopper-oracle")` に相談する。これまでの
-    失敗試行（何を試して何が起きたか）を渡し、助言を受けて別のアプローチで再試行する
-  - 同一goal内の2回目以降のoracle相談は新規ではなく `task(task_id: "<前回のID>")` で同subagent継続として呼ぶ（OmOのresume=session_id相当。文脈を失わず重複説明を省く）
-  - **これはrouter gate（diffサイズ）とは別軸のタイミング判断**——無条件で毎回opusを呼ぶのではなく、
-    本当に詰まった時だけ上位モデルのコストを払う graph engineering の分岐点
-  - stuck 信号は2系統＋fail（いずれかで escalate。eval_cmd 運用では idle の eval 失敗文に自動追記される）:
-    - `fail_streak`（連続失敗。`ok`・phase 遷移・resume でリセット。`recordAttempt` 側で判定）
-    - 同一ファイル再編集（`stuck_edit_repeat` 既定5連。別ファイル・eval pass でリセット。
-      `checkStuck` で判定＝進捗停滞系）
-    - diff 停滞（`stuck_diff_stall` 既定4。ワーキングコピー差分が変わらない idle eval の連続。
-      差分変化・eval pass でリセット。`checkStuck` で判定＝進捗停滞系）
-  - 連続失敗が `max_eval_fails`（既定6）に達すると相談ではなく goal が pause する（giveUp）。修正して resume せよ
-- 全タスク実施したら `graphhopper_router_check` を呼ぶ（diffサイズを機械測定してrouteを決める）
-- goal start時に初期脏れ（前goal未コミット分）を自動snapshotし、遷移判定は実効diff（測定－初期値）で行う。
-  statusの `initial_dirt` で確認可。実効0時は「未実装」と断定せず `router_check` 手動確認も可
+> 詳細は [refs/implementing.md](refs/implementing.md) を読め（implementingに入ったら必読）
 
 ### polish
 
@@ -139,73 +111,8 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 - 適用後は `eval_cmd` を**再実行**して機械確認してから verifier に進む（simplify 後の未検証コードで done を出さない）
 - route は simplify 前の記録値に固定。simplify 後に diff を再測定して route を変えない
 
-#### selector（任意・advisory-only）
-
-polish前にlens編成の助言が欲しい場合のみ使う（現行routerは維持。省略可）。
-判定は d1 decision-model（`LIQUID_API_KEY` 必須。約0.7秒・$0・決定的）:
-
-1. `graphhopper_selector(design_excerpt, diff_stat)` を呼ぶ（design抜粋＋diff統計のみ。blast radiusは渡さない）
-2. 返却の `lenses`（1-3件）を参考にする。3観点のNoulを各0.5閾値で判定し、全て未満なら「該当なし→general」。
-   design抜粋が契約変更系キーワード（契約/migration/互換/breaking/schema）に当たるとrequirementを強制追加する
-3. `fallback=true`（key未設定・API失敗等＝判定不能）の場合は従来router（advisor/polish）を継続せよ（general倒しはしない）。
-   採否の決定はmain。toolは判定を返すだけ（advisory-only）
-
-#### verifier（drift 検出）
-
-`graphhopper_router_check` の `route` に従う。**いずれのrouteでも `graphhopper-verifier` への
-第三者チェックは省略できない**（`graphhopper_verifier_set` はresultsが空だとエラーを返す機械ゲートがある。
-自己レビューだけでのclean記録は不可能。level/targetの最終決定は機械集約される）:
-
-- **route=advisor**（小diff）: `task(subagent_type: "graphhopper-verifier")` を**1回だけ**、
-  `general`charterで呼ぶ。「実装がdesign.mdの意図から外れていないか・テストが実際のユーザーパスを
-  検証しているか・変更がgoalに収束しているか、3観点をまとめてレビューせよ」と渡す。
-  診断はメインが事前に1回実行し `.graphhopper/tmp/diag-<goal>.txt` に保存してpathを渡す
-  （verifierの個別実行はbash denyで禁止。inline添付は3重トークン再発のため禁止）。
-  verifierは添付診断を裏付け・反証に使え。LSPは補助線に留める（単一証拠源にしない）。
-  ただし診断クリーン≠driftなし（挙動driftは診断に出ない）。
-  添付が無ければ「診断未実行（理由）」を明記し、診断不在をcleanの根拠にしない。
-  周辺探索はgraft-first（漁り読み禁止。graft/diffが指した関数・テスト単位のReadは可）。
-  全文catして数える（cat | wc等）・同一範囲の再読は禁止。行特定はgrep/graftで行い、Readは1範囲1回。
-  findingsには証拠状態を必ず付ける（typesafe流・失敗原因分離）: `裏付けあり` /
-  `証拠不足` / `診断未実行` / `実行失敗`。原因不明のままlevelだけ付けない
-   結果を `graphhopper_verifier_set(results: [{lens: "general", level}], reason: ...)` で記録
-   （実行モデルがconfig既定と違う場合は `model` に明示。成績表の帰属に使う）
-- **route=polish**（大diff・閾値超）: adversarial verifier fan-out を行う
-  1. `task(subagent_type: "graphhopper-verifier")` を3回呼ぶ。それぞれ以下のcharterをプロンプトに含める:
-     - requirement: 「実装がdesign.mdの意図から外れていないか（実装漏れ・解釈ズレ・スコープ逸脱）を検証せよ」
-     - behavior: 「テストが実際のユーザーパスを検証しているか（モック過多・ハッピーパスのみ・エラー握り潰し）を疑え」
-     - progress: 「変更がgoalに収束しているか（堂々巡り・残骸・goal無関係な混入）を見よ」
-     時間短縮のため3体は**並列**に投げてよい（MCP駆動では graphhopper_invoke を3連並列。入れ子のみ禁止）。
-     charter定型文は MCP prompts（graphhopper-verifier-requirement/behavior/progress）にもある。
-     並列時の注意: 各invokeは独立 `opencode run`（自前server＋MCP付きの重い処理）のため、
-     同一モデル3連はprovider側rate limitのリトライ待ちになり得る。気になる場合は
-     `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
-     伝播してkillされる（取り消し後の裏回りなし）。
-     推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
-- **deep推奨**（routerの `deep` 標示時）: 状態遷移核（`src/state.ts`・`src/gate.ts`）に触れたgoalは、該当lensだけ上位モデルで走らせる。route=polishならbehavior、route=advisorならgeneralを `graphhopper_invoke` のmodel上書き（`claude-oauth/claude-sonnet-5-5`指定）で実行し、`graphhopper_verifier_set` の該当 results 要素に `model` を付けて記録する（他lensは既定のまま。lens構成は変えない。sonnet-5-5はshadow運用中：scoreboardのper-model集計で5との比較材料を溜め、単独切替は別途判断）。selectorとの住分け：selector→lens選択、deep→model選択（直交）。無視してもstandardとして記録される（fail-safe。追従／無視はhistoryに残り事後集計可）。判断者は増やさない（集約は1本のまま）
-- **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `claude-oauth/claude-haiku-4-5`
-  （OAuth定額内で$0・最速。見逃し率はscoreboardのper-model集計で監視し、悪化したら昇格）。
-  verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。
-  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはmuse-spark-1.3-contributor（Go経由。学習利用を許諾済みのため個人用途のみ。他repoはglobal既定のdeepseek-v4.1-flash）、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
-  注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
-  `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
-  `env -u AWS_BEARER_TOKEN_BEDROCK` を付ける
-- **diff肥大は検証コスト3倍**: polish routeは3lensが全差分を読む。748行級は1回で3×748行の
-  コンテキスト消費。goalを小さく切ってadvisor（verifier×1）に収めるのが最大の節約。
-  巻き戻しはさらに3倍するので、criticで初回品質を上げることも節約になる
-   2. `graphhopper_diff_stash` でdiffを退避（`.graphhopper/tmp`配下。子権限で読めるため
-      手動コピーは不要・禁止）し、各verifierには**返却pathを渡す**
-      （inline 3重展開は禁止。3lensが全文を各々読むと3倍燃費になる）。
-      読むのは `goal` / `.graphhopper/plans/<goal-id>.md` の内容 / 退避diffの差分範囲＋疑義点のみ。
-      周辺探索はgraft-first（漁り読み禁止）。診断はメインが事前に1回実行し
-      `.graphhopper/tmp/diag-<goal>.txt` に保存してpathを渡す（verifier個別実行は禁止）。
-      behavior charterでは添付診断を証拠に使う
-  3. drift（乖離）を検出したら**全件報告させる**（閾値カットしない。「重大なものだけ報告」のような保守的指示は書かない——過少報告を招く）
-  4. 3体の結果（各charterの level。drift には target 必須）を `results` に詰め、
-     `graphhopper_verifier_set(results: [...], reason: ...)` で1回記録する。
-     level/target の最終決定は機械集約（いずれか drift → drift、target は
-     implementing 優先）であり、メインの裁量で「重大なものだけ採用」といった
-     後段フィルタはしない
+> selectorの詳細は [refs/verifier.md](refs/verifier.md) を読め（polishに入ったら必読）
+> 詳細は [refs/verifier.md](refs/verifier.md) を読め（polishに入ったら必読）
 
 ### done
 
@@ -232,31 +139,5 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
 compact前に `.log.md` へ決定事項・途中経過を書いておくこと（圧縮要約に落とせない詳細の保全。
 state・design・historyはdiskにあり圧縮の影響を受けない）。
 
-## Gotchas
+> 詳細は [refs/gotchas.md](refs/gotchas.md) を読め（該当時に参照）
 
-- **live-docs-first**: 版依存の主張（SDK API・MCP仕様・外部CLI挙動・言語仕様の版差）は
-  推測で書かず、context7 / 公式docで裏付けてから書く・直す。裏が取れない版詳細は
-  「版未確認」と明記する（typesafe SKILL.mdの作法）
-- **コード探索のtier**: graft（意味・構造の入口）→ LSP（点照会: file＋line特定済みの定義・参照・hover・診断のみ）→ ast-grep（構造パターン: `ast-grep -p '<pattern>' <path>` / `ast-grep --rule rule.yaml`）→ rg（テキスト最終手段）。plain grep・findは使わない。graftの絞り込み前にlsp_workspace_symbolsを投げない（版ズレ・ノイズの温床）
-- **`sg` は使わない**: macOSではast-grepのshimだが、Linux（Amazon Linux等）では newgrp へのsymlink＝「別グループで任意コマンド実行」。canonical名 `ast-grep` のみ使う（allowlistはsgをdeny済み）
-- **tgrepはtier外の逃走経路**: 表現力は rg と同じで、利点は巨大repoでの速度のみ。通常は rg で足りる。どうしても遅い巨大repoでのみ、自分で `tgrep index .` または `tgrep serve .` を立てて `tgrep search` を使う（index/serve は状態変更のため allowlist では deny＝BYOS。stale index は取りこぼしの原因になるので更新に注意）
-- **書き換え系フラグは禁止**: `ast-grep --update-all` / `ast-grep -U`、`ruff --fix` / `ruff format`、`pyright --createstub` はsubagent read-only不変条件のためdeny。使わない
-- **診断クリーンをdriftなしの根拠にしない**: 挙動driftは診断に出ない。診断は補助証拠
-- **言語版ガード（critic/verifier共通の誤検知止め）**: 構文・APIの指摘前に requires-python / .python-version / toolchain の版を必ず確認する。Python 3.14+ では PEP 758 により括弧なし except（`except A, B:`）は有効な構文であり、版が 3.14+ なら指摘しない（警告が出る場合のみ言及）。版不明・3.13以前なら従来通り指摘してよい
-
-- **designing中に無理にEdit/Writeしようとしてエラーになったら**: 設計が先という合図。design.md を先に書いてから implementing へ遷移する
-- **designing終了後にdesign.mdを書き直そうとしてエラーになったら**: 仕様変更や見落としがあっても design.md 自体は書き換えない。`.graphhopper/plans/<goal-id>.log.md` に決定の経緯・棄却した代替案を追記する（design.mdはverifierのdrift検出アンカーなので不変を保つ）
-- **critic を呼ばずに implementing に飛ばない**: `graphhopper-critic` は毎goal必ず1回呼ぶ（安価な常設node）。飛ばすと設計段階の要件漏れ・スコープ逸脱が implementing まで持ち越される。critic の指摘は design.md に反映してから遷移する
-- **route=polishなのに「念のため」でverifier fan-outを省略しない**: router_checkの判定はコード側の機械測定。無条件発火だったcouncilの再発防止はここで担保されている
-- **simplify の diff を inline で subagent に渡さない**: main context を汚す。`graphhopper_diff_stash` の返却pathで渡す（verifierと共用。agent は bash deny なので自分で diff は取れない）
-- **route=advisor なのに simplify を実行しない**: simplify は route=polish（大diff）のときだけの条件分岐 node。advisor（小diff）ではスキップが正しい。逆に polish で飛ばすのも禁止
-- **1 goal 1 driver**: TUI bind中のgoalをMCP等別sessionから操作すると警告が出る（二重駆動防止）。
-  意図的な引き継ぎなら session_id を指定して resume で bind し直す
-- **非法遷移は拒否される**: designing→implementing→polish→done のみ（polish→implementing巻き戻し可）。
-  特に `setPhase(done)` の直指定は不可（doneはverifier clean後のcompleteのみ）
-- **simplify で critical を自動適用して設計を変えない**: interface / signature / 公開 API の振る舞いを変える提案は high 扱いで人間に提示。勝手に直すと design レベルの変更になる
-- **simplify 適用後に eval_cmd を再実行しないで verifier に進まない**: critical 適用でコードが再変更されている。機械確認してから verifier を呼ぶ
-- **route=advisorだからverifier呼び出し自体を省略しない**: 「小diffだから自分で見れば十分」は禁止。`graphhopper_verifier_set`はresultsが空だと機械的にエラーを返す（self-graded完了防止のゲート）ので、必ず`task(graphhopper-verifier, charter: 'general')`を1回呼んでから記録する
-- **verifier fan-outへの指示を「重大な問題だけ報告」にしない**: 全件報告→機械集約が正しい順序（保守的な指示は再現率を落とす）。`results` に詰めるのは各charterの level そのまま。メインの裁量でdriftを握り潰さない（集約ルールがコード側にあるため握り潰せない）
-- **`graphhopper_attempt`を省略しない**: 呼ばなければfail_streakが0のまま止まり、詰まっていても oracle への相談が起動しない。実装試行のたびに毎回呼ぶ
-- **escalate: trueが出たのに自力でもう一度だけ試そうとしない**: 閾値はコード側の機械カウント。無視して回すと同じ失敗を繰り返すだけになりがちなので、必ずoracleに相談してから再試行する
