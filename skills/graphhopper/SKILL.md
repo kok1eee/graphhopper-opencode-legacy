@@ -185,7 +185,7 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
 - **モデル割当（2026-09-28改定・Bedrock配線後）**: criticは `amazon-bedrock/grok-4.6`
   （Bedrock cross-region `global.xai.grok-4.6`。1回/goalのため約$0.14と誤差。系列多様性も確保）。
   verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。
-  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはdeepseek-flash、oracleはopus-5を維持。
+  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはdeepseek-flash、oracleはopus-5を維持（opus-5-5はOAuth grant再作成後に切替。`claude setup-token`を現行CLIで取り直すこと）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
   `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
   `env -u AWS_BEARER_TOKEN_BEDROCK` を付ける
