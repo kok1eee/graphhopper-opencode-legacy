@@ -34,13 +34,12 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
                      drift target=implementing の巻き戻し
 ```
 
-### 入口トリアージ（jev・route full/light/direct/advised/oracle）
+### 入口トリアージ（decide・route full/light/direct/advised/oracle）
 
-フルループが大袈裟な作業に相応の重さで回す入口判定。判定は安価な `graphhopper-jev`
-（既定longcat無料。ollaya型typed choice相当＝1行JSONのみ出力）:
+フルループが大袈裟な作業に相応の重さで回す入口判定。判定は `graphhopper_decide`
+（d1 decision-modelのChoice型でroute 5択＋confidence。低confidence・障害時はfull。`LIQUID_API_KEY` が要る）:
 
-- `graphhopper_route(request)` → prompt取得 → `task(graphhopper-jev)` /
-  `graphhopper_invoke(agent: 'graphhopper-jev')` で判定 →
+- `graphhopper_route(request)` → 手順取得 → `graphhopper_decide(request)` で判定 →
   `graphhopper_route_set(route, reason)` で記録
 - **full=フル**（現行通り）/**light=軽量**（thin design＋task列のみ、critic省略、verifier general×1）/
   **direct=直行**（loopなし・goalを作らない。historyに1行のみ残る）/
@@ -52,7 +51,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
   `router_check` でlight/advised＋大diffなら**自動昇格**（designing巻き戻し＋肉付け＋critic1回＋fan-out×3）。
   stuck発火時もlight/advisedは自動昇格する（fullのstuckは従来通りoracle相談）。
   昇格後はcritic記録なしにimplementingへ進めない（機械ゲート）
-- light適用条件（jev prompt内チェックリスト）：単一関心・設計判断なし・既存踏襲・テスト容易。
+- light適用条件（decide criteria）：単一関心・設計判断なし・既存踏襲・テスト容易。
   1つでも欠けたらfull。誤lightは昇格で回収する前提
 
 ### designing
@@ -182,10 +181,10 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
      伝播してkillされる（取り消し後の裏回りなし）。
      推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
 - **deep推奨**（routerの `deep` 標示時）: 状態遷移核（`src/state.ts`・`src/gate.ts`）に触れたgoalは、該当lensだけ上位モデルで走らせる。route=polishならbehavior、route=advisorならgeneralを `graphhopper_invoke` のmodel上書き（`claude-oauth/claude-sonnet-5-5`指定）で実行し、`graphhopper_verifier_set` の該当 results 要素に `model` を付けて記録する（他lensは既定のまま。lens構成は変えない。sonnet-5-5はshadow運用中：scoreboardのper-model集計で5との比較材料を溜め、単独切替は別途判断）。selectorとの住分け：selector→lens選択、deep→model選択（直交）。無視してもstandardとして記録される（fail-safe。追従／無視はhistoryに残り事後集計可）。判断者は増やさない（集約は1本のまま）
-- **モデル割当（2026-09-28改定・Bedrock配線後）**: criticは `amazon-bedrock/grok-4.6`
-  （Bedrock cross-region `global.xai.grok-4.6`。1回/goalのため約$0.14と誤差。系列多様性も確保）。
+- **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `claude-oauth/claude-haiku-4-5`
+  （OAuth定額内で$0・最速。見逃し率はscoreboardのper-model集計で監視し、悪化したら昇格）。
   verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。
-  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはdeepseek-flash、oracleはopus-5-5。
+  researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはminimax-M3、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
   `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
   `env -u AWS_BEARER_TOKEN_BEDROCK` を付ける

@@ -35,8 +35,8 @@ graphhopper-opencode/
 │   ├── index.ts   — プラグイン本体（tool.execute.before + event + 20 tool）
 │   ├── state.ts   — .graphhopper/ 配下の state 管理（atomic write）
 │   ├── gate.ts    — helper・定数の単一源泉（entryは関数exportのみの制約対応）
-│   ├── mcp.ts     — MCPブリッジ（22 tool＋resources/prompts。API経由セッション用）
-│   ├── agents.ts  — 8 subagent 定義（config hook で注入。入口トリアージ用graphhopper-jev・相談判定用graphhopper-advisor含む）
+│   ├── mcp.ts     — MCPブリッジ（23 tool＋resources/prompts。API経由セッション用）
+│   ├── agents.ts  — 7 subagent 定義（config hook で注入。相談判定用graphhopper-advisor含む。入口トリアージはgraphhopper_decide toolに移管しagentは持たない）
 │   ├── prompts.ts — MCP prompts charter定型文の単一源泉（8件）
 │   ├── invoke.ts  — graphhopper_invoke（opencode run spawn・中断伝播・heartbeat）
 │   ├── watch.ts   — outbox監視（--notifyでmacOS通知）
@@ -64,7 +64,7 @@ graphhopper-opencode/
 | `graphhopper_phase` | フェーズ遷移（designing → implementing → polish → done） |
 | `graphhopper_router_check` | diffサイズを機械測定し advisor(verifier×1)/polish(verifier×3) に分岐（loop-driver.sh相当） |
 | `graphhopper_diff_stash` | verifier fan-out用に実効diff（初期脏れ除外）を.graphhopper/tmpへ1回だけ退避しpathを返す（3 lensへのinline 3重展開防止） |
-| `graphhopper_route` / `graphhopper_route_set` | jev入口トリアージ。判定prompt発行＋記録（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す。directはhistory 1行のみ）。done/paused goalへのbindは拒否（pending維持） |
+| `graphhopper_route` / `graphhopper_route_set` / `graphhopper_decide` | 入口トリアージ。decide（d1 decision-model）で判定＋記録（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す。directはhistory 1行のみ）。done/paused goalへのbindは拒否（pending維持） |
 | `graphhopper_consult_set` | advised/oracle入口の相談記録（kind=advisor/oracle＋要旨。実在は検証しない。designing→implementingの機械ゲート入力） |
 | `graphhopper_escalate` | light/advised→full昇格（designing巻き戻し＋critic1回＋fan-out×3。full→light禁止のラチェット） |
 | `graphhopper_verifier_set` | verifier結果を記録。各charterの結果をresultsに詰めるとlevel/targetは機械集約（state.aggregateVerdicts）される。resultsが空だとエラーになる（self-graded完了防止の機械ゲート）。results要素の`model`でper-lens上書き可（deep時の上位モデル等） |
@@ -82,9 +82,9 @@ graphhopper-opencode/
 |---|---|---|---|---|
 | `graphhopper-researcher` | 任意 | コードベース/外部doc | 事実収集・調査専用。高頻度なので最安モデル | 最下層コスト |
 | `graphhopper-librarian` | 任意 | 外部公式doc | 公式doc・仕様調査専用（URL・引用付き。判断なし） | 最下層コスト |
-| `graphhopper-jev` | goal開始前 | やる内容テキスト | 入口トリアージ（route 5択の1行JSON判定。ollaya型typed choice相当） | 最下層コスト |
+| `graphhopper_decide`（tool。agentではない） | goal開始前 | やる内容テキスト | 入口トリアージ（d1 decision-modelのChoice型でroute 5択判定＋confidence。低confidence・障害時はfull） | $0（d1:free） |
 | `graphhopper-advisor` | 任意 | 問い・判定材料テキスト | selector判定・セカンドオピニオン（stuck時はoracle。出力は非拘束） | 最下層コスト |
-| `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 上位品質・別ベンダー推奨 |
+| `graphhopper-critic` | designing（実装前・pre-hoc） | design.md（計画） | 敵対レビュー（要件漏れ・設計の穴・スコープ逸脱） | 安価・高速（haiku級。見逃し率はscoreboardで監視） |
 | `graphhopper-oracle` | implementing（詰まった時。`graphhopper_attempt`のfail_streakがstuck_threshold到達） | 失敗試行の文脈 | 手詰まり打開の相談役 | 上位品質 |
 | `graphhopper-simplify` | polish（実装後・post-hoc。大diffのみ） | コードdiff | simplify提案（3レンズ: 再利用・品質・効率） | 中位 |
 | `graphhopper-verifier` | polish（実装後・post-hoc） | コードdiff | adversarial verifier fan-out。判断node | 上位品質 |

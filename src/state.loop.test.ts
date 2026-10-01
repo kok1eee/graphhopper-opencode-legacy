@@ -1771,7 +1771,7 @@ describe("退避diff掃除（complete/clear）", () => {
   });
 });
 
-describe("entry_route（jevトリアージ）", () => {
+describe("entry_route（入口トリアージ）", () => {
   test("pendingはgoal startで消費される（light）", async () => {
     const s = await import("./state");
     const root = tmpRoot();

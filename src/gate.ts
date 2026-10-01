@@ -51,16 +51,8 @@ export const PHASE_ACTION_BRIEF: Record<state.Phase, string> = {
 export const PONYTAIL_BRIEF =
   "ponytail継続適用: YAGNI・怠惰原則（詳細は初回注入参照）。interface変更はhigh扱いで人間に提示";
 
-/* jev入口判定のprompt定数（ollayaのbaked質問セット相当。指示文の単一源泉則で
- * gate.tsに置く）。出力は1行JSONのみ。light/advised適用はチェックリスト化し複合時はfull */
-export const JEV_ROUTE_PROMPT = `あなたは入口トリアージ判定器。やる内容からrouteを1つ選べ。
-出力は1行のJSONのみ: {"route":"full|light|direct|advised|oracle"}
-- full=フルループ: 設計判断・複数関心・規模不明・曖昧・以下に当てはまらない全て
-- light=軽量: 全て満たす時のみ → (1)単一関心 (2)設計判断なし (3)既存パターンの踏襲 (4)テスト容易。1つでも欠けたらfull
-- advised=軽量＋第二意見: light条件を満たす＋影響範囲の読みに迷いがある／第二意見が欲しい軽微変更
-- oracle=多角: full相当＋最初から多角的視点が必要（アーキテクチャ判断・複雑デバッグ・不慣れパターン）
-- direct=直行: 単一ファイルの小修正・質問への回答・一回きりのコマンド実行
-複合・曖昧はfull。理由文・確信度は不要。JSON以外の文字を出すな`;
+/* decide toolの5択criteriaは decision.ts DECISION_ROUTE_CRITERIA に一本化
+ *（旧JEV_ROUTE_PROMPTの判定基準を移植）。gate.tsにはLLM用promptを残さない */
 
 /* jev出力の厳密parse。未知値・非JSON・空はfullに倒す（fail-safe＝重い側）。
  * 旧A/B/C（bare・JSON内）も受理しfull/light/directに写像する。
@@ -70,17 +62,17 @@ export function parseEntryRoute(text: string | null | undefined): {
   reason: string;
 } {
   if (typeof text !== "string" || text.trim().length === 0) {
-    return { route: "full", reason: "jev未呼び出し→full" };
+    return { route: "full", reason: "未呼び出し→full" };
   }
   // bare入力（route_setのschemaが素の値を受け付けるため先に照合。旧A/B/C互換）
   const normalized = state.normalizeEntryRoute(text);
   if (normalized) {
-    return { route: normalized, reason: "jev判定（bare）" };
+    return { route: normalized, reason: "判定（bare）" };
   }
   const m = text.match(/\{[^{}]*"route"\s*:\s*"([A-Za-z]+)"[^{}]*\}/);
   const parsed = state.normalizeEntryRoute(m?.[1]);
   if (parsed) {
-    return { route: parsed, reason: "jev判定" };
+    return { route: parsed, reason: "判定" };
   }
   return { route: "full", reason: "parse失敗→full" };
 }
@@ -130,10 +122,7 @@ export function effectivePhaseAction(
 export const ESCALATE_NEXT =
   "次: design.mdを肉付けし、task(graphhopper-critic)／graphhopper_invoke(agent: 'graphhopper-critic')で1回レビューしてから implementing へ。polishでは verifier fan-out×3（requirement/behavior/progress）が必須。";
 
-/* jev prompt組立（plugin/MCPのroute toolの単一源泉） */
-export function buildJevPrompt(request: string): string {
-  return [JEV_ROUTE_PROMPT, "", "やる内容:", request].join("\n");
-}
+/* （旧buildJevPromptは削除。入口判定は decision.ts のdecideRouteに移管） */
 
 /* selector判定のprompt定数（jev同型。指示文の単一源泉則でgate.tsに置く。
  * design.mdにはprompts.tsと書いたが、判定promptはJEV_ROUTE_PROMPTに倣い

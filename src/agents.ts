@@ -204,24 +204,9 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
     ].join("\n"),
   },
 
-  "graphhopper-jev": {
-    description:
-      "入口トリアージ判定専用。やる内容テキストからroute（full/light/direct/advised/oracle）の1行JSONだけ返す（ollayaのtyped choice相当。生成文・理由文は出さない。モデルは agents.graphhopper-jev で設定）",
-    mode: "all",
-    temperature: 0.1,
-    /* 判断材料はテキストのみ。探索・診断は不要のためbash全面deny
-     * （他agentのSEARCH_ONLY_BASHより厳しい。最小権限） */
-    permission: { edit: "deny", bash: "deny" },
-    prompt: [
-      "あなたは入口判定器。やる内容を読んでrouteを1つ選べ。",
-      "出力は1行のJSONのみ。説明・理由・確信度は出すな。",
-      "判断材料は渡されたテキストのみ。探索・診断は不要。",
-    ].join("\n"),
-  },
-
   "graphhopper-advisor": {
     description:
-      "気軽な相談・判定専用。selector判定とセカンドオピニオンに使う（モデルは .graphhopper/config.json の agents で設定）。入口トリアージはgraphhopper-jevのまま。stuck時はgraphhopper-oracle（advisorで代替しない）。最終決定は呼び出し側",
+      "気軽な相談・判定専用。selector判定とセカンドオピニオンに使う（モデルは .graphhopper/config.json の agents で設定）。入口トリアージはgraphhopper_decide toolに移管（agent不要）。stuck時はgraphhopper-oracle（advisorで代替しない）。最終決定は呼び出し側",
     mode: "all",
     temperature: 0.2,
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
@@ -243,11 +228,10 @@ export const GRAPHHOPPER_AGENTS: Record<string, AgentConfig> = {
 
   "graphhopper-critic": {
     description:
-      "designingフェーズのdesign.mdを敵対レビューする。要件漏れ・設計の穴・スコープ逸脱を検出する安価な常設チェックnode（モデルは .graphhopper/config.json の agents で設定）。verifierとは対照的に実装前の計画のみを対象とし、メインとは別ベンダーで系列多様性を設計段階で得る",
+      "designingフェーズのdesign.mdを敵対レビューする。要件漏れ・設計の穴・スコープ逸脱を検出する安価な常設チェックnode（モデルは .graphhopper/config.json の agents で設定。haiku級で安価・高速に回し、見逃し率はscoreboardで監視）。verifierとは対照的に実装前の計画のみを対象とする",
     mode: "all",
-    /* temperature未指定: Bedrock経由grok-4.6はtemperatureフィールド自体を拒否するため
-     * agent側で送らない（sonnet運用時の0.2固定は捨てる。既定温度でのばらつきは
-     * criticの敵対レビュー用途では許容）。verifier等は維持 */
+    /* temperature未指定: criticは既定温度で回す（敵対レビュー用途ではばらつき許容）。
+     * verifier等は維持 */
     permission: { edit: "deny", bash: SEARCH_ONLY_BASH },
     prompt: [
       "あなたはcritic。実装前に、設計ドキュメントの質を敵対的に検証する。",
@@ -376,7 +360,6 @@ const LSP_DENY_AGENTS: ReadonlySet<string> = new Set([
   "graphhopper-critic",
   "graphhopper-simplify",
   "graphhopper-librarian",
-  "graphhopper-jev",
   "graphhopper-advisor",
 ]);
 

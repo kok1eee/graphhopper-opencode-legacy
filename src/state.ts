@@ -93,7 +93,7 @@ export type DriftTarget = "implementing" | "design" | "requirements";
 /** general: route=advisor の単発呼び出し（3レンズを1つにまとめた統合charter） */
 export type VerifierLens = "requirement" | "behavior" | "progress" | "general";
 
-/* jev入口トリアージのroute。null＝full（未呼び出し・legacyの機械定義）。
+/* 入口トリアージのroute。null＝full（未呼び出し・legacyの機械定義）。
  * light/advised→full昇格のみ可（full→light禁止のラチェット）。directはgoalを作らない */
 export type EntryRoute = "full" | "light" | "direct" | "advised" | "oracle";
 
@@ -225,7 +225,7 @@ export interface LoopState {
   /** goal start時の未コミット脏れファイル集合（正規化済み）。deep判定の差分基準。
    * null＝legacy/未測定→deepなし。snapshotInitialDiffFilesがstart時に記録する */
   initial_diff_files: string[] | null;
-  /** jev入口判定のroute。null＝full（未呼び出し・legacy）。light/advised→full昇格のみ可 */
+  /** 入口判定のroute。null＝full（未呼び出し・legacy）。light/advised→full昇格のみ可 */
   entry_route: EntryRoute | null;
   /** light/advised→full昇格の実施時刻。null＝未昇格 */
   escalated_at: string | null;
@@ -452,7 +452,7 @@ export type HistoryEvent =
       reason: string;
     }
   | {
-      /* jev入口判定の記録。Cはgoalを作らないためgoal任意。
+      /* 入口判定の記録。Cはgoalを作らないためgoal任意。
        * 監査用1行（誤Cの検知・回収のためhistoryには残す） */
       type: "entry_route";
       goal?: string;

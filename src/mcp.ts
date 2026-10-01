@@ -46,13 +46,13 @@ import {
   effectivePhaseAction,
   ESCALATE_NEXT,
   autoEscalateOnStuck,
-  buildJevPrompt,
   buildSelectorPrompt,
   extractTasks,
   foreignBoundNote,
   parseEntryRoute,
 } from "./gate";
 import { readGraphhopperHash, runGraphhopperEdit } from "./gate";
+import { decideRoute } from "./decision";
 import * as state from "./state";
 import { invokeStructured } from "./invoke";
 import { PROMPT_DEFS } from "./prompts";
@@ -996,7 +996,7 @@ const TOOL_DEFS: ToolDef[] = [
   {
     name: "graphhopper_route",
     description:
-      "jev入口トリアージの判定promptを発行する。LLM呼び出しはtool外: graphhopper_invoke(agent: 'graphhopper-jev')で判定しgraphhopper_route_setで記録せよ",
+      "入口トリアージの入口。graphhopper_decide の呼び出し手順を返す（判定本体はdecide tool。LLM agentは使わない）",
     inputSchema: {
       type: "object",
       properties: {
@@ -1012,26 +1012,63 @@ const TOOL_DEFS: ToolDef[] = [
       required: ["prompt"],
     },
     run: (a) => {
-      const prompt = buildJevPrompt(a.request as string);
+      const prompt = [
+        "## 入口トリアージ手順",
+        "1. graphhopper_decide(request) を呼ぶ（d1 decision-modelがroute＋confidenceを返す。stateは書かない）:",
+        "",
+        a.request as string,
+        "",
+        "2. 返却routeを graphhopper_route_set(route, reason) で記録せよ。",
+        "3. full/light/advised/oracleなら graphhopper_goal(start)（pending routeが消費される）。directならloopなしで直接対応せよ。",
+      ].join("\n");
+      return { text: prompt, data: { prompt } };
+    },
+  },
+  {
+    name: "graphhopper_decide",
+    description:
+      "d1 decision-modelで入口routeを判定する（jev置換）。requestを渡すとroute＋confidenceを返す。stateは書かない",
+    inputSchema: {
+      type: "object",
+      properties: {
+        root: ROOT_PROP,
+        request: { type: "string", description: "これからやる内容のテキスト" },
+      },
+      required: ["request"],
+    },
+    schema: z.object({ root: rootZ, request: z.string() }),
+    outputSchema: {
+      type: "object",
+      properties: {
+        route: { type: "string" },
+        confidence: { type: ["number", "null"] },
+        reason: { type: "string" },
+      },
+      required: ["route", "reason"],
+    },
+    run: async (a) => {
+      const r = await decideRoute(a.request as string);
+      const text = [
+        `route=${r.route}（confidence=${r.confidence ?? "n/a"}。${r.reason}）`,
+        r.route === "direct"
+          ? "次: loopなしで直接対応せよ。goalは作らない（必要なら graphhopper_route_set(route: 'direct') でhistoryに残す）。"
+          : "次: graphhopper_route_set(route, reason) で記録せよ。full/light/advised/oracleなら graphhopper_goal(start)（pending routeが消費される）。",
+      ].join("\n");
       return {
-        text: [
-          prompt,
-          "",
-          "次: graphhopper_invoke(agent: 'graphhopper-jev') に上記を渡し、返却JSONを graphhopper_route_set で記録せよ。",
-        ].join("\n"),
-        data: { prompt },
+        text,
+        data: { route: r.route, confidence: r.confidence, reason: r.reason },
       };
     },
   },
   {
     name: "graphhopper_route_set",
     description:
-      "jev判定の記録。不正値はfullに倒す。full/light/advised/oracleは次回goal start時に消費。directはhistoryに1行残すのみ",
+      "decide判定の記録。不正値はfullに倒す。full/light/advised/oracleは次回goal start時に消費。directはhistoryに1行残すのみ",
     inputSchema: {
       type: "object",
       properties: {
         root: ROOT_PROP,
-        route: { type: "string", description: "jev返却のroute（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す）" },
+        route: { type: "string", description: "decide返却のroute（full/light/direct/advised/oracle。旧A/B/Cも受理。不正値はfullに倒す）" },
         reason: { type: "string", description: "判定理由の要旨（任意）" },
       },
       required: ["route"],

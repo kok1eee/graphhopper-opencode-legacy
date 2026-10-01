@@ -234,7 +234,7 @@ describe("subagent read-only guard", () => {
     );
   });
 
-  test("advisor定義: 権限・LSP deny・jev不変", () => {
+  test("advisor定義: 権限・LSP deny・decide移管", () => {
     const advisor = GRAPHHOPPER_AGENTS["graphhopper-advisor"];
     expect(advisor).toBeDefined();
     expect(advisor?.permission).toMatchObject({ edit: "deny" });
@@ -244,11 +244,8 @@ describe("subagent read-only guard", () => {
     const input: { agent?: Record<string, { tools?: Record<string, boolean> }> } = {};
     injectAgents(input as never, "/tmp/gh-nope");
     expect(input.agent?.["graphhopper-advisor"]?.tools?.["lsp_hover"]).toBe(false);
-    // jevは入口専用のまま（bash全面deny・文面不変）
-    expect(GRAPHHOPPER_AGENTS["graphhopper-jev"]?.permission).toMatchObject({
-      edit: "deny",
-      bash: "deny",
-    });
+    // jevは削除済み（入口判定はgraphhopper_decide toolに移管）
+    expect(GRAPHHOPPER_AGENTS["graphhopper-jev"]).toBeUndefined();
   });
 });
 
@@ -443,7 +440,7 @@ describe("continuationText 3段階文面", () => {
   });
 });
 
-describe("jev判定parse・thin gate（gate.ts）", () => {
+  describe("decide判定parse・thin gate（gate.ts）", () => {
   test("parseEntryRoute: 正常系とfail-safe", async () => {
     const g = await import("./gate");
     expect(g.parseEntryRoute('{"route":"light"}').route).toBe("light");

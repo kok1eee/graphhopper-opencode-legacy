@@ -26,7 +26,7 @@ function freshRoot(): string {
 }
 
 describe("graphhopper-mcp tool一覧", () => {
-  test("22 toolが登録される", async () => {
+  test("23 toolが登録される", async () => {
     const client = await linked();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
@@ -35,6 +35,7 @@ describe("graphhopper-mcp tool一覧", () => {
         "graphhopper_attempt",
         "graphhopper_consult_set",
         "graphhopper_critic_set",
+        "graphhopper_decide",
         "graphhopper_discover_clear",
         "graphhopper_discover_start",
         "graphhopper_discover_tick",
