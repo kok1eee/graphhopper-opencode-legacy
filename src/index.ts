@@ -724,7 +724,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
             `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
             `route: ${route}`,
             recorded.router.deep
-              ? `deep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を agents["graphhopper-oracle"] 枠の上位モデルで走らせ、verifier_set の該当 results に model を付けて記録せよ（無視してもstandardとして記録される。追従／無視はhistoryに残る）`
+              ? `deep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）は休止中（verifier既定がsonnet-5-5のため上書き不要。詳細はSKILL refs/verifier.md）`
               : null,
             route === "polish"
               ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"
@@ -1496,7 +1496,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
               state.setPhase(root, "polish");
               evalNote = `eval_cmd passed (diff ${diffLines} lines since baseline): ${cmd}`;
               if (recorded.router.deep) {
-                evalNote += `\ndeep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を上位モデルで走らせ、verifier_set の該当 results に model を付けよ`;
+                evalNote += `\ndeep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）は休止中（verifier既定がsonnet-5-5のため上書き不要）`;
               }
             } else {
               await state.recordRouterCheckWithRisk($, root, baseline, 0, "advisor");

@@ -458,7 +458,7 @@ async function evalOnce(root: string): Promise<string> {
       );
       state.setPhase(root, "polish");
       const deepLine = recorded.router.deep
-        ? `\ndeep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を上位モデルで走らせ、verifier_set の該当 results に model を付けよ`
+        ? `\ndeep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）は休止中（verifier既定がsonnet-5-5のため上書き不要）`
         : "";
       return `eval_cmd passed (diff ${diffLines} lines since baseline): ${cmd}${deepLine}\n${tail}`;
     } else {
@@ -550,7 +550,7 @@ async function routerCheck(root: string): Promise<ToolOut> {
       `diff_lines: ${diffLines} (threshold: ${cfg.router_threshold_lines})`,
       `route: ${route}`,
       recorded.router.deep
-        ? `deep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）を agents["graphhopper-oracle"] 枠の上位モデルで走らせ、verifier_set の該当 results に model を付けて記録せよ（無視してもstandardとして記録される。追従／無視はhistoryに残る）`
+        ? `deep: ${recorded.router.deep_reason} — behavior lens（polish時）／general lens（advisor時）は休止中（verifier既定がsonnet-5-5のため上書き不要。詳細はSKILL refs/verifier.md）`
         : null,
       route === "polish"
         ? "次: task(subagent_type: 'graphhopper-verifier') をrequirement/behavior/progressの3charterで呼び、graphhopper_verifier_setで記録する"

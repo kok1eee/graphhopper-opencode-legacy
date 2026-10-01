@@ -41,10 +41,10 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
      `delayMs` で数秒ずつ起動をずらす。実行中はheartbeatログが出る。キャンセルは子に
      伝播してkillされる（取り消し後の裏回りなし）。
      推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
-- **deep推奨**（routerの `deep` 標示時）: 状態遷移核（`src/state.ts`・`src/gate.ts`）に触れたgoalは、該当lensだけ上位モデルで走らせる。route=polishならbehavior、route=advisorならgeneralを `graphhopper_invoke` のmodel上書き（`claude-oauth/claude-sonnet-5-5`指定）で実行し、`graphhopper_verifier_set` の該当 results 要素に `model` を付けて記録する（他lensは既定のまま。lens構成は変えない。sonnet-5-5はshadow運用中：scoreboardのper-model集計で5との比較材料を溜め、単独切替は別途判断）。selectorとの住分け：selector→lens選択、deep→model選択（直交）。無視してもstandardとして記録される（fail-safe。追従／無視はhistoryに残り事後集計可）。判断者は増やさない（集約は1本のまま）
+- **deep休止**（2026-10-01改定：verifierがsonnet-5-5に昇格し、上位モデルでの上書き先が無くなった。selector→lens選択の原則は維持。oracle級が必要なlensが出たら別途検討）。
 - **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `claude-oauth/claude-haiku-4-5`
   （OAuth定額内で$0・最速。見逃し率はscoreboardのper-model集計で監視し、悪化したら昇格）。
-  verifierは `claude-oauth/claude-sonnet-5` 維持（判断nodeは品質優先）。
+  verifierは `claude-oauth/claude-sonnet-5-5`（shadow比較を経て昇格。判断nodeは品質優先）。
   researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはmuse-spark-1.3-contributor（Go経由。学習利用を許諾済みのため個人用途のみ。他repoはglobal既定のdeepseek-v4.1-flash）、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
   `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
