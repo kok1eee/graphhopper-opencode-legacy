@@ -45,7 +45,9 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
 - **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `minimax/MiniMax-M3`
   （契約済みquotaを使用。haikuより強い。見逃し率はscoreboardのper-model集計で監視継続。
   minimaxが使えない時〈cap切れ・エラー〉は `claude-oauth/claude-haiku-4-5` に
-  フォールバックして呼べ。自動切替の仕組みは無いためmain判断で呼ぶ）。
+  フォールバックして呼べ。自動切替の仕組みは無いためmain判断で呼ぶ。
+  subagent呼び出しは `graphhopper_invoke` を使うこと（毎回configを読み直す。
+  `task()` はagent束縛が古いまま残り、割当変更が効かない）。
   verifierは `claude-oauth/claude-sonnet-5-5`（shadow比較を経て昇格。判断nodeは品質優先）。
   researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはmuse-spark-1.3-contributor（Go経由。学習利用を許諾済みのため個人用途のみ。他repoはglobal既定のdeepseek-v4.1-flash）、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
