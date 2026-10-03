@@ -40,7 +40,9 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 （d1 decision-modelのChoice型でroute 5択＋confidence。低confidence・障害時はfull。`LIQUID_API_KEY` が要る）:
 
 - `graphhopper_route(request)` → 手順取得 → `graphhopper_decide(request)` で判定 →
-  `graphhopper_route_set(route, reason)` で記録
+  `graphhopper_route_set(route, reason)` で記録。
+  decide/selectorの呼び出しは `.graphhopper/decisions.jsonl` に自動記録される
+  （route・confidence・レイテンシ。閾値較正の材料にするため入口では必ず呼ぶこと）
 - **full=フル**（現行通り）/**light=軽量**（thin design＋task列のみ、critic省略、verifier general×1）/
   **direct=直行**（loopなし・goalを作らない。historyに1行のみ残る）/
   **advised=軽量＋第二意見**（light相当＋implementing前にadvisor相談1回）/

@@ -1050,8 +1050,10 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["route", "reason"],
     },
-    run: async (a) => {
-      const r = await decideRoute(a.request as string);
+    run: async (a, ctx) => {
+      const r = await decideRoute(a.request as string, fetch, {
+        root: ctx.root,
+      });
       const text = [
         `route=${r.route}（confidence=${r.confidence ?? "n/a"}。${r.reason}）`,
         r.route === "direct"
@@ -1139,10 +1141,12 @@ const TOOL_DEFS: ToolDef[] = [
       },
       required: ["lenses", "reason", "fallback"],
     },
-    run: async (a) => {
+    run: async (a, ctx) => {
       const r = await selectLenses(
         a.design_excerpt as string,
         a.diff_stat as string,
+        fetch,
+        { root: ctx.root },
       );
       return {
         text: formatSelectorResult(r),

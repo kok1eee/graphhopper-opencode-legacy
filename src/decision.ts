@@ -12,6 +12,8 @@
  * 失敗は呼び出し側が極性を決める（routeはfull、selectorはfallback=true）。
  * 本モジュールはstateを書かない。
  */
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import * as state from "./state";
 
 export const DECISION_API_URL =
@@ -45,6 +47,37 @@ export type DecisionAnswers = Record<
   string,
   { noul?: unknown; choice?: unknown; confidence?: unknown }
 >;
+
+/* d1呼び出しの較正用ログ。`.graphhopper/decisions.jsonl` へ1call1行で追記する。
+ * 使われなければ較正できないため、decide/selectの利用実績を残すのが目的。
+ * requestは先頭200字のみ（較正には概要で足りる）。書込失敗は握り潰す */
+export type DecisionLog = {
+  ts: string;
+  kind: "decide" | "select";
+  request: string;
+  result: string | string[];
+  confidence: number | null;
+  probs?: Record<string, number>;
+  latencyMs: number;
+  fallback: boolean;
+  reason: string;
+};
+
+export async function logDecision(
+  root: string,
+  entry: Omit<DecisionLog, "ts">,
+): Promise<void> {
+  try {
+    const dir = join(root, ".graphhopper");
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(
+      join(dir, "decisions.jsonl"),
+      JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n",
+    );
+  } catch {
+    /* 較正ログの書込失敗で本体を止めない */
+  }
+}
 
 export type CallResult =
   | { ok: true; answers: DecisionAnswers }
@@ -162,11 +195,31 @@ export function mapDecisionAnswer(
   return { route, confidence: conf, reason: `d1判定(${route})` };
 }
 
-/* 入口routeをd1で判定する。失敗は一律full（現行fail-safe極性＝重い側） */
+/* 入口routeをd1で判定する。失敗は一律full（現行fail-safe極性＝重い側）。
+ * opts.root があれば較正ログに追記する（無ければ記録しない。テストは無指定） */
 export async function decideRoute(
   request: string,
   fetchFn: FetchFn = fetch,
+  opts?: { root?: string },
 ): Promise<DecideResult> {
+  const t0 = performance.now();
+  const finish = async (
+    d: DecideResult,
+    failed = false,
+  ): Promise<DecideResult> => {
+    if (opts?.root) {
+      await logDecision(opts.root, {
+        kind: "decide",
+        request: request.slice(0, 200),
+        result: d.route,
+        confidence: d.confidence,
+        latencyMs: Math.round(performance.now() - t0),
+        fallback: failed,
+        reason: d.reason,
+      });
+    }
+    return d;
+  };
   const r = await callDecision(
     request,
     {
@@ -179,10 +232,18 @@ export async function decideRoute(
     },
     fetchFn,
   );
-  if (!r.ok) return { route: "full", confidence: null, reason: `${r.reason}→full` };
-  return mapDecisionAnswer(
-    r.answers.route?.choice,
-    r.answers.route?.confidence,
+  if (!r.ok) {
+    return finish(
+      {
+        route: "full",
+        confidence: null,
+        reason: `${r.reason}→full`,
+      },
+      true,
+    );
+  }
+  return finish(
+    mapDecisionAnswer(r.answers.route?.choice, r.answers.route?.confidence),
   );
 }
 
@@ -223,6 +284,8 @@ export type SelectResult = {
   reason: string;
   /** true＝判定不能（API失敗等）。呼び出し側は従来routerを継続せよ（generalへ倒さない） */
   fallback: boolean;
+  /** 各Noulの確率（較正用。欠測時は空） */
+  probs: Partial<Record<SelectorLensKey, number>>;
 };
 
 /* Noul確率→lens集合の組立（純粋関数。単体テスト対象）。
@@ -244,6 +307,7 @@ export function assembleLenses(
       lenses: [],
       reason: "d1応答に有効なNoulなし→従来router",
       fallback: true,
+      probs,
     };
   }
   const hit = SELECTOR_LENS_KEYS.filter(
@@ -258,7 +322,7 @@ export function assembleLenses(
     `d1選択(${SELECTOR_LENS_KEYS.map(fmt).join(",")})` +
     (forced ? " requirement強制(契約変更系キーワード)" : "") +
     (picked.length === 0 ? " 該当なし→general" : "");
-  return { lenses, reason, fallback: false };
+  return { lenses, reason, fallback: false, probs };
 }
 
 /* selector toolの人用テキスト（plugin/MCP両面の単一源泉。文面ズレ防止） */
@@ -271,12 +335,33 @@ export function formatSelectorResult(r: SelectResult): string {
     : `selector: lenses=${r.lenses.join(",")}（${r.reason}）。verifier編成の参考にする（advisory-only。採否はmainが決める）。`;
 }
 
-/* verifier編成をd1で選ぶ。API失敗・key未設定・全Noul欠測は fallback=true */
+/* verifier編成をd1で選ぶ。API失敗・key未設定・全Noul欠測は fallback=true。
+ * opts.root があれば較正ログに追記する（無ければ記録しない。テストは無指定） */
 export async function selectLenses(
   designExcerpt: string,
   diffStat: string,
   fetchFn: FetchFn = fetch,
+  opts?: { root?: string },
 ): Promise<SelectResult> {
+  const t0 = performance.now();
+  const stateText = ["design抜粋:", designExcerpt, "", "diff統計:", diffStat].join(
+    "\n",
+  );
+  const finish = async (s: SelectResult): Promise<SelectResult> => {
+    if (opts?.root) {
+      await logDecision(opts.root, {
+        kind: "select",
+        request: stateText.slice(0, 200),
+        result: s.lenses,
+        confidence: null,
+        probs: s.probs as Record<string, number>,
+        latencyMs: Math.round(performance.now() - t0),
+        fallback: s.fallback,
+        reason: s.reason,
+      });
+    }
+    return s;
+  };
   const r = await callDecisionWithRetry(
     ["design抜粋:", designExcerpt, "", "diff統計:", diffStat].join("\n"),
     SELECTOR_QUESTIONS,
@@ -285,7 +370,12 @@ export async function selectLenses(
     SELECTOR_RETRIES,
   );
   if (!r.ok) {
-    return { lenses: [], reason: `${r.reason}→従来router`, fallback: true };
+    return finish({
+      lenses: [],
+      reason: `${r.reason}→従来router`,
+      fallback: true,
+      probs: {},
+    });
   }
-  return assembleLenses(r.answers, designExcerpt);
+  return finish(assembleLenses(r.answers, designExcerpt));
 }

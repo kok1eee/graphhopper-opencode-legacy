@@ -3,6 +3,7 @@ import {
   assembleLenses,
   callDecision,
   callDecisionWithRetry,
+  logDecision,
   DECISION_CONFIDENCE_FLOOR,
   decideRoute,
   mapDecisionAnswer,
@@ -152,6 +153,21 @@ describe("callDecision／selectLenses（fail-safe）", () => {
     try {
       const r = await callDecision("s", { q: { type: "noul", instructions: "?" } });
       expect(r).toEqual({ ok: false, reason: "LIQUID_API_KEY未設定", retryable: false });
+    } finally {
+      restore();
+    }
+  });
+
+  test("decideRouteのAPI失敗ログはfallback:true", async () => {
+    const root = await mkRoot();
+    setKey(undefined);
+    try {
+      const r = await decideRoute("何か", fetch, { root });
+      expect(r.route).toBe("full");
+      const { readFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const [line] = readFileSync(join(root, ".graphhopper", "decisions.jsonl"), "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(line).toMatchObject({ kind: "decide", result: "full", fallback: true });
     } finally {
       restore();
     }
@@ -327,6 +343,107 @@ describe("callDecision／selectLenses（fail-safe）", () => {
       expect(await selectLenses("x", "y", okFetch({}))).toMatchObject({ lenses: [], fallback: true });
     } finally {
       restore();
+    }
+  });
+});
+
+const mkRoot = async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  return mkdtempSync(join(tmpdir(), "gh-decide-log-"));
+};
+describe("logDecision（較正ログ）", () => {
+  const readLines = async (root: string) => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    return readFileSync(join(root, ".graphhopper", "decisions.jsonl"), "utf-8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+  };
+
+  test("decideRouteはroot指定で1行追記する（kind/result/latency）", async () => {
+    const root = await mkRoot();
+    const saved = process.env.LIQUID_API_KEY;
+    process.env.LIQUID_API_KEY = "liquid_test";
+    try {
+      const fake = (async () => ({
+        ok: true,
+        json: async () => ({
+          answers: { route: { choice: "direct", confidence: 0.9 } },
+        }),
+      })) as unknown as typeof fetch;
+      const r = await decideRoute("typoを直す", fake, { root });
+      expect(r.route).toBe("direct");
+      const [line] = await readLines(root);
+      expect(line).toMatchObject({ kind: "decide", result: "direct" });
+      expect(typeof line.latencyMs).toBe("number");
+      expect(typeof line.ts).toBe("string");
+    } finally {
+      if (saved === undefined) delete process.env.LIQUID_API_KEY;
+      else process.env.LIQUID_API_KEY = saved;
+    }
+  });
+
+  test("selectLensesはlenses＋probsを記録する", async () => {
+    const root = await mkRoot();
+    const saved = process.env.LIQUID_API_KEY;
+    process.env.LIQUID_API_KEY = "liquid_test";
+    try {
+      const fake = (async () => ({
+        ok: true,
+        json: async () => ({
+          answers: {
+            requirement: { noul: 0.9 },
+            behavior: { noul: 0.1 },
+            progress: { noul: 0.1 },
+          },
+        }),
+      })) as unknown as typeof fetch;
+      const r = await selectLenses("設計", "1 file", fake, { root });
+      expect(r.lenses).toEqual(["requirement"]);
+      const [line] = await readLines(root);
+      expect(line).toMatchObject({
+        kind: "select",
+        fallback: false,
+      });
+      expect(line.result).toEqual(["requirement"]);
+      expect(line.probs.requirement).toBe(0.9);
+    } finally {
+      if (saved === undefined) delete process.env.LIQUID_API_KEY;
+      else process.env.LIQUID_API_KEY = saved;
+    }
+  });
+
+  test("root無指定は記録しない・書込失敗でも結果を返す", async () => {
+    const saved = process.env.LIQUID_API_KEY;
+    process.env.LIQUID_API_KEY = "liquid_test";
+    try {
+      const fake = (async () => ({
+        ok: true,
+        json: async () => ({
+          answers: { route: { choice: "light", confidence: 0.8 } },
+        }),
+      })) as unknown as typeof fetch;
+      const r = await decideRoute("何か", fake);
+      expect(r.route).toBe("light");
+      // 書込先がファイルでmkdir失敗してもthrowせず結果を返す
+      const { writeFileSync } = await import("node:fs");
+      const notDir = "/tmp/gh-decide-log-notdir";
+      writeFileSync(notDir, "x");
+      await logDecision(notDir, {
+        kind: "decide",
+        request: "x",
+        result: "full",
+        confidence: null,
+        latencyMs: 1,
+        fallback: false,
+        reason: "t",
+      });
+    } finally {
+      if (saved === undefined) delete process.env.LIQUID_API_KEY;
+      else process.env.LIQUID_API_KEY = saved;
     }
   });
 });

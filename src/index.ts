@@ -490,7 +490,7 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
           request: tool.schema.string().describe("これからやる内容のテキスト"),
         },
         async execute(args) {
-          const r = await decideRoute(args.request);
+          const r = await decideRoute(args.request, fetch, { root });
           return [
             `route=${r.route}（confidence=${r.confidence ?? "n/a"}。${r.reason}）`,
             r.route === "direct"
@@ -549,7 +549,9 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
         },
         async execute(args) {
           return formatSelectorResult(
-            await selectLenses(args.design_excerpt, args.diff_stat),
+            await selectLenses(args.design_excerpt, args.diff_stat, fetch, {
+              root,
+            }),
           );
         },
       }),
