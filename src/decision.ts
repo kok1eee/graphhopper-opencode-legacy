@@ -53,7 +53,7 @@ export type DecisionAnswers = Record<
  * requestは先頭200字のみ（較正には概要で足りる）。書込失敗は握り潰す */
 export type DecisionLog = {
   ts: string;
-  kind: "decide" | "select";
+  kind: "decide" | "select" | "compact" | "compact-skip";
   request: string;
   result: string | string[];
   confidence: number | null;
@@ -77,6 +77,19 @@ export async function logDecision(
   } catch {
     /* 較正ログの書込失敗で本体を止めない */
   }
+}
+
+/* d1応答からNoul確率を抜く（compact側と共有。応答形変更時の修正点集約） */
+export function extractNoulProbs(
+  answers: DecisionAnswers,
+  keys: readonly string[],
+): Record<string, number> {
+  const probs: Record<string, number> = {};
+  for (const k of keys) {
+    const v = answers[k]?.noul;
+    if (typeof v === "number") probs[k] = v;
+  }
+  return probs;
 }
 
 export type CallResult =
@@ -297,11 +310,7 @@ export function assembleLenses(
   answers: DecisionAnswers,
   designExcerpt: string,
 ): SelectResult {
-  const probs: Partial<Record<SelectorLensKey, number>> = {};
-  for (const k of SELECTOR_LENS_KEYS) {
-    const v = answers[k]?.noul;
-    if (typeof v === "number") probs[k] = v;
-  }
+  const probs = extractNoulProbs(answers, SELECTOR_LENS_KEYS);
   if (Object.keys(probs).length === 0) {
     return {
       lenses: [],

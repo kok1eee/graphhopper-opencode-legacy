@@ -88,6 +88,49 @@ describe("system注入節約", () => {
   });
 });
 
+describe("compacting hook統合（goal意図＋keep-listの両push生存）", () => {
+  async function compacting(root: string, sessionID: string) {
+    const plugin = (await Graphhopper({
+      client: {},
+      $: {},
+      directory: root,
+    } as never)) as Record<
+      string,
+      (input: { sessionID?: string }, output: { context: string[] }) => Promise<void>
+    >;
+    const out: { context: string[] } = { context: [] };
+    await plugin["experimental.session.compacting"]({ sessionID }, out);
+    return out.context;
+  }
+  async function loggedKinds(root: string): Promise<string[]> {
+    const { readFileSync, existsSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const p = join(root, ".graphhopper", "decisions.jsonl");
+    if (!existsSync(p)) return [];
+    return readFileSync(p, "utf-8")
+      .trim()
+      .split("\n")
+      .map((l) => (JSON.parse(l) as { kind: string }).kind);
+  }
+
+  test("active goalあり：goal意図push＋keep側skip記録（上書き消去なし）", async () => {
+    const root = tmpRoot();
+    startGoal(root, "t", "sA");
+    const ctx = await compacting(root, "sess-nope");
+    // goal意図push（旧処理）が残っている
+    expect(ctx.some((c) => c.includes("[graphhopper] active goal"))).toBe(true);
+    // keep側も動いた証拠：候補0件のskipが記録される（DBは実物・該当なし）
+    expect(await loggedKinds(root)).toContain("compact-skip");
+  });
+
+  test("goalなし：goal意図なし＋keep側は試行する（throwなし）", async () => {
+    const root = tmpRoot();
+    const ctx = await compacting(root, "sess-nope");
+    expect(ctx.some((c) => c.includes("[graphhopper] active goal"))).toBe(false);
+    expect(await loggedKinds(root)).toContain("compact-skip");
+  });
+});
+
 describe("plugin route系tool", () => {
   async function tools(root: string) {
     const plugin = (await Graphhopper({

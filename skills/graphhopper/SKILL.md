@@ -140,6 +140,7 @@ designing → implementing → router_check → polish ─┬─ route=polish:  
 
 compact前に `.log.md` へ決定事項・途中経過を書いておくこと（圧縮要約に落とせない詳細の保全。
 state・design・historyはdiskにあり圧縮の影響を受けない）。
+compaction時はd1 keep-listが自動注入される（要約落ち防止の制約。hook不発時は手動で要点を残せ）。
 
 > 詳細は [refs/gotchas.md](refs/gotchas.md) を読め（該当時に参照）
 

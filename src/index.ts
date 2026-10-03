@@ -53,6 +53,11 @@ import {
   SELECTOR_TOOL_DESCRIPTION,
   selectLenses,
 } from "./decision";
+import {
+  pushGoalIntent,
+  resolveCompactDb,
+  runCompactGate,
+} from "./compact";
 import * as state from "./state";
 /* LSP読取subset（design g-mu5atclj・自前実装）。Manager singletonは
  * src/lsp/ 内に閉じ込め、entryには関数以外の値を置かない（index.ts:110-113の制約）。 */
@@ -146,25 +151,31 @@ export const Graphhopper: Plugin = async ({ client, $, directory }) => {
       injectAgents(input, root);
     },
 
-    /* compact 連携（design g-mtl7l8j3 T3）: 要約に goal の意図を残す。
-     * state は disk のためループ自体は compact を生き残るが、モデル側文脈の
-     * goal 意図が要約落ちするのを防ぐ。prompt は置換しない。 */
-    "experimental.session.compacting": async (_input, output) => {
+    /* compact 連携（design g-mtl7l8j3 T3＋g-muswp69e T2）: 要約に goal の意図を残す＋
+     * d1 keep-list注入（要約落ち防止）。prompt は置換しない。どちらもfail-open
+     * （例外は握りつぶし、既定compaction継続）。単一ハンドラに統合すること
+     * （同キー追加は上書きで既存が消える。回帰テストで両pushを担保） */
+    "experimental.session.compacting": async (input, output) => {
+      const push = (t: string) => output.context.push(t);
       try {
-        const active = state.getActive(root);
-        if (!active || active.goal.status !== "active") return;
-        output.context.push(
-          [
-            `[graphhopper] active goal: "${active.goal.title}" (${active.goal.id})`,
-            `phase: ${active.state.phase}`,
-            active.state.notes ? `notes: ${active.state.notes}` : null,
-            active.state.eval_cmd ? `eval_cmd: ${active.state.eval_cmd}` : null,
-          ]
-            .filter(Boolean)
-            .join("\n"),
-        );
+        pushGoalIntent(() => state.getActive(root), push);
       } catch {
         // 要約を壊さないため例外は握りつぶす
+      }
+      try {
+        const sessionID =
+          input != null &&
+          typeof (input as { sessionID?: unknown }).sessionID === "string"
+            ? (input as { sessionID: string }).sessionID
+            : "";
+        await runCompactGate({
+          dbPath: resolveCompactDb(),
+          sessionID,
+          root,
+          push,
+        });
+      } catch {
+        // keep-list側の例外も要約を壊さない（runCompactGate内でも握りつぶす二重化）
       }
     },
 
