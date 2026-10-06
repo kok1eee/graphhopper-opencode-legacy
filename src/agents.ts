@@ -386,8 +386,15 @@ export function injectAgents(
     };
     const merged: AgentConfig = override ? { ...base, model: override } : base;
     const prev = input.agent[name] as AgentConfig | undefined;
+    // 事前定義（opencode.json の agent.<name>）がある場合も、割当表
+    // （.graphhopper/config.json の agents）は明示指定として最優先で model に反映する。
+    // 以前は prev があると override が捨てられ、task() の子が親モデルを継承していた。
     input.agent[name] = prev
-      ? { ...prev, tools: { ...prev.tools, ...readOnlyGuard, ...lspGuard } }
+      ? {
+          ...prev,
+          ...(override ? { model: override } : {}),
+          tools: { ...prev.tools, ...readOnlyGuard, ...lspGuard },
+        }
       : merged;
   }
 }

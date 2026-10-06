@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   writeFileSync,
@@ -225,6 +226,25 @@ describe("subagent read-only guard", () => {
     expect(kept?.["description"]).toBe("user custom");
     expect((kept?.["tools"] as Record<string, boolean>)["graphhopper_edit"]).toBe(false);
     expect((kept?.["tools"] as Record<string, boolean>)["read"]).toBe(true);
+  });
+
+  test("事前定義があっても割当表(config.json agents)のmodelが優先される", () => {
+    const root = mkdtempSync(join(tmpdir(), "gh-assign-test-"));
+    mkdirSync(join(root, ".graphhopper"), { recursive: true });
+    writeFileSync(
+      join(root, ".graphhopper", "config.json"),
+      JSON.stringify({ agents: { "graphhopper-critic": "opencode-go/deepseek-v4.1-flash" } }),
+      "utf8",
+    );
+    const input: { agent?: Record<string, Record<string, unknown>> } = {
+      agent: {
+        "graphhopper-critic": { model: "opencode-go/muse-spark-1.3-contributor", tools: { read: true } },
+      },
+    };
+    injectAgents(input as never, root);
+    expect(input.agent?.["graphhopper-critic"]?.["model"]).toBe("opencode-go/deepseek-v4.1-flash");
+    // 他agentの割当はグローバル設定（~/.config/opencode/graphhopper.json）にも依存するため、
+    // ここでは「割当が事前定義より優先される」ことだけを固定する
   });
 
   test("librarianが存在しresearcherが純化文言", () => {
