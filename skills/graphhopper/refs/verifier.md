@@ -48,6 +48,7 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
   フォールバックして呼べ。自動切替の仕組みは無いためmain判断で呼ぶ。
   subagent呼び出しは `graphhopper_invoke` を使うこと（毎回configを読み直す。
   `task()` はagent束縛が古いまま残り、割当変更が効かない）。
+  割当の見直しは `/choice` で対話変更できる（変更後はTUI再起動）。
   verifierは `claude-oauth/claude-sonnet-5-5`（shadow比較を経て昇格。判断nodeは品質優先）。
   researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはmuse-spark-1.3-contributor（Go経由。学習利用を許諾済みのため個人用途のみ。他repoはglobal既定のdeepseek-v4.1-flash）、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
