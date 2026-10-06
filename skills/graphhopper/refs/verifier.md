@@ -45,8 +45,8 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
 - **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `opencode-go/deepseek-v4.1-flash`
   （Go経由。学習利用なし・枠大・コード特化。見逃し率はscoreboardのper-model集計で監視継続。
   Go枠切れ時は `claude-oauth/claude-haiku-4-5` にフォールバックして呼べ。
-  subagent呼び出しは `graphhopper_invoke` に統一（モデル割当が効くのはinvoke経路のみ。
-  `task()` は親モデル継承で割当が効かない。枠切れ時のみtask()可。coreの規則に従う）。
+  subagent呼び出しは `task()` が既定。束縛が古いセッションでは `graphhopper_invoke`
+  を使う（coreの規則に従う）。
   割当の見直しは `/choice` で対話変更できる（変更後はTUI再起動）。
   verifierは `minimax/MiniMax-M3`（MiniMax枠切れ時は
   `opencode-go/deepseek-v4.1-flash` に暫定切替。自動切替は無いためmain判断で呼ぶ。

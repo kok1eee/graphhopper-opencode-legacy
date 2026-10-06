@@ -24,10 +24,13 @@ graphhopper本体（Claude Code版）の3相グラフをopencodeに移植した�
 | 大diff整理 | simplify（route=polishのみ） | 提案のみ。適用はメイン |
 
 独立した問いなら並列に投げ、メインが統合する。判断は増やさない（council再発防止）。
-subagent呼び出しは `graphhopper_invoke` に統一すること（モデル割当が効くのは
-invoke経路のみ。`task(subagent_type: ...)` は親モデルを継承し割当が効かない）。
-枠切れ時（MiniMax等のquota枯渇）のみ `task()` を使う（親がOAuthなら$0で動く
-フォールバック。結果のmodelはverifier_set等に明示し、復旧したらinvokeに戻す）。
+subagent呼び出しは `task(subagent_type: ...)` が既定（文脈共有・TUI可視）。
+ただしagent→モデル束縛はセッション開始時に凍結されるため、(1)モデル割当を変えたら
+新規セッションで始める（resume・再起動では直らない）(2)最初の子でDB上のモデルを
+確認してから本流しする。(2)で割当と違うモデルが動いたら、そのセッションでは
+`graphhopper_invoke` を使う（毎回configを読み直す）。枠切れ時（MiniMax等の
+quota枯渇）のみ `task()`＋親継承を許す（親がOAuthなら$0。結果のmodelは
+verifier_set等に明示し、復旧したらinvokeに戻す）。
 
 ## フェーズ
 
