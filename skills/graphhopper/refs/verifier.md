@@ -42,10 +42,9 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
      伝播してkillされる（取り消し後の裏回りなし）。
      推奨は3並列＋ずらし（delayMs 0/5000/10000）。直列は遅いだけで安全性は変わらない
 - **deep休止**（2026-10-01改定：verifierがsonnet-5-5に昇格し、上位モデルでの上書き先が無くなった。selector→lens選択の原則は維持。oracle級が必要なlensが出たら別途検討）。
-- **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `minimax/MiniMax-M3`
-  （契約済みquotaを使用。haikuより強い。見逃し率はscoreboardのper-model集計で監視継続。
-  minimaxが使えない時〈cap切れ・エラー〉は `claude-oauth/claude-haiku-4-5` に
-  フォールバックして呼べ。自動切替の仕組みは無いためmain判断で呼ぶ。
+- **モデル割当（2026-10-01改定・OAuth/MiniMax配線後）**: criticは `opencode-go/deepseek-v4.1-flash`
+  （Go経由。学習利用なし・枠大・コード特化。見逃し率はscoreboardのper-model集計で監視継続。
+  Go枠切れ時は `claude-oauth/claude-haiku-4-5` にフォールバックして呼べ。
   subagent呼び出しは `graphhopper_invoke` に統一（モデル割当が効くのはinvoke経路のみ。
   `task()` は親モデル継承で割当が効かない。枠切れ時のみtask()可。coreの規則に従う）。
   割当の見直しは `/choice` で対話変更できる（変更後はTUI再起動）。
