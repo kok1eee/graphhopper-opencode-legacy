@@ -49,9 +49,9 @@ polish前にlens編成の助言が欲しい場合のみ使う（現行routerは�
   subagent呼び出しは `graphhopper_invoke` を使うこと（毎回configを読み直す。
   `task()` はagent束縛が古いまま残り、割当変更が効かない）。
   割当の見直しは `/choice` で対話変更できる（変更後はTUI再起動）。
-  verifierは `minimax/MiniMax-M3`（当repoのみ。globalはsonnet-5-5維持。
-  MiniMax枠切れ時は `opencode-go/deepseek-v4.1-flash` に暫定切替。
-  自動切替は無いためmain判断で呼ぶ。見逃し率はscoreboardで監視）。
+  verifierは `minimax/MiniMax-M3`（MiniMax枠切れ時は
+  `opencode-go/deepseek-v4.1-flash` に暫定切替。自動切替は無いためmain判断で呼ぶ。
+  見逃し率はscoreboardで監視。会社repoは学習利用の確認が取れるまでproject別に5-5維持可）。
   researcher/librarianは無料枠（researcher=longcat-2.5-preview-freeで試用中、librarian=bunny-free維持で対照）、simplifyはmuse-spark-1.3-contributor（Go経由。学習利用を許諾済みのため個人用途のみ。他repoはglobal既定のdeepseek-v4.1-flash）、oracleはopus-5-5、advisorはgrok-4.7（Bedrock。advised入口がGo cap切れで回らないため復活。xAIの目で系列多様性も確保）。
   注意: session envに陳腐な `AWS_BEARER_TOKEN_BEDROCK` があるとSSOをshadowしてBedrock系が全滅する。
   `graphhopper_invoke` の子には渡さない（invoke.tsで除去済み）。直接 `opencode run` する場合は
