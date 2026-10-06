@@ -545,12 +545,19 @@ function writeOutbox(
   }
 }
 
-function readJson<T>(path: string, fallback: T): T {
+/* 直近の正常値をプロセス内で覚える（同時書き換えとのrace対策）。
+ * 書込み途中の壊れJSONを読んだ場合、記憶があればそれを返し、
+ * 全agentモデル欠落（子の親main継承）を防ぐ。初回から壊れていたらfallback */
+const lastGoodJson = new Map<string, unknown>();
+export function readJson<T>(path: string, fallback: T): T {
   if (!existsSync(path)) return fallback;
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as T;
+    // 呼び出し側の変更から守るため複製を記憶する（返却値は毎回freshなparse結果）
+    lastGoodJson.set(path, structuredClone(parsed));
+    return parsed;
   } catch {
-    return fallback;
+    return (lastGoodJson.get(path) as T | undefined) ?? fallback;
   }
 }
 

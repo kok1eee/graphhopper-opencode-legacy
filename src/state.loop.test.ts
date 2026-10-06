@@ -39,6 +39,7 @@ import {
   pauseGoal,
   readConfig,
   readDiscover,
+  readJson,
   readGoals,
   readHistory,
   readState,
@@ -743,6 +744,41 @@ describe("config 2層解決（グローバル既定 → プロジェクト上書
       const cfg = readConfig(tmpRoot());
       expect(cfg.agents).toEqual({});
       expect(cfg.stuck_threshold).toBe(CFG.stuck_threshold);
+    } finally {
+      if (prev === undefined) delete process.env.GRAPHHOPPER_CONFIG;
+      else process.env.GRAPHHOPPER_CONFIG = prev;
+    }
+  });
+
+  test("返却値の変更はキャッシュを汚染しない（readJson直結）", () => {
+    const path = join(tmpRoot(), "alias.json");
+    writeFileSync(path, JSON.stringify({ nested: { v: "v1" } }), "utf8");
+    const a = readJson<{ nested: { v: string } }>(path, { nested: { v: "fb" } });
+    a.nested.v = "MUTATED";
+    writeFileSync(path, "{ not json", "utf8");
+    // 壊れ読みは記憶値を返す。返却時の変更が記憶に波及していなければv1
+    expect(readJson<{ nested: { v: string } }>(path, { nested: { v: "fb" } }).nested.v).toBe("v1");
+  });
+
+  test("書換え途中の壊れJSONは前回値を維持する（モデル欠落防止）", () => {
+    const prev = process.env.GRAPHHOPPER_CONFIG;
+    const path = join(tmpRoot(), "race.json");
+    process.env.GRAPHHOPPER_CONFIG = path;
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({ agents: { "graphhopper-verifier": "v1" } }),
+        "utf8",
+      );
+      expect(readConfig(tmpRoot()).agents["graphhopper-verifier"]).toBe("v1");
+      writeFileSync(path, "{ not json", "utf8");
+      expect(readConfig(tmpRoot()).agents["graphhopper-verifier"]).toBe("v1");
+      writeFileSync(
+        path,
+        JSON.stringify({ agents: { "graphhopper-verifier": "v2" } }),
+        "utf8",
+      );
+      expect(readConfig(tmpRoot()).agents["graphhopper-verifier"]).toBe("v2");
     } finally {
       if (prev === undefined) delete process.env.GRAPHHOPPER_CONFIG;
       else process.env.GRAPHHOPPER_CONFIG = prev;

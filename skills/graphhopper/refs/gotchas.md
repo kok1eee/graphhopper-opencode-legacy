@@ -28,3 +28,5 @@
 - **escalate: trueが出たのに自力でもう一度だけ試そうとしない**: 閾値はコード側の機械カウント。無視して回すと同じ失敗を繰り返すだけになりがちなので、必ずoracleに相談してから再試行する
 
 - **モデル割当を変えたらTUI再起動**: 実行中セッションのagent→モデル束縛は古いまま残る（`task()`は初回解決を維持し、config変更が伝播しない実証あり。K7は現行minimaxではなく旧haikuで走った）。`graphhopper_invoke` は毎回configを読み直すため新割当が効く。subagent呼び出しはinvokeを優先し、fan-out前は最初に1件だけ投げてDBでモデルを確認せよ
+
+- **config直書きはtmp+renameでatomicに**: `graphhopper.json` を直接dumpで書き換えると、同時刻のconfig読み出しとraceして壊れJSON→全agentモデル欠落→子が親mainを継承する。書換えは必ずtmp＋renameで行う
