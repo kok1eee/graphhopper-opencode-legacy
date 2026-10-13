@@ -1,5 +1,7 @@
 # graphhopper-opencode
 
+> **v1 legacy（opencode 1.18.x）** — 現行の v2 は https://github.com/kok1eee/graphhopper-opencode
+
 **graphhopper for opencode** — designing/implementing/polish state machine plugin。
 
 元は Claude Code plugin として作られた [graphhopper](../graphhopper) を、
